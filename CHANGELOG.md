@@ -3,6 +3,23 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0] - 2026-10-04
+
+### Changed（不兼容）
+- **网关长期身份改为客户端证书（mTLS）**：注册/轮换时本机生成密钥对、只交 CSR，中心用 CA-G 签出
+  客户端证书后回执；`state/credential.json` 改存「证书 + 私钥」（0600），**私钥永不出本机**。
+  取代旧的对称 bearer `rt_`。
+- 已注册后所有网关面调用（status / renew / upgrade-plan / upgrade-result）改为 **mTLS**（reqwest 挂
+  客户端证书/私钥）；`link-upstream` 首跑置备仍用一次性 bootstrap bearer。
+- 轮换 = **证书轮换**：到期前再生成一套密钥对，以当前证书证明身份 + 新 CSR 换新证书，旧证书作废。
+- wire 契约切到 `wist-contracts::gateway_control`（`GatewayCredentialBundle` 只带 `certificate` 等）。
+
+### Added
+- **首跑注册可重试**：`link-upstream` 成功即把 RegistToken 落盘（0600）；register 失败后下次
+  **免 bootstrap** 重试（bootstrap 已被消费）。
+- 诊断：`credential.pending_regist`（有未消费 RegistToken 时提示）；credential.local 改看客户端证书到期。
+- 依赖：`wist-contracts`（0.2）/ `rcgen` / `x509-parser`。
+
 ## [0.1.1] - 2026-10-04
 
 ### Fixed
