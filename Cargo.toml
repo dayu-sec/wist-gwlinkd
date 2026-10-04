@@ -19,8 +19,8 @@ tokio = { version = "1.48", features = ["full"] }
 libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls", "webpki-roots"] }
 wist-control = "0.6"
-# gateway↔center 注册/凭据契约（客户端证书 mTLS）。尚未发 crates.io，先用本地 path。
-wist-contracts = { path = "../wist-contracts" }
+# gateway↔center 注册/凭据契约（客户端证书 mTLS）。
+wist-contracts = "0.2"
 # 客户端密钥对 + CSR（私钥永不出本机）；x509-parser 读自家证书序列号（轮换时提交）。
 rcgen = { version = "0.13", features = ["x509-parser"] }
 x509-parser = "0.16"
