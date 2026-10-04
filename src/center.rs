@@ -1,12 +1,33 @@
-//! 连 `WistCenter` 的客户端：link-upstream / register / status / credentials:renew。
+//! 连 `WistCenter` 的客户端：link-upstream / register / status / credentials:renew / upgrade-plan / upgrade-result。
 //!
 //! 本进程是**运行期凭据 `rt_` 的唯一持有者** —— 全边缘只此一处与中心对话。wire 类型来自
 //! `wist-control`（由 `wist-design/jumo` 模型生成）。
+
+use std::path::Path;
+use std::time::Duration;
 
 use wist_control::{
     GatewayCredentialBundle, GatewayEnrollmentResult, GatewayInitialConfig, GatewayUpgradePlan,
     RegisterGateway, ReportGatewayStatus,
 };
+
+/// 单次请求超时（避免中心/网关半死把常驻循环卡住）。
+pub const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 建 HTTP 客户端：带超时；给了 `trust_bundle`（PEM）则作为**自定义信任锚**（自签中心证书时必需）。
+pub fn build_http_client(trust_bundle: Option<&Path>) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder().timeout(HTTP_TIMEOUT);
+    if let Some(path) = trust_bundle {
+        let pem = std::fs::read(path)
+            .map_err(|err| format!("读取信任锚失败 {}: {err}", path.display()))?;
+        let cert = reqwest::Certificate::from_pem(&pem)
+            .map_err(|err| format!("解析信任锚失败 {}: {err}", path.display()))?;
+        builder = builder.add_root_certificate(cert);
+    }
+    builder
+        .build()
+        .map_err(|err| format!("建 HTTP 客户端失败: {err}"))
+}
 
 /// link-upstream 的响应壳（中心侧 `InitialConfigReturned`）：配置 + 置备态一次性 RegistToken。
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -25,10 +46,20 @@ pub struct CenterClient {
 
 impl CenterClient {
     /// 以控制中心 endpoint 建客户端（`endpoint` 形如 `https://center.example`）。
+    ///
+    /// **不**接自定义信任锚；需要自签锚时用 [`build_http_client`] + [`CenterClient::with_client`]。
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
+        }
+    }
+
+    /// 以既有 HTTP 客户端建（供注入超时 / 信任锚）。
+    pub fn with_client(endpoint: impl Into<String>, http: reqwest::Client) -> Self {
+        Self {
+            endpoint: endpoint.into().trim_end_matches('/').to_string(),
+            http,
         }
     }
 

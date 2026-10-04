@@ -36,6 +36,16 @@ impl Check {
         }
     }
 
+    fn warn(name: &str, title: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: Status::Warn,
+            title: title.into(),
+            detail: detail.into(),
+            hint: None,
+        }
+    }
+
     fn fail(
         name: &str,
         title: impl Into<String>,
@@ -74,7 +84,34 @@ impl Report {
 /// 运行全部本地检查（网络项：中心可达性，后续补）。
 pub fn diagnose(config: &Config) -> Report {
     Report {
-        checks: vec![config_check(config), upgrade_check(config)],
+        checks: vec![
+            config_check(config),
+            credential_check(config),
+            upgrade_check(config),
+        ],
+    }
+}
+
+/// 运行期凭据是否已就位（首跑前为 warn，不是错）。
+fn credential_check(config: &Config) -> Check {
+    match crate::state::load_credential(&config.state_dir) {
+        Some(_) => Check::ok(
+            "credential.local",
+            "已有运行期凭据",
+            "state/credential.json",
+        ),
+        None => {
+            let mut check = Check::warn(
+                "credential.local",
+                "尚无运行期凭据",
+                "首跑会走 link-upstream → register",
+            );
+            check.hint = Some(
+                "设 WIST_GWLINKD_BOOTSTRAP_TOKEN 后运行 `wist-gwlinkd run` 完成首次置备"
+                    .to_string(),
+            );
+            check
+        }
     }
 }
 

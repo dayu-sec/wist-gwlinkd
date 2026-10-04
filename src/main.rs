@@ -2,18 +2,22 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use wist_control::{DateTime, ReportGatewayStatus};
-use wist_gwlinkd::center::CenterClient;
+use wist_gwlinkd::center::{self, CenterClient};
 use wist_gwlinkd::config::Config;
 use wist_gwlinkd::doctor::{self, Status};
 use wist_gwlinkd::selfreport::SelfReportClient;
-use wist_gwlinkd::state;
+use wist_gwlinkd::state::{self, UpgradeCursor};
 use wist_gwlinkd::upgrade::{DEFAULT_UPGRADER_PROGRAM, UpgradeDriver, UpgradeReporter};
 
 /// 运行期状态上报周期（秒）。
 const STATUS_INTERVAL_SECS: u64 = 30;
+/// renew 失败后的初始退避（秒）。
+const RENEW_BACKOFF_BASE_SECS: u64 = 60;
+/// renew 退避上限（秒）。
+const RENEW_BACKOFF_MAX_SECS: u64 = 1800;
 
 fn config_path() -> PathBuf {
     std::env::var("WIST_GWLINKD_CONFIG")
@@ -56,10 +60,25 @@ async fn main() -> ExitCode {
     }
 }
 
-/// 常驻：首跑置备（若未注册），随后**续期 + 拉自述面 + 周期上报**。
+/// 常驻：单实例 → 首跑置备（若未注册）→ 周期【续期 / 拉升级目标 / 拉自述面 / 上报状态】。
 async fn run(config: &Config) -> Result<(), String> {
+    // 单实例：同机只允许一个常驻（否则双重上报 + 双重驱动升级）。持有到进程退出。
+    let _lock = state::acquire_single_instance_lock(&config.state_dir)?;
+
     let identity = state::load_or_create_identity(&config.state_dir)?;
-    let client = CenterClient::new(config.control_center_endpoint.clone());
+    // 信任锚：配置给了且文件在，就作为自定义根（自签中心必需）；否则回落公共根（并记一笔）。
+    let trust_bundle = config.trust_bundle.as_path();
+    let trust = if trust_bundle.exists() {
+        Some(trust_bundle)
+    } else {
+        eprintln!(
+            "event=TrustBundleMissing path={}（回落公共根）",
+            trust_bundle.display()
+        );
+        None
+    };
+    let http = center::build_http_client(trust)?;
+    let client = CenterClient::with_client(config.control_center_endpoint.clone(), http);
 
     if state::load_credential(&config.state_dir).is_none() {
         onboard(&client, config, &identity).await?;
@@ -80,65 +99,84 @@ async fn run(config: &Config) -> Result<(), String> {
         config.state_dir.clone(),
     );
 
-    // 手动触发一次升级（占位 CR-002 C2 的「拉 desired」）：设了 WIST_GWLINKD_UPGRADE_TO 就驱动一次。
-    if let Ok(to_version) = std::env::var("WIST_GWLINKD_UPGRADE_TO") {
-        let reporter = UpgradeReporter {
-            client: client.clone(),
-            credential: credential.clone(),
-        };
-        driver
-            .start("manual", wist_gwlinkd::VERSION, &to_version, Some(reporter))
-            .await?;
-    }
-
     let mut ticker = tokio::time::interval(Duration::from_secs(STATUS_INTERVAL_SECS));
-    // 已驱过的 plan_id：同一计划不重复驱动（幂等；跨重启由 upgrade.json 留痕继续判断）。
-    let mut last_driven: Option<String> = None;
+    // renew 退避：失败时指数退避，避免每 tick 猛击中心。
+    let mut renew_backoff = Duration::ZERO;
+    let mut next_renew_at = Instant::now();
+
     loop {
         ticker.tick().await;
 
-        // 到期前续期（旧凭据立即失效，新凭据落盘）。
-        if DateTime::now().seconds_until(&credential.expires_at) <= renew_lead {
+        // 到期前续期（旧凭据立即失效，新凭据**原子落盘**）。
+        if DateTime::now().seconds_until(&credential.expires_at) <= renew_lead
+            && Instant::now() >= next_renew_at
+        {
             match client.renew_credential(&credential).await {
                 Ok(renewed) => {
                     state::save_credential(&config.state_dir, &renewed)?;
                     credential = renewed;
+                    renew_backoff = Duration::ZERO;
+                    next_renew_at = Instant::now();
                     println!("event=CredentialRenewed gateway_id={}", config.gateway_id);
                 }
-                Err(err) => eprintln!("event=RenewFailed error={err}"),
+                Err(err) => {
+                    renew_backoff = if renew_backoff.is_zero() {
+                        Duration::from_secs(RENEW_BACKOFF_BASE_SECS)
+                    } else {
+                        (renew_backoff * 2).min(Duration::from_secs(RENEW_BACKOFF_MAX_SECS))
+                    };
+                    next_renew_at = Instant::now() + renew_backoff;
+                    eprintln!("event=RenewFailed backoff={renew_backoff:?} error={err}");
+                }
             }
         }
 
-        // 拉升级目标（CR-002 C1/C2）：有覆盖本网关、目标非当前版本、且未驱过 → 驱动 + 回执。
-        match client
-            .get_upgrade_plan(&credential, &config.gateway_id)
-            .await
-        {
-            Ok(plan) if plan.has_plan => {
-                let to_version = plan.to_version.clone().unwrap_or_default();
-                let already = last_driven.as_deref() == plan.plan_id.as_deref();
-                if !to_version.is_empty() && to_version != wist_gwlinkd::VERSION && !already {
-                    println!(
-                        "event=UpgradeDriven plan_id={:?} to_version={to_version}",
-                        plan.plan_id
-                    );
-                    let reporter = UpgradeReporter {
-                        client: client.clone(),
-                        credential: credential.clone(),
-                    };
-                    driver
-                        .start(
-                            plan.plan_id.as_deref().unwrap_or("plan"),
-                            wist_gwlinkd::VERSION,
-                            &to_version,
-                            Some(reporter),
-                        )
-                        .await?;
-                    last_driven = plan.plan_id;
+        // 拉升级目标（CR-002 C2）：有在飞升级则**互斥跳过**；否则「未驱过的计划」才驱动。
+        if !state::upgrade_in_flight(&config.state_dir, SystemTime::now()) {
+            match client
+                .get_upgrade_plan(&credential, &config.gateway_id)
+                .await
+            {
+                Ok(plan) if plan.has_plan => {
+                    let cursor = state::load_upgrade_cursor(&config.state_dir);
+                    let already = plan.plan_id.is_some() && plan.plan_id == cursor.last_plan_id;
+                    let to_version = plan.to_version.clone().unwrap_or_default();
+                    if !already && !to_version.is_empty() {
+                        // 从版本取游标记的「上次目标」；不知道就 unknown（**不再拿 gwlinkd 自身版本硬比** —— 版本空间不同）。
+                        let from_version = if cursor.last_to_version.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            cursor.last_to_version.clone()
+                        };
+                        println!(
+                            "event=UpgradeDriven plan_id={:?} to_version={to_version}",
+                            plan.plan_id
+                        );
+                        let reporter = UpgradeReporter {
+                            client: client.clone(),
+                            credential: credential.clone(),
+                        };
+                        driver
+                            .start(
+                                plan.plan_id.as_deref().unwrap_or("plan"),
+                                &from_version,
+                                &to_version,
+                                Some(reporter),
+                            )
+                            .await?;
+                        // 先落游标再继续：跨重启幂等据此判定。
+                        state::save_upgrade_cursor(
+                            &config.state_dir,
+                            &UpgradeCursor {
+                                last_plan_id: plan.plan_id.clone(),
+                                last_to_version: to_version,
+                            },
+                        )?;
+                    }
                 }
+                Ok(_) => {}
+                Err(err) => eprintln!("event=UpgradePlanFailed error={err}"),
             }
-            Ok(_) => {}
-            Err(err) => eprintln!("event=UpgradePlanFailed error={err}"),
         }
 
         // 拉网关自述面（准确状态的来源）；不答则把「沉默」当判断，上报 unknown。
@@ -165,12 +203,24 @@ async fn run(config: &Config) -> Result<(), String> {
         };
         match client.report_status(&credential, &payload).await {
             Ok(()) => println!("event=StatusReported gateway_id={}", config.gateway_id),
+            Err(err) if is_auth_failure(&err) => {
+                // 运行期凭据被拒（多为 renew 后崩溃丢新凭据）：要重走置备。
+                eprintln!(
+                    "event=CredentialRejected gateway_id={}（运行期凭据已失效，需重新置备：设 WIST_GWLINKD_BOOTSTRAP_TOKEN 后重跑）error={err}",
+                    config.gateway_id
+                );
+            }
             Err(err) => eprintln!("event=StatusReportFailed error={err}"),
         }
     }
 }
 
-/// 首跑置备：link-upstream（一次性 bootstrap + 身份头）→ register → 落运行期凭据。
+/// 401/403 视为凭据失效（`decode` 的错误串里带状态码）。
+fn is_auth_failure(err: &str) -> bool {
+    err.contains("401") || err.contains("403")
+}
+
+/// 首跑置备：link-upstream（一次性 bootstrap + 身份头）→ 落链接配置 → register → 落运行期凭据。
 async fn onboard(client: &CenterClient, config: &Config, identity: &str) -> Result<(), String> {
     let bootstrap = std::env::var("WIST_GWLINKD_BOOTSTRAP_TOKEN").map_err(|_| {
         "首跑需要 WIST_GWLINKD_BOOTSTRAP_TOKEN（中心 admin 创建实例时签发的引导 Token）".to_string()
@@ -181,6 +231,8 @@ async fn onboard(client: &CenterClient, config: &Config, identity: &str) -> Resu
     let returned = client
         .link_upstream(&config.gateway_id, &bootstrap, Some(identity))
         .await?;
+    // 链接配置（信任锚 / 协议版本 / 注册 token 引用）落盘留痕 —— 不再丢弃。
+    state::save_link_config(&config.state_dir, &returned.config)?;
     let regist_token = returned
         .regist_token
         .ok_or_else(|| "中心未返回 regist_token（网关可能已初始化）".to_string())?;

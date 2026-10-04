@@ -1,10 +1,10 @@
 //! 消费网关容器内的**自述面**（`GatewaySelfInterface`：进程内算得准的自身状态）。
 //!
 //! 背景（CR-003）：中心要的是**准确**的网关状态，而准确值只有网关进程内算得出。所以容器暴露一个
-//! **环回**自述面，本常驻拉取后再上报 —— 网关活着拿到准值；网关不答则把「沉默」当判断。
+//! **环回**自述面（网关侧 `GET /api/v1/gateway/self-state`，手加路由、限环回），本常驻拉取后再上报 ——
+//! 网关活着拿到准值；网关不答则把「沉默」当判断。
 //!
-//! 注意：模型里的 `GatewaySelfInterface` 迄今**未 `bind`**（环回鉴权未定），网关侧路由尚未落地；
-//! 本模块按模型定义的 `GET /api/v1/gateway/self-state?gateway_id=` 消费，端点由配置给出。
+//! 字段用 **snake_case**，与网关 `self_state.rs` 的输出一致（网关其余管理面 DTO 用 camelCase，属历史分歧）。
 
 /// 网关自述状态（对应模型 `GatewaySelfState`）。
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -42,7 +42,10 @@ impl SelfReportClient {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(crate::center::HTTP_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
         }
     }
 

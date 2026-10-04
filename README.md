@@ -38,8 +38,10 @@ renew_lead_seconds = 3600                          # 凭据续期提前量
 upgrader_program = "gops"                          # 升级执行器
 ```
 
-环境变量：`WIST_GWLINKD_CONFIG`（配置文件路径）、`WIST_GWLINKD_BOOTSTRAP_TOKEN`（首跑置备用的一次性引导 Token）、
-`WIST_GWLINKD_UPGRADE_TO`（手动触发一次升级的**覆盖口**；正常由常驻周期从中心 `GET /api/v1/gateway/upgrade-plan` 拉 desired 驱动）。
+环境变量：`WIST_GWLINKD_CONFIG`（配置文件路径）、`WIST_GWLINKD_BOOTSTRAP_TOKEN`（首跑置备用的一次性引导 Token）。
+
+升级由常驻周期从中心 `GET /api/v1/gateway/upgrade-plan` 拉 desired 驱动（按 `plan_id` 幂等，游标落盘跨重启）。
+其余：同机**单实例**（`flock` 锁）、HTTP 带**超时**、`trust_bundle` 作为**自定义信任锚**、凭据**原子落盘**。
 
 ## 交付与升级
 
