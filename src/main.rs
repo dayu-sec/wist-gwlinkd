@@ -9,8 +9,10 @@ use wist_gwlinkd::center::{self, CenterClient};
 use wist_gwlinkd::config::Config;
 use wist_gwlinkd::doctor::{self, Status};
 use wist_gwlinkd::selfreport::SelfReportClient;
-use wist_gwlinkd::state::{self, UpgradeCursor};
-use wist_gwlinkd::upgrade::{DEFAULT_UPGRADER_PROGRAM, UpgradeDriver, UpgradeReporter};
+use wist_gwlinkd::state::{self, CredentialStatus, UpgradeCursor};
+use wist_gwlinkd::upgrade::{
+    DEFAULT_ON_FAILURE, DEFAULT_UPGRADER_PROGRAM, UpgradeDriver, UpgradeReporter,
+};
 
 /// 运行期状态上报周期（秒）。
 const STATUS_INTERVAL_SECS: u64 = 30;
@@ -80,8 +82,15 @@ async fn run(config: &Config) -> Result<(), String> {
     let http = center::build_http_client(trust)?;
     let client = CenterClient::with_client(config.control_center_endpoint.clone(), http);
 
-    if state::load_credential(&config.state_dir).is_none() {
-        onboard(&client, config, &identity).await?;
+    match state::credential_status(&config.state_dir) {
+        CredentialStatus::Present(_) => {}
+        CredentialStatus::Missing => onboard(&client, config, &identity).await?,
+        CredentialStatus::Corrupt(detail) => {
+            // 损坏 ≠ 缺失：不能静默重置备（会覆盖掉唯一一份运行期凭据）。
+            return Err(format!(
+                "运行期凭据损坏：{detail}；修复或删除 state/credential.json 后重跑（若中心已初始化该实例，需先在中心重置）"
+            ));
+        }
     }
     let mut credential = state::load_credential(&config.state_dir)
         .ok_or_else(|| "注册后仍无运行期凭据".to_string())?;
@@ -97,9 +106,21 @@ async fn run(config: &Config) -> Result<(), String> {
             .clone()
             .unwrap_or_else(|| DEFAULT_UPGRADER_PROGRAM.to_string()),
         config.state_dir.clone(),
+    )
+    .with_on_failure(
+        config
+            .upgrade_on_failure
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ON_FAILURE.to_string()),
+    )
+    .with_project(
+        config.upgrade_project_dir.clone(),
+        config.upgrade_project_name.clone(),
     );
 
     let mut ticker = tokio::time::interval(Duration::from_secs(STATUS_INTERVAL_SECS));
+    // 一轮里有多次（30s 超时）的网络调用；慢轮后别突发补 tick。
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renew_backoff = Duration::ZERO;
     let mut next_renew_at = Instant::now();
     let mut status_backoff = Duration::ZERO;
@@ -114,7 +135,10 @@ async fn run(config: &Config) -> Result<(), String> {
         {
             match client.renew_credential(&credential).await {
                 Ok(renewed) => {
-                    state::save_credential(&config.state_dir, &renewed)?;
+                    // 续期成功：内存态立刻换上；落盘失败不拖死常驻（下一轮还会再续）。
+                    if let Err(err) = state::save_credential(&config.state_dir, &renewed) {
+                        eprintln!("event=CredentialSaveFailed error={err}");
+                    }
                     credential = renewed;
                     renew_backoff = Duration::ZERO;
                     next_renew_at = Instant::now();
@@ -125,6 +149,22 @@ async fn run(config: &Config) -> Result<(), String> {
                     next_renew_at = Instant::now() + renew_backoff;
                     eprintln!("event=RenewFailed backoff={renew_backoff:?} error={err}");
                 }
+            }
+        }
+
+        // 上一次升级被判死（升级器被中断，机器可能停在中间态）：清游标，让本次能把同一计划**重新驱动**。
+        // 只对「判死（心跳陈旧）」清 —— 执行器真失败（failed/rolled_back）不在此列，不会陷入重试。
+        // 并发安全：即便上一轮的执行器成了孤儿还在跑，gops 自带工程交付锁会串起两次调用。
+        if state::upgrader_is_declared_dead(&config.state_dir, SystemTime::now())
+            && state::load_upgrade_cursor(&config.state_dir)
+                .last_plan_id
+                .is_some()
+        {
+            eprintln!("event=DeadUpgradeDetected 清游标以便重驱同一计划");
+            if let Err(err) =
+                state::save_upgrade_cursor(&config.state_dir, &UpgradeCursor::default())
+            {
+                eprintln!("event=CursorClearFailed error={err}");
             }
         }
 
@@ -146,29 +186,38 @@ async fn run(config: &Config) -> Result<(), String> {
                             cursor.last_to_version.clone()
                         };
                         println!(
-                            "event=UpgradeDriven plan_id={:?} to_version={to_version}",
-                            plan.plan_id
+                            "event=UpgradeDriven plan_id={:?} to_version={to_version} component={:?}",
+                            plan.plan_id, plan.component
                         );
                         let reporter = UpgradeReporter {
                             client: client.clone(),
-                            credential: credential.clone(),
+                            state_dir: config.state_dir.clone(),
                         };
-                        driver
+                        // **不**用 `?`：驱动失败（执行器缺失/架构不符…）绝不能把链路常驻整个拖死。
+                        match driver
                             .start(
                                 plan.plan_id.as_deref().unwrap_or("plan"),
                                 &from_version,
                                 &to_version,
+                                plan.component.as_deref(),
                                 Some(reporter),
                             )
-                            .await?;
-                        // 先落游标再继续：跨重启幂等据此判定。
-                        state::save_upgrade_cursor(
-                            &config.state_dir,
-                            &UpgradeCursor {
-                                last_plan_id: plan.plan_id.clone(),
-                                last_to_version: to_version,
-                            },
-                        )?;
+                            .await
+                        {
+                            Ok(()) => {
+                                // 先落游标再继续：跨重启幂等据此判定。
+                                if let Err(err) = state::save_upgrade_cursor(
+                                    &config.state_dir,
+                                    &UpgradeCursor {
+                                        last_plan_id: plan.plan_id.clone(),
+                                        last_to_version: to_version,
+                                    },
+                                ) {
+                                    eprintln!("event=CursorSaveFailed error={err}");
+                                }
+                            }
+                            Err(err) => eprintln!("event=UpgradeDriveFailed error={err}"),
+                        }
                     }
                 }
                 Ok(_) => {}

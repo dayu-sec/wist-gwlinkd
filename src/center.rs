@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use wist_control::{
     GatewayCredentialBundle, GatewayEnrollmentResult, GatewayInitialConfig, GatewayUpgradePlan,
-    RegisterGateway, ReportGatewayStatus,
+    RegisterGateway, ReportGatewayStatus, ReportGatewayUpgradeResult,
 };
 
 /// 单次请求超时（避免中心/网关半死把常驻循环卡住）。
@@ -77,7 +77,10 @@ impl CenterClient {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(HTTP_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
         }
     }
 
@@ -201,18 +204,31 @@ impl CenterClient {
         decode(response, "upgrade-plan").await
     }
 
-    /// 升级回执：`POST /api/v1/gateway/upgrade-result`（字段对齐 `upgrade.json`）。
+    /// 升级回执：`POST /api/v1/gateway/upgrade-result`。
+    ///
+    /// body 是中心侧 `ReportGatewayUpgradeResult`（**含必填 `gateway_id` / `reported_at`**，
+    /// 不能直接发本地 `UpgradeRecord` —— 否则中心反序列化失败）。
     pub async fn report_upgrade_result(
         &self,
         credential: &GatewayCredentialBundle,
         record: &crate::state::UpgradeRecord,
     ) -> Result<(), CenterError> {
         let url = format!("{}/api/v1/gateway/upgrade-result", self.endpoint);
+        let payload = ReportGatewayUpgradeResult {
+            gateway_id: credential.gateway_id.clone(),
+            work_id: record.work_id.clone(),
+            from_version: record.from_version.clone(),
+            to_version: record.to_version.clone(),
+            step: record.step.clone(),
+            status: record.status.clone(),
+            detail: record.detail.clone(),
+            reported_at: wist_control::DateTime::now(),
+        };
         let response = self
             .http
             .post(url)
             .bearer_auth(&credential.bearer_token)
-            .json(record)
+            .json(&payload)
             .send()
             .await
             .map_err(|err| CenterError::Other(format!("upgrade-result 请求失败: {err}")))?;
@@ -436,9 +452,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn report_upgrade_result_posts_the_record() {
+    async fn report_upgrade_result_posts_the_center_contract() {
         let (endpoint, captured) = capture_server("200 OK", r#"{}"#).await;
         let client = CenterClient::new(endpoint);
+        let credential = credential();
         let record = crate::state::UpgradeRecord {
             work_id: "w-1".into(),
             from_version: "0.1.0".into(),
@@ -448,7 +465,7 @@ mod tests {
             detail: "ok".into(),
         };
         client
-            .report_upgrade_result(&credential(), &record)
+            .report_upgrade_result(&credential, &record)
             .await
             .expect("ok");
         let request = captured.await.expect("request");
@@ -458,6 +475,13 @@ mod tests {
                 .starts_with("post /api/v1/gateway/upgrade-result"),
             "{request}"
         );
-        assert!(request.contains("w-1"), "{request}");
+        // body 必须是中心侧 ReportGatewayUpgradeResult（含必填 gateway_id / reported_at）——
+        // 直接发 UpgradeRecord 会被中心 422 拒掉。
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let sent: wist_control::ReportGatewayUpgradeResult = serde_json::from_str(body)
+            .unwrap_or_else(|err| panic!("body 不是合法回执: {err}; {body}"));
+        assert_eq!(sent.gateway_id, credential.gateway_id);
+        assert_eq!(sent.work_id, "w-1");
+        assert_eq!(sent.status, "done");
     }
 }

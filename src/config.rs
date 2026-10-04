@@ -22,6 +22,15 @@ pub struct Config {
     /// 升级执行器程序（缺省 `gops`）。
     #[serde(default)]
     pub upgrader_program: Option<String>,
+    /// 升级失败处置（`rollback-all` | `halt`；缺省 `rollback-all`）。
+    #[serde(default)]
+    pub upgrade_on_failure: Option<String>,
+    /// gops 工程根（含 `ops-prj.yml`）：gops 从 cwd 解析工程，需在此指定。
+    #[serde(default)]
+    pub upgrade_project_dir: Option<PathBuf>,
+    /// 只升级该系统（gops 位置参数 NAME；缺省 = 工程里全部已导入系统）。
+    #[serde(default)]
+    pub upgrade_project_name: Option<String>,
 }
 
 impl Config {
@@ -59,6 +68,9 @@ mod tests {
         assert!(config.gateway_self_endpoint.is_none());
         assert!(config.renew_lead_seconds.is_none());
         assert!(config.upgrader_program.is_none());
+        assert!(config.upgrade_on_failure.is_none());
+        assert!(config.upgrade_project_dir.is_none());
+        assert!(config.upgrade_project_name.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

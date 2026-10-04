@@ -62,11 +62,13 @@ pub fn new_secret_token(prefix: &str) -> Result<String, String> {
     SystemRandom::new()
         .fill(&mut bytes)
         .map_err(|_| "failed to read system random source".to_string())?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(prefix.len() + 1 + bytes.len() * 2);
     out.push_str(prefix);
     out.push('_');
     for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     Ok(out)
 }
@@ -76,7 +78,18 @@ fn ensure_dir(state_dir: &Path) -> Result<(), String> {
         .map_err(|err| format!("创建状态目录失败 {}: {err}", state_dir.display()))
 }
 
-/// 写敏感文件：**先写临时文件 → 设 `0600` → 原子 rename**（崩溃不会留半截文件把凭据写坏）。
+/// 原子写：**先写临时文件 → rename**（读者永不会看到半截内容）。
+fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("创建目录失败 {}: {err}", parent.display()))?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content).map_err(|err| format!("写入失败 {}: {err}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|err| format!("落盘失败 {}: {err}", path.display()))
+}
+
+/// 写敏感文件：原子写 + 中间文件设 `0600`（崩溃不会留半截文件把凭据写坏）。
 fn write_secret(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -127,8 +140,15 @@ pub fn load_or_create_identity(state_dir: &Path) -> Result<String, String> {
     let path = path_in(state_dir, IDENTITY_FILE);
     if let Ok(text) = std::fs::read_to_string(&path) {
         let token = text.trim();
-        if !token.is_empty() {
+        if token.starts_with("ident_") {
             return Ok(token.to_string());
+        }
+        // 非空但不成形（不是空的首写中断）→ 拒绝静默换身份（换身份会导致重复置备）。
+        if !token.is_empty() {
+            return Err(format!(
+                "身份文件损坏 {}（内容不以 ident_ 开头）：修复或删除后重跑",
+                path.display()
+            ));
         }
     }
     let token = new_secret_token("ident")?;
@@ -150,7 +170,7 @@ pub fn load_or_create_instance_id(state_dir: &Path, gateway_id: &str) -> Result<
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let value = format!("{gateway_id}/boot-{boot}");
+    let value = format!("{gateway_id}/inst-{boot}");
     ensure_dir(state_dir)?;
     write_secret(&path, &value)?;
     Ok(value)
@@ -166,10 +186,39 @@ pub fn save_credential(
     write_secret(&path_in(state_dir, CREDENTIAL_FILE), &text)
 }
 
-/// 读运行期凭据；不存在或不可解析 → `None`。
+/// 运行期凭据的就位状态（区分「缺失」与「损坏」，不把损坏当缺失静默重置备）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CredentialStatus {
+    /// 文件不存在（首跑前置备状态）。
+    Missing,
+    /// 文件在但读不了/解析不了：**不可**当成缺失自动重置备。
+    Corrupt(String),
+    /// 就绪。
+    Present(wist_control::GatewayCredentialBundle),
+}
+
+/// 读运行期凭据的就位状态（见 [`CredentialStatus`]）。
+pub fn credential_status(state_dir: &Path) -> CredentialStatus {
+    let path = path_in(state_dir, CREDENTIAL_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return CredentialStatus::Missing,
+        Err(err) => {
+            return CredentialStatus::Corrupt(format!("读取失败 {}: {err}", path.display()));
+        }
+    };
+    match serde_json::from_str(&text) {
+        Ok(bundle) => CredentialStatus::Present(bundle),
+        Err(err) => CredentialStatus::Corrupt(format!("解析失败 {}: {err}", path.display())),
+    }
+}
+
+/// 读运行期凭据；不存在、损坏或不可解析 → `None`。
 pub fn load_credential(state_dir: &Path) -> Option<wist_control::GatewayCredentialBundle> {
-    let text = std::fs::read_to_string(path_in(state_dir, CREDENTIAL_FILE)).ok()?;
-    serde_json::from_str(&text).ok()
+    match credential_status(state_dir) {
+        CredentialStatus::Present(bundle) => Some(bundle),
+        _ => None,
+    }
 }
 
 /// 保存 link-upstream 返回的链接配置（信任锚 / 协议版本 / 注册 token 引用）—— 落盘留痕，不丢。
@@ -190,13 +239,11 @@ pub fn read_upgrade_record(state_dir: &Path) -> Option<UpgradeRecord> {
     serde_json::from_str(&text).ok()
 }
 
-/// 写升级记录。
+/// 写升级记录（**原子**：诊断/判死都在读它，半截写会被当成「无升级」）。
 pub fn write_upgrade_record(state_dir: &Path, record: &UpgradeRecord) -> Result<(), String> {
-    ensure_dir(state_dir)?;
     let text =
         serde_json::to_string_pretty(record).map_err(|err| format!("序列化升级记录失败: {err}"))?;
-    std::fs::write(path_in(state_dir, UPGRADE_RECORD_FILE), text)
-        .map_err(|err| format!("写升级记录失败: {err}"))
+    write_atomic(&path_in(state_dir, UPGRADE_RECORD_FILE), &text)
 }
 
 /// 读升级游标；不存在或不可解析 → 默认（无已驱计划）。
@@ -314,10 +361,18 @@ mod tests {
     }
 
     #[test]
+    fn a_corrupt_identity_is_an_error_not_a_silent_rotation() {
+        let dir = temp_dir("ident-corrupt");
+        std::fs::write(dir.join(IDENTITY_FILE), "garbage").expect("write");
+        assert!(load_or_create_identity(&dir).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn instance_id_is_stable_and_scoped_to_gateway() {
         let dir = temp_dir("instance");
         let first = load_or_create_instance_id(&dir, "gw-x").expect("instance");
-        assert!(first.starts_with("gw-x/boot-"));
+        assert!(first.starts_with("gw-x/inst-"));
         assert_eq!(
             first,
             load_or_create_instance_id(&dir, "gw-x").expect("instance")
@@ -338,7 +393,21 @@ mod tests {
             expires_at: wist_control::DateTime::now(),
         };
         save_credential(&dir, &bundle).expect("save");
-        assert_eq!(load_credential(&dir), Some(bundle));
+        assert_eq!(load_credential(&dir), Some(bundle.clone()));
+        assert_eq!(credential_status(&dir), CredentialStatus::Present(bundle));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_and_corrupt_credentials_are_distinguished() {
+        let dir = temp_dir("cred-status");
+        assert_eq!(credential_status(&dir), CredentialStatus::Missing);
+        std::fs::write(dir.join(CREDENTIAL_FILE), "{ not json").expect("write");
+        assert!(matches!(
+            credential_status(&dir),
+            CredentialStatus::Corrupt(_)
+        ));
+        assert_eq!(load_credential(&dir), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 

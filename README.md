@@ -36,12 +36,18 @@ state_dir = "/var/lib/wist-gwlinkd/state"
 gateway_self_endpoint = "https://127.0.0.1:3000"   # 网关容器自述面（环回）
 renew_lead_seconds = 3600                          # 凭据续期提前量
 upgrader_program = "gops"                          # 升级执行器
+upgrade_on_failure = "rollback-all"                # gops --on-failure（rollback-all | halt）
+upgrade_project_dir = "/opt/wist/gateway-prj"      # gops 工程根（含 ops-prj.yml；gops 从 cwd 解析）
+upgrade_project_name = "wist-gateway"              # 只升该系统（缺省 = 全部已导入系统）
 ```
 
 环境变量：`WIST_GWLINKD_CONFIG`（配置文件路径）、`WIST_GWLINKD_BOOTSTRAP_TOKEN`（首跑置备用的一次性引导 Token）。
 
 升级由常驻周期从中心 `GET /api/v1/gateway/upgrade-plan` 拉 desired 驱动（按 `plan_id` 幂等，游标落盘跨重启）。
-其余：同机**单实例**（`flock` 锁）、HTTP 带**超时**、`trust_bundle` 作为**自定义信任锚**、凭据**原子落盘**。
+执行器调用契约（gops 2.2.x）：`gops prj upgrade --to <版本|URL|路径> --on-failure <rollback-all|halt> --json [NAME]`；
+`--on-failure` 现阶段**必填**（缺省全回滚），`--json` 出机读结局（成功/失败/已回滚），执行器日志落
+`state_dir/wist-upgrader.log`。其余：同机**单实例**（`flock` 锁）、HTTP 带**超时**、`trust_bundle` 作为**自定义信任锚**、
+凭据**原子落盘**。
 
 ## 交付与升级
 
