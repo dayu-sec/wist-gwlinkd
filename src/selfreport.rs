@@ -12,10 +12,9 @@ pub struct GatewaySelfState {
     pub gateway_id: String,
     pub version: String,
     pub collected_at: wist_control::DateTime,
-    pub spool_backlog: i64,
-    pub work_grants_active: i64,
-    pub uplink_enabled: bool,
     pub store_healthy: bool,
+    pub agent_count: i64,
+    pub uplink_enabled: bool,
     #[serde(default)]
     pub last_error: Option<String>,
 }
