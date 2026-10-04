@@ -353,6 +353,21 @@ mod tests {
         assert!(!err.is_unauthorized(), "{err}");
     }
 
+    #[test]
+    fn build_mtls_http_client_rejects_a_bad_identity() {
+        assert!(build_mtls_http_client(None, "not a pem").is_err());
+    }
+
+    #[test]
+    fn build_mtls_http_client_accepts_a_real_certificate_and_key() {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let cert = rcgen::CertificateParams::default()
+            .self_signed(&key)
+            .expect("cert");
+        let pem = format!("{}\n{}", cert.pem(), key.serialize_pem());
+        assert!(build_mtls_http_client(None, &pem).is_ok());
+    }
+
     fn status_payload() -> ReportGatewayStatus {
         ReportGatewayStatus {
             gateway_id: "gw-1".into(),

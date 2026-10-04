@@ -133,6 +133,9 @@ async fn run(config: &Config) -> Result<(), String> {
     let mut next_renew_at = Instant::now();
     let mut status_backoff = Duration::ZERO;
     let mut next_status_at = Instant::now();
+    // 轮换收尾的三态对齐标记（内存 credential / 磁盘 / mTLS 客户端）：失败则下一轮自愈重试。
+    let mut credential_dirty = false;
+    let mut client_stale = false;
 
     // 启动收尾：上次运行留下的「被判死」升级（升级器被中断，机器可能停在中间态）。
     // 放在循环外只做一次（这是「上一次运行」的遗留态，不是运行中会反复出现的东西）。
@@ -159,6 +162,25 @@ async fn run(config: &Config) -> Result<(), String> {
     loop {
         ticker.tick().await;
 
+        // 上一轮轮换若有收尾未完成（内存/磁盘/客户端未对齐），先自愈重试。
+        if credential_dirty && let Err(err) = state::save_credential(&config.state_dir, &credential)
+        {
+            eprintln!("event=CredentialSaveRetryFailed error={err}");
+        } else if credential_dirty {
+            credential_dirty = false;
+            println!("event=CredentialSaved gateway_id={}", config.gateway_id);
+        }
+        if client_stale {
+            match mtls_client(config, trust, &credential) {
+                Ok(rebuilt) => {
+                    client = rebuilt;
+                    client_stale = false;
+                    println!("event=MtlsClientRebuilt gateway_id={}", config.gateway_id);
+                }
+                Err(err) => eprintln!("event=MtlsClientRebuildRetryFailed error={err}"),
+            }
+        }
+
         // 到期前轮换：当场再生成一套密钥对 → 以当前证书证明身份 + 新 CSR → 换新证书（旧证书作废）。
         if credential.seconds_remaining() <= renew_lead && Instant::now() >= next_renew_at {
             let keypair = match identity::generate_client_keypair(&config.gateway_id) {
@@ -180,15 +202,26 @@ async fn run(config: &Config) -> Result<(), String> {
                         bundle: renewed,
                         private_key_pem: keypair.private_key_pem,
                     };
-                    // 先重建 mTLS 客户端（旧证书已在中心侧作废）；落盘失败不拖死常驻（下一轮还会再续）。
-                    match mtls_client(config, trust, &new_credential) {
-                        Ok(new_client) => client = new_client,
-                        Err(err) => eprintln!("event=MtlsClientRebuildFailed error={err}"),
-                    }
-                    if let Err(err) = state::save_credential(&config.state_dir, &new_credential) {
-                        eprintln!("event=CredentialSaveFailed error={err}");
-                    }
+                    // 先换内存态 + mTLS 客户端（旧证书已在中心侧作废），再落盘；
+                    // 落盘/重建失败均置脏标记，下一轮循环自愈重试（不拖死常驻）。
                     credential = new_credential;
+                    match mtls_client(config, trust, &credential) {
+                        Ok(rebuilt) => {
+                            client = rebuilt;
+                            client_stale = false;
+                        }
+                        Err(err) => {
+                            client_stale = true;
+                            eprintln!("event=MtlsClientRebuildFailed error={err}");
+                        }
+                    }
+                    match state::save_credential(&config.state_dir, &credential) {
+                        Ok(()) => credential_dirty = false,
+                        Err(err) => {
+                            credential_dirty = true;
+                            eprintln!("event=CredentialSaveFailed error={err}");
+                        }
+                    }
                     renew_backoff = Duration::ZERO;
                     next_renew_at = Instant::now();
                     println!("event=CredentialRenewed gateway_id={}", config.gateway_id);

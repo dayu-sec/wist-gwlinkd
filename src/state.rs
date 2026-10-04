@@ -468,6 +468,47 @@ mod tests {
     }
 
     #[test]
+    fn certificate_serial_hex_reads_the_real_serial() {
+        let cert = rcgen::generate_simple_self_signed(vec!["gw-1".to_string()]).expect("cert");
+        let credential = StoredCredential {
+            bundle: GatewayCredentialBundle {
+                certificate: cert.cert.pem(),
+                ..stored_credential().bundle
+            },
+            private_key_pem: "unused".into(),
+        };
+        let serial = credential.certificate_serial_hex().expect("serial");
+        assert!(!serial.is_empty());
+        assert!(serial.chars().all(|c| c.is_ascii_hexdigit()), "{serial}");
+    }
+
+    #[test]
+    fn certificate_serial_hex_errors_on_a_non_certificate() {
+        let credential = StoredCredential {
+            bundle: GatewayCredentialBundle {
+                certificate: "not a certificate".into(),
+                ..stored_credential().bundle
+            },
+            private_key_pem: "unused".into(),
+        };
+        assert!(credential.certificate_serial_hex().is_err());
+    }
+
+    #[test]
+    fn seconds_remaining_handles_none_past_and_future() {
+        let mut credential = stored_credential();
+
+        credential.bundle.not_after = None;
+        assert_eq!(credential.seconds_remaining(), i64::MAX);
+
+        credential.bundle.not_after = Some("2000-01-01T00:00:00+00:00".into());
+        assert_eq!(credential.seconds_remaining(), 0, "已过期应夹到 0");
+
+        credential.bundle.not_after = Some("2999-01-01T00:00:00+00:00".into());
+        assert!(credential.seconds_remaining() > 0);
+    }
+
+    #[test]
     fn missing_and_corrupt_credentials_are_distinguished() {
         let dir = temp_dir("cred-status");
         assert_eq!(credential_status(&dir), CredentialStatus::Missing);
