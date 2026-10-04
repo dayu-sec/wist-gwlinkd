@@ -16,7 +16,7 @@ pub struct Config {
     /// 本机网关容器**自述面** endpoint（如 `https://127.0.0.1:3000`；缺省则不消费自述面）。
     #[serde(default)]
     pub gateway_self_endpoint: Option<String>,
-    /// 运行期凭据续期提前量（秒，缺省 3600）。
+    /// 客户端证书轮换提前量（秒，缺省 3600）。
     #[serde(default)]
     pub renew_lead_seconds: Option<i64>,
     /// 升级执行器程序（缺省 `gops`）。

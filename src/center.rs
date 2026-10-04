@@ -131,8 +131,8 @@ impl CenterClient {
 
     /// 链接上级：`GET /api/v1/gateway/link-upstream?gateway_id=`。
     ///
-    /// - 未初始化：`Bearer <bootstrap>` + `X-Gateway-Identity-Token: <ident_>`；
-    /// - 已初始化：`Bearer <rt_>`（可不带身份头）。
+    /// **只用于首跑置备**（本地还没有客户端证书时）：`Bearer <bootstrap>` +
+    /// `X-Gateway-Identity-Token: <ident_>`。已注册后不再调此端点（直接走 mTLS）。
     pub async fn link_upstream(
         &self,
         gateway_id: &str,

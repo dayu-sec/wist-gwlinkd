@@ -3,8 +3,8 @@
 //! 「网关 / 升级器死没死」的判据只在这里定义；[`crate::doctor`]、上报、升级记账都复用它 ——
 //! 不许各写一套，否则「判定说死了、诊断说没事」就会打架。
 //!
-//! 同时承载本机的**身份与凭据**：网关身份 `ident_`（首跑自生成、中心不存）与运行期凭据
-//! `rt_`（`register` 后签发，本进程是唯一持有者）。
+//! 同时承载本机的**身份与凭据**：网关身份 `ident_`（首跑自生成、中心不存）与**客户端证书+私钥**
+//! （`register` 后签发，本进程是唯一持有者；私钥永不出本机）。
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -25,7 +25,7 @@ pub const UPGRADE_CURSOR_FILE: &str = "upgrade-cursor.json";
 pub const IDENTITY_FILE: &str = "identity";
 /// 一次运行的实例标识文件（注册用，重启保持稳定）。
 pub const INSTANCE_FILE: &str = "instance";
-/// 运行期凭据文件。
+/// 客户端证书+私钥文件（`StoredCredential`，0600）。
 pub const CREDENTIAL_FILE: &str = "credential.json";
 /// link-upstream 返回的链接配置（信任锚 / 协议版本 / 注册 token 引用）。
 pub const LINK_CONFIG_FILE: &str = "link-config.json";
