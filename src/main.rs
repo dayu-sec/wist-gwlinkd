@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime};
 
 use wist_control::{DateTime, ReportGatewayStatus};
-use wist_gwlinkd::center::{self, CenterClient};
+use wist_gwlinkd::center::{self, CenterClient, CenterError};
 use wist_gwlinkd::config::Config;
 use wist_gwlinkd::doctor::{self, Status};
 use wist_gwlinkd::identity;
@@ -82,7 +82,10 @@ async fn run(config: &Config) -> Result<(), String> {
     };
 
     match state::credential_status(&config.state_dir) {
-        CredentialStatus::Present(_) => {}
+        CredentialStatus::Present(_) => {
+            // 已有客户端证书：遗留的 RegistToken 一定是旧的，清掉（避免误用）。
+            state::clear_regist_token(&config.state_dir);
+        }
         CredentialStatus::Missing => {
             // 首跑还没客户端证书：用无身份的客户端走 link-upstream + register（bootstrap）。
             let bootstrap = center::build_http_client(trust)?;
@@ -319,11 +322,11 @@ async fn run(config: &Config) -> Result<(), String> {
                     println!("event=StatusReported gateway_id={}", config.gateway_id);
                 }
                 Err(err) if err.is_unauthorized() => {
-                    // 运行期凭据被拒：**退避**（不每 30s 猛击），并明确要中心重置该实例。
+                    // 客户端证书被拒：**退避**（不每 30s 猛击），并明确要中心重置该实例。
                     status_backoff = back_off(status_backoff);
                     next_status_at = Instant::now() + status_backoff;
                     eprintln!(
-                        "event=CredentialRejected gateway_id={} backoff={status_backoff:?}（运行期凭据已失效；需管理员在中心重置该实例后重新置备）error={err}",
+                        "event=CredentialRejected gateway_id={} backoff={status_backoff:?}（客户端证书已失效；需管理员在中心重置该实例后重新置备）error={err}",
                         config.gateway_id
                     );
                 }
@@ -344,13 +347,35 @@ fn back_off(current: Duration) -> Duration {
 
 /// 首跑置备：link-upstream（一次性 bootstrap + 身份头）→ 落链接配置 → 生成密钥对+CSR →
 /// register（中心签出客户端证书）→ 落长期身份（证书 + 私钥）。
+///
+/// **可重试**：`link-upstream` 成功即把 RegistToken 落盘；若随后 `register` 失败（网络等），
+/// 下次直接拿落盘的 token 重试，**不再需要 bootstrap**（bootstrap 已被消费）。
 async fn onboard(client: &CenterClient, config: &Config, identity: &str) -> Result<(), String> {
+    let instance_id = state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)?;
+
+    // 复用上次未消费的 RegistToken（link-upstream 已成功、register 未成的遗留）：直接重试注册。
+    if let Some(regist_token) = state::load_regist_token(&config.state_dir) {
+        println!("event=RegisterRetry gateway_id={}", config.gateway_id);
+        match register_once(client, config, &regist_token, &instance_id).await {
+            Ok(()) => {
+                state::clear_regist_token(&config.state_dir);
+                return Ok(());
+            }
+            Err(err) if err.is_unauthorized() => {
+                // token 已失效/已被消费：丢弃，走完整首跑（需 bootstrap）。
+                eprintln!("event=RegistTokenStale 清掉遗留 token，重走首跑");
+                state::clear_regist_token(&config.state_dir);
+            }
+            // 网络类错误：保留 token，下次再试。
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+
     let bootstrap = std::env::var("WIST_GWLINKD_BOOTSTRAP_TOKEN").map_err(|_| {
         "首跑需要 WIST_GWLINKD_BOOTSTRAP_TOKEN（中心 admin 创建实例时签发的引导 Token）；\
          若本机曾有身份，请检查 state/credential.json 是否损坏"
             .to_string()
     })?;
-    let instance_id = state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)?;
 
     println!("event=LinkUpstream gateway_id={}", config.gateway_id);
     let returned = client
@@ -364,20 +389,34 @@ async fn onboard(client: &CenterClient, config: &Config, identity: &str) -> Resu
          请在中心重置该实例后重跑，或把既有的客户端证书/私钥写入 state/credential.json"
             .to_string()
     })?;
+    // **先落盘再注册**：bootstrap 已消费，注册失败也要能靠这个 token 重试。
+    state::save_regist_token(&config.state_dir, &regist_token)?;
 
-    // 首跑当场生成密钥对：私钥不上送，只交 CSR；中心用 CA-G 签出客户端证书。
-    let keypair = identity::generate_client_keypair(&config.gateway_id)?;
-
-    println!("event=Register gateway_id={}", config.gateway_id);
-    let result = client
-        .register(&regist_token, &instance_id, &keypair.csr_pem)
+    register_once(client, config, &regist_token, &instance_id)
         .await
         .map_err(|err| err.to_string())?;
+    state::clear_regist_token(&config.state_dir);
+    Ok(())
+}
+
+/// 用 RegistToken 完成一次注册：当场生成密钥对（私钥不上送，只交 CSR）、落长期身份。
+async fn register_once(
+    client: &CenterClient,
+    config: &Config,
+    regist_token: &str,
+    instance_id: &str,
+) -> Result<(), CenterError> {
+    let keypair =
+        identity::generate_client_keypair(&config.gateway_id).map_err(CenterError::Other)?;
+    println!("event=Register gateway_id={}", config.gateway_id);
+    let result = client
+        .register(regist_token, instance_id, &keypair.csr_pem)
+        .await?;
     let credential = state::StoredCredential {
         bundle: result.credential_bundle,
         private_key_pem: keypair.private_key_pem,
     };
-    state::save_credential(&config.state_dir, &credential)?;
+    state::save_credential(&config.state_dir, &credential).map_err(CenterError::Other)?;
     println!(
         "event=Registered gateway_id={} credential_id={}",
         result.gateway_id, result.credential_id

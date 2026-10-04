@@ -29,6 +29,9 @@ pub const INSTANCE_FILE: &str = "instance";
 pub const CREDENTIAL_FILE: &str = "credential.json";
 /// link-upstream 返回的链接配置（信任锚 / 协议版本 / 注册 token 引用）。
 pub const LINK_CONFIG_FILE: &str = "link-config.json";
+/// 首跑置备遗留的**注册 token**：link-upstream 已签发、register 尚未消费时落盘，
+/// 使 register 失败（网络）后下次可**免 bootstrap** 重试。
+pub const REGIST_TOKEN_FILE: &str = "regist-token";
 /// 单实例锁文件。
 pub const LOCK_FILE: &str = "gwlinkd.lock";
 
@@ -269,6 +272,23 @@ pub fn load_credential(state_dir: &Path) -> Option<StoredCredential> {
         CredentialStatus::Present(credential) => Some(credential),
         _ => None,
     }
+}
+
+/// 保存待消费的 RegistToken（首跑 register 前落盘；register 成功或已失效时清）。
+pub fn save_regist_token(state_dir: &Path, token: &str) -> Result<(), String> {
+    write_secret(&path_in(state_dir, REGIST_TOKEN_FILE), token)
+}
+
+/// 读待消费的 RegistToken；不存在 / 空白 → `None`。
+pub fn load_regist_token(state_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path_in(state_dir, REGIST_TOKEN_FILE)).ok()?;
+    let token = text.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+/// 清掉待消费的 RegistToken（register 成功，或已确认失效）。幂等。
+pub fn clear_regist_token(state_dir: &Path) {
+    let _ = std::fs::remove_file(path_in(state_dir, REGIST_TOKEN_FILE));
 }
 
 /// 保存 link-upstream 返回的链接配置（信任锚 / 协议版本 / 注册 token 引用）—— 落盘留痕，不丢。
@@ -519,6 +539,24 @@ mod tests {
         ));
         assert_eq!(load_credential(&dir), None);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn regist_token_persists_loads_and_clears() {
+        let dir = temp_dir("regist");
+        assert_eq!(load_regist_token(&dir), None);
+
+        save_regist_token(&dir, "reg_abc").expect("save");
+        assert_eq!(load_regist_token(&dir).as_deref(), Some("reg_abc"));
+
+        // 空白不算（与身份文件同口径）。
+        save_regist_token(&dir, "   ").expect("save blank");
+        assert_eq!(load_regist_token(&dir), None);
+
+        save_regist_token(&dir, "reg_xyz").expect("save");
+        clear_regist_token(&dir);
+        assert_eq!(load_regist_token(&dir), None);
+        clear_regist_token(&dir); // 幂等：再清一次不报错
     }
 
     #[test]

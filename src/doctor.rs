@@ -102,12 +102,31 @@ pub fn diagnose(config: &Config) -> Report {
         config_check(config),
         trust_check(config),
         credential_check(config),
+        regist_token_check(config),
         self_endpoint_check(config),
         upgrader_check(config),
         upgrade_check(config),
         reachability_check(config),
     ];
     Report { checks }
+}
+
+/// 首跑置备遗留：有未消费的 RegistToken（link-upstream 成功、register 未成）。
+/// 留着是好状态 —— 下次启动会**免 bootstrap** 直接重试注册。
+fn regist_token_check(config: &Config) -> Check {
+    match state::load_regist_token(&config.state_dir) {
+        Some(_) => Check::warn(
+            "credential.pending_regist",
+            "有未完成的注册（待消费 RegistToken）",
+            "上次 link-upstream 成功但 register 未完成；不会丢，下次启动会重试",
+        )
+        .with_hint("运行 `wist-gwlinkd run` 完成注册（**无需**再设 bootstrap token）"),
+        None => Check::ok(
+            "credential.pending_regist",
+            "无待完成的注册",
+            "无遗留 RegistToken",
+        ),
+    }
 }
 
 /// endpoint 形态（空 / 非法 scheme → 早退）。
@@ -416,6 +435,21 @@ mod tests {
         let dir = temp_dir("cred");
         assert_eq!(
             status_of(&diagnose(&config(&dir)), "credential.local"),
+            Status::Warn
+        );
+    }
+
+    #[test]
+    fn a_pending_regist_token_is_a_warning() {
+        let dir = temp_dir("regist");
+        let cfg = config(&dir);
+        assert_eq!(
+            status_of(&diagnose(&cfg), "credential.pending_regist"),
+            Status::Ok
+        );
+        state::save_regist_token(&dir, "reg_abc").expect("save");
+        assert_eq!(
+            status_of(&diagnose(&cfg), "credential.pending_regist"),
             Status::Warn
         );
     }
