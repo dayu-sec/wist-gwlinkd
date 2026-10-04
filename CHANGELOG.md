@@ -7,4 +7,5 @@
 
 首个骨架：host 侧常驻的 CLI（`run` / `diagnose`）与模块边界（config / state / center / upgrade / doctor），
 外加**唯一来源的判死判据**（`state::{heartbeat_is_fresh, UPGRADER_DEAD_AFTER}`）。
-对接 `WistCenter`（link-upstream / register / status / renew）与升级驱动尚为骨架。见 CR-003。
+对接 `WistCenter`（link-upstream / register / status / credentials:renew）、网关**自述面消费**（环回）、
+凭据**续期**、升级**驱动 + 回执**（`upgrade-result`），身份/实例/凭据落盘。见 CR-003。

@@ -28,9 +28,18 @@ wist-gwlinkd version
 
 ```toml
 control_center_endpoint = "https://dayu-01.example"
+gateway_id = "gw-001"
 trust_bundle = "/etc/wist-gwlinkd/ca/control-center.pem"
 state_dir = "/var/lib/wist-gwlinkd/state"
+
+# 可选：
+gateway_self_endpoint = "https://127.0.0.1:3000"   # 网关容器自述面（环回）
+renew_lead_seconds = 3600                          # 凭据续期提前量
+upgrader_program = "gops"                          # 升级执行器
 ```
+
+环境变量：`WIST_GWLINKD_CONFIG`（配置文件路径）、`WIST_GWLINKD_BOOTSTRAP_TOKEN`（首跑置备用的一次性引导 Token）、
+`WIST_GWLINKD_UPGRADE_TO`（手动触发一次升级，占位 CR-002 C2 的「拉 desired」）。
 
 ## 交付与升级
 

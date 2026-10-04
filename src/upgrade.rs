@@ -1,4 +1,4 @@
-//! 升级闭环：拉 desired → 幂等 → 驱动执行器（`gops prj upgrade`）→ 回执。
+//! 升级闭环：拉 desired → 幂等 → 驱动执行器（`gops prj upgrade`）→ **回执**。
 //!
 //! **不实现制品**（下载 / 校验 / 原子切换归 `gops`）；这里只**驱动 + 记账 + 回执**。
 //! 执行器是**瞬态进程**，不被本常驻托管 —— 升级时本进程要能跨过它（这正是「容器外常驻」的意义）。
@@ -6,10 +6,20 @@
 use std::path::PathBuf;
 use std::process::Stdio;
 
+use wist_control::GatewayCredentialBundle;
+
+use crate::center::CenterClient;
 use crate::state::{self, UpgradeRecord};
 
 /// 缺省升级执行器程序名。
 pub const DEFAULT_UPGRADER_PROGRAM: &str = "gops";
+
+/// 升级回执的投递方（中心客户端 + 运行期凭据）。
+#[derive(Debug, Clone)]
+pub struct UpgradeReporter {
+    pub client: CenterClient,
+    pub credential: GatewayCredentialBundle,
+}
 
 /// 升级驱动：把一次「升到某版本」交给执行器，并在状态目录记账 + 心跳。
 #[derive(Debug, Clone)]
@@ -29,7 +39,8 @@ impl UpgradeDriver {
         }
     }
 
-    /// 驱动一次升级：写 `running` 记录 + 初始心跳，起执行器 `{program} prj upgrade --to <version>`。
+    /// 驱动一次升级：写 `running` 记录 + 初始心跳，起执行器 `{program} prj upgrade --to <version>`；
+    /// 执行器结束后写终态记录，并（若给了 `reporter`）**回执**中心。
     ///
     /// 返回后升级在后台进行；执行器（宿主侧）应周期 [`state::touch_heartbeat`]，超时无心跳即判死
     /// （[`state::upgrader_is_declared_dead`]）。**执行器不被本进程托管**（跨重启）。
@@ -38,8 +49,9 @@ impl UpgradeDriver {
         work_id: &str,
         from_version: &str,
         to_version: &str,
+        reporter: Option<UpgradeReporter>,
     ) -> Result<(), String> {
-        let record = UpgradeRecord {
+        let mut record = UpgradeRecord {
             work_id: work_id.to_string(),
             from_version: from_version.to_string(),
             to_version: to_version.to_string(),
@@ -57,10 +69,29 @@ impl UpgradeDriver {
             .spawn()
             .map_err(|err| format!("启动升级执行器 {} 失败: {err}", self.program))?;
 
-        // 回收子进程，避免僵尸（升级跨越本进程重启由执行器自身保证，不依赖此等待）。
+        let state_dir = self.state_dir.clone();
         tokio::spawn(async move {
-            let _ = child.wait().await;
-            // TODO(④): 等完后写终态到 upgrade.json 并回执 `upgrade-result` 给中心。
+            let (ok, detail) = match child.wait().await {
+                Ok(exit) if exit.success() => (true, format!("executor {exit}")),
+                Ok(exit) => (false, format!("executor {exit}")),
+                Err(err) => (false, format!("wait failed: {err}")),
+            };
+            record.status = if ok { "done" } else { "failed" }.to_string();
+            record.step = "verify".to_string();
+            record.detail = detail;
+            if let Err(err) = state::write_upgrade_record(&state_dir, &record) {
+                eprintln!("event=UpgradeRecordWriteFailed error={err}");
+            }
+            if let Some(reporter) = reporter {
+                match reporter
+                    .client
+                    .report_upgrade_result(&reporter.credential, &record)
+                    .await
+                {
+                    Ok(()) => println!("event=UpgradeReported work_id={}", record.work_id),
+                    Err(err) => eprintln!("event=UpgradeReportFailed error={err}"),
+                }
+            }
         });
         Ok(())
     }

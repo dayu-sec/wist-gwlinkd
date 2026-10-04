@@ -125,6 +125,25 @@ impl CenterClient {
             .map_err(|err| format!("renew 请求失败: {err}"))?;
         decode(response, "renew").await
     }
+
+    /// 升级回执：`POST /api/v1/gateway/upgrade-result`（字段对齐 `upgrade.json`）。
+    pub async fn report_upgrade_result(
+        &self,
+        credential: &GatewayCredentialBundle,
+        record: &crate::state::UpgradeRecord,
+    ) -> Result<(), String> {
+        let url = format!("{}/api/v1/gateway/upgrade-result", self.endpoint);
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(&credential.bearer_token)
+            .json(record)
+            .send()
+            .await
+            .map_err(|err| format!("upgrade-result 请求失败: {err}"))?;
+        let _: serde_json::Value = decode(response, "upgrade-result").await?;
+        Ok(())
+    }
 }
 
 /// 解码响应：非 2xx → 带状态码与响应体的错误；2xx → 反序列化。

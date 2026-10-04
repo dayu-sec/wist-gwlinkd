@@ -2,12 +2,15 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
-use wist_control::ReportGatewayStatus;
+use wist_control::{DateTime, ReportGatewayStatus};
 use wist_gwlinkd::center::CenterClient;
 use wist_gwlinkd::config::Config;
 use wist_gwlinkd::doctor::{self, Status};
+use wist_gwlinkd::selfreport::SelfReportClient;
 use wist_gwlinkd::state;
+use wist_gwlinkd::upgrade::{DEFAULT_UPGRADER_PROGRAM, UpgradeDriver, UpgradeReporter};
 
 /// 运行期状态上报周期（秒）。
 const STATUS_INTERVAL_SECS: u64 = 30;
@@ -53,7 +56,7 @@ async fn main() -> ExitCode {
     }
 }
 
-/// 常驻：首跑置备（若未注册），随后周期上报状态。
+/// 常驻：首跑置备（若未注册），随后**续期 + 拉自述面 + 周期上报**。
 async fn run(config: &Config) -> Result<(), String> {
     let identity = state::load_or_create_identity(&config.state_dir)?;
     let client = CenterClient::new(config.control_center_endpoint.clone());
@@ -61,21 +64,70 @@ async fn run(config: &Config) -> Result<(), String> {
     if state::load_credential(&config.state_dir).is_none() {
         onboard(&client, config, &identity).await?;
     }
-    let credential = state::load_credential(&config.state_dir)
+    let mut credential = state::load_credential(&config.state_dir)
         .ok_or_else(|| "注册后仍无运行期凭据".to_string())?;
 
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(STATUS_INTERVAL_SECS));
+    let self_client = config
+        .gateway_self_endpoint
+        .as_deref()
+        .map(SelfReportClient::new);
+    let renew_lead = config.renew_lead_seconds.unwrap_or(3600);
+    let driver = UpgradeDriver::new(
+        config
+            .upgrader_program
+            .clone()
+            .unwrap_or_else(|| DEFAULT_UPGRADER_PROGRAM.to_string()),
+        config.state_dir.clone(),
+    );
+
+    // 手动触发一次升级（占位 CR-002 C2 的「拉 desired」）：设了 WIST_GWLINKD_UPGRADE_TO 就驱动一次。
+    if let Ok(to_version) = std::env::var("WIST_GWLINKD_UPGRADE_TO") {
+        let reporter = UpgradeReporter {
+            client: client.clone(),
+            credential: credential.clone(),
+        };
+        driver
+            .start("manual", wist_gwlinkd::VERSION, &to_version, Some(reporter))
+            .await?;
+    }
+
+    let mut ticker = tokio::time::interval(Duration::from_secs(STATUS_INTERVAL_SECS));
     loop {
         ticker.tick().await;
+
+        // 到期前续期（旧凭据立即失效，新凭据落盘）。
+        if DateTime::now().seconds_until(&credential.expires_at) <= renew_lead {
+            match client.renew_credential(&credential).await {
+                Ok(renewed) => {
+                    state::save_credential(&config.state_dir, &renewed)?;
+                    credential = renewed;
+                    println!("event=CredentialRenewed gateway_id={}", config.gateway_id);
+                }
+                Err(err) => eprintln!("event=RenewFailed error={err}"),
+            }
+        }
+
+        // 拉网关自述面（准确状态的来源）；不答则把「沉默」当判断，上报 unknown。
+        let health = match &self_client {
+            Some(self_client) => match self_client.fetch(&config.gateway_id).await {
+                Ok(self_state) => self_state.health().to_string(),
+                Err(err) => {
+                    eprintln!("event=SelfStateFailed error={err}");
+                    "unknown".to_string()
+                }
+            },
+            None => "ok".to_string(),
+        };
+
         let payload = ReportGatewayStatus {
             gateway_id: config.gateway_id.clone(),
             instance_id: credential.instance_id.clone(),
             version: wist_gwlinkd::VERSION.to_string(),
             status: "running".to_string(),
-            health: "ok".to_string(),
+            health,
             memory_bytes: None,
             cpu_percent: None,
-            reported_at: wist_control::DateTime::now(),
+            reported_at: DateTime::now(),
         };
         match client.report_status(&credential, &payload).await {
             Ok(()) => println!("event=StatusReported gateway_id={}", config.gateway_id),

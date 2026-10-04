@@ -10,6 +10,7 @@
 pub mod center;
 pub mod config;
 pub mod doctor;
+pub mod selfreport;
 pub mod state;
 pub mod upgrade;
 
