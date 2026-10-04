@@ -126,6 +126,28 @@ async fn run(config: &Config) -> Result<(), String> {
     let mut status_backoff = Duration::ZERO;
     let mut next_status_at = Instant::now();
 
+    // 启动收尾：上次运行留下的「被判死」升级（升级器被中断，机器可能停在中间态）。
+    // 放在循环外只做一次（这是「上一次运行」的遗留态，不是运行中会反复出现的东西）。
+    if state::upgrader_is_declared_dead(&config.state_dir, SystemTime::now())
+        && state::load_upgrade_cursor(&config.state_dir)
+            .last_plan_id
+            .is_some()
+    {
+        if config.upgrade_retry_on_dead.unwrap_or(true) {
+            // 清游标 → 同一计划可被下面的循环重新驱动。并发安全：gops 自带工程交付锁串行化两次调用。
+            eprintln!("event=DeadUpgradeDetected 清游标以便重驱同一计划");
+            if let Err(err) =
+                state::save_upgrade_cursor(&config.state_dir, &UpgradeCursor::default())
+            {
+                eprintln!("event=CursorClearFailed error={err}");
+            }
+        } else {
+            eprintln!(
+                "event=DeadUpgradeDetected 未自动重试（upgrade_retry_on_dead=false）：请到管理面重派升级"
+            );
+        }
+    }
+
     loop {
         ticker.tick().await;
 
@@ -149,22 +171,6 @@ async fn run(config: &Config) -> Result<(), String> {
                     next_renew_at = Instant::now() + renew_backoff;
                     eprintln!("event=RenewFailed backoff={renew_backoff:?} error={err}");
                 }
-            }
-        }
-
-        // 上一次升级被判死（升级器被中断，机器可能停在中间态）：清游标，让本次能把同一计划**重新驱动**。
-        // 只对「判死（心跳陈旧）」清 —— 执行器真失败（failed/rolled_back）不在此列，不会陷入重试。
-        // 并发安全：即便上一轮的执行器成了孤儿还在跑，gops 自带工程交付锁会串起两次调用。
-        if state::upgrader_is_declared_dead(&config.state_dir, SystemTime::now())
-            && state::load_upgrade_cursor(&config.state_dir)
-                .last_plan_id
-                .is_some()
-        {
-            eprintln!("event=DeadUpgradeDetected 清游标以便重驱同一计划");
-            if let Err(err) =
-                state::save_upgrade_cursor(&config.state_dir, &UpgradeCursor::default())
-            {
-                eprintln!("event=CursorClearFailed error={err}");
             }
         }
 

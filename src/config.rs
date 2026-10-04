@@ -31,6 +31,12 @@ pub struct Config {
     /// 只升级该系统（gops 位置参数 NAME；缺省 = 工程里全部已导入系统）。
     #[serde(default)]
     pub upgrade_project_name: Option<String>,
+    /// 升级被判死（心跳陈旧）后，是否自动清游标重驱同一计划（缺省 `true`）。
+    ///
+    /// - `true`：常驻自愈（可能重驱一个已被中断、实际还在跑的计划；靠 gops 工程锁串行化）；
+    /// - `false`：仅报告，交由**管理面重派**（更保守，但机器会停在中间态直到人工介入）。
+    #[serde(default)]
+    pub upgrade_retry_on_dead: Option<bool>,
 }
 
 impl Config {
@@ -71,6 +77,7 @@ mod tests {
         assert!(config.upgrade_on_failure.is_none());
         assert!(config.upgrade_project_dir.is_none());
         assert!(config.upgrade_project_name.is_none());
+        assert!(config.upgrade_retry_on_dead.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -80,6 +87,26 @@ mod tests {
         let path = dir.join("gwlinkd.toml");
         std::fs::write(&path, "control_center_endpoint = \"https://c\"\n").expect("write");
         assert!(Config::load(&path).is_err(), "缺 gateway_id 必须报错");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn optional_upgrade_knobs_parse() {
+        let dir = temp_dir("upgrade-knobs");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\nupgrade_on_failure = \"halt\"\nupgrade_project_dir = \"/opt/prj\"\nupgrade_project_name = \"wist-gateway\"\nupgrade_retry_on_dead = false\n",
+        )
+        .expect("write");
+        let config = Config::load(&path).expect("load");
+        assert_eq!(config.upgrade_on_failure.as_deref(), Some("halt"));
+        assert_eq!(
+            config.upgrade_project_dir.as_deref(),
+            Some(std::path::Path::new("/opt/prj"))
+        );
+        assert_eq!(config.upgrade_project_name.as_deref(), Some("wist-gateway"));
+        assert_eq!(config.upgrade_retry_on_dead, Some(false));
         let _ = std::fs::remove_dir_all(dir);
     }
 

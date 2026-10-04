@@ -382,6 +382,7 @@ mod tests {
             upgrade_on_failure: None,
             upgrade_project_dir: None,
             upgrade_project_name: None,
+            upgrade_retry_on_dead: None,
         }
     }
 

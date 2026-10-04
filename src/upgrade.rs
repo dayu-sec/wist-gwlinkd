@@ -130,7 +130,24 @@ impl UpgradeDriver {
         }
 
         let mut command = tokio::process::Command::new(&self.program);
-        command.args(&args).stdout(Stdio::piped()).stderr(stderr);
+        command
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            // 常驻一旦退出（含被 SIGKILL），不把执行器留成孤儿继续动现场。
+            .kill_on_drop(true);
+        // Linux：父进程死亡即给执行器发 SIGTERM（比 kill_on_drop 的 SIGKILL 温和，给 gops 机会善后）。
+        // macOS 无 PDEATHSIG：靠 kill_on_drop（正常退出时）+ systemd cgroup（Linux 宿主）兼容。
+        #[cfg(target_os = "linux")]
+        unsafe {
+            // SAFETY: `pre_exec` 在 fork 后 exec 前跑，回调里只调 async-signal-safe 的 `prctl`。
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         if let Some(dir) = &self.project_dir {
             command.current_dir(dir);
         }

@@ -39,6 +39,7 @@ upgrader_program = "gops"                          # 升级执行器
 upgrade_on_failure = "rollback-all"                # gops --on-failure（rollback-all | halt）
 upgrade_project_dir = "/opt/wist/gateway-prj"      # gops 工程根（含 ops-prj.yml；gops 从 cwd 解析）
 upgrade_project_name = "wist-gateway"              # 只升该系统（缺省 = 全部已导入系统）
+upgrade_retry_on_dead = true                       # 判死后是否自动重驱同一计划（false = 只交管理面重派）
 ```
 
 环境变量：`WIST_GWLINKD_CONFIG`（配置文件路径）、`WIST_GWLINKD_BOOTSTRAP_TOKEN`（首跑置备用的一次性引导 Token）。
@@ -46,7 +47,8 @@ upgrade_project_name = "wist-gateway"              # 只升该系统（缺省 = 
 升级由常驻周期从中心 `GET /api/v1/gateway/upgrade-plan` 拉 desired 驱动（按 `plan_id` 幂等，游标落盘跨重启）。
 执行器调用契约（gops 2.2.x）：`gops prj upgrade --to <版本|URL|路径> --on-failure <rollback-all|halt> --json [NAME]`；
 `--on-failure` 现阶段**必填**（缺省全回滚），`--json` 出机读结局（成功/失败/已回滚），执行器日志落
-`state_dir/wist-upgrader.log`。其余：同机**单实例**（`flock` 锁）、HTTP 带**超时**、`trust_bundle` 作为**自定义信任锚**、
+`state_dir/wist-upgrader.log`。**常驻退出时会收走执行器**（`kill_on_drop` + Linux `PR_SET_PDEATHSIG`），
+不留孤儿执行器继续动现场。其余：同机**单实例**（`flock` 锁）、HTTP 带**超时**、`trust_bundle` 作为**自定义信任锚**、
 凭据**原子落盘**。
 
 ## 交付与升级
