@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use ring::rand::{SecureRandom, SystemRandom};
+use wist_contracts::gateway_control::GatewayCredentialBundle;
 
 /// 心跳超过该时长即判死（与 `wist-agentd` 同量级）。
 pub const UPGRADER_DEAD_AFTER: Duration = Duration::from_secs(60);
@@ -176,17 +177,66 @@ pub fn load_or_create_instance_id(state_dir: &Path, gateway_id: &str) -> Result<
     Ok(value)
 }
 
-/// 保存运行期凭据（`register` / `renew` 后；原子写）。
-pub fn save_credential(
-    state_dir: &Path,
-    bundle: &wist_control::GatewayCredentialBundle,
-) -> Result<(), String> {
+/// 本机持有的网关长期身份：中心签发的**客户端证书** + 本机私钥（私钥永不出本机）。
+///
+/// 取代旧的运行期 bearer `rt_`：mTLS 是网关↔中心的唯一凭据路径。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredCredential {
+    /// 中心回执的凭据包（含客户端证书 PEM；`ca_bundle` / `not_after` 供排障）。
+    pub bundle: GatewayCredentialBundle,
+    /// 客户端私钥（PEM，PKCS#8）。**永不上送 / 不出本机**。
+    pub private_key_pem: String,
+}
+
+impl StoredCredential {
+    /// mTLS 身份 PEM（证书在前、私钥在后），供 `reqwest::Identity::from_pem`。
+    pub fn identity_pem(&self) -> String {
+        format!(
+            "{}\n{}\n",
+            self.bundle.certificate.trim_end(),
+            self.private_key_pem.trim_end()
+        )
+    }
+
+    /// 证书序列号（小写 hex，无分隔符）：轮换时提交给中心（用旧证书证明身份）。
+    pub fn certificate_serial_hex(&self) -> Result<String, String> {
+        use x509_parser::prelude::{FromDer, X509Certificate};
+        let (_, pem) = x509_parser::pem::parse_x509_pem(self.bundle.certificate.as_bytes())
+            .map_err(|err| format!("解析客户端证书 PEM 失败: {err}"))?;
+        let (_, cert) = X509Certificate::from_der(&pem.contents)
+            .map_err(|err| format!("解析客户端证书 DER 失败: {err}"))?;
+        Ok(hex_lower(cert.raw_serial()))
+    }
+
+    /// 距离证书到期还剩多少秒（无 `not_after` → `i64::MAX`，不触发轮换）。
+    pub fn seconds_remaining(&self) -> i64 {
+        self.bundle
+            .not_after
+            .as_deref()
+            .and_then(wist_control::types::DateTime::from_rfc3339)
+            .map(|expires| wist_control::DateTime::now().seconds_until(&expires))
+            .unwrap_or(i64::MAX)
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// 保存长期身份（`register` / `renew` 后；原子写 + 0600）。
+pub fn save_credential(state_dir: &Path, credential: &StoredCredential) -> Result<(), String> {
     let text =
-        serde_json::to_string_pretty(bundle).map_err(|err| format!("序列化凭据失败: {err}"))?;
+        serde_json::to_string_pretty(credential).map_err(|err| format!("序列化凭据失败: {err}"))?;
     write_secret(&path_in(state_dir, CREDENTIAL_FILE), &text)
 }
 
-/// 运行期凭据的就位状态（区分「缺失」与「损坏」，不把损坏当缺失静默重置备）。
+/// 长期身份的就位状态（区分「缺失」与「损坏」，不把损坏当缺失静默重置备）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum CredentialStatus {
     /// 文件不存在（首跑前置备状态）。
@@ -194,10 +244,10 @@ pub enum CredentialStatus {
     /// 文件在但读不了/解析不了：**不可**当成缺失自动重置备。
     Corrupt(String),
     /// 就绪。
-    Present(wist_control::GatewayCredentialBundle),
+    Present(StoredCredential),
 }
 
-/// 读运行期凭据的就位状态（见 [`CredentialStatus`]）。
+/// 读长期身份的就位状态（见 [`CredentialStatus`]）。
 pub fn credential_status(state_dir: &Path) -> CredentialStatus {
     let path = path_in(state_dir, CREDENTIAL_FILE);
     let text = match std::fs::read_to_string(&path) {
@@ -208,15 +258,15 @@ pub fn credential_status(state_dir: &Path) -> CredentialStatus {
         }
     };
     match serde_json::from_str(&text) {
-        Ok(bundle) => CredentialStatus::Present(bundle),
+        Ok(credential) => CredentialStatus::Present(credential),
         Err(err) => CredentialStatus::Corrupt(format!("解析失败 {}: {err}", path.display())),
     }
 }
 
-/// 读运行期凭据；不存在、损坏或不可解析 → `None`。
-pub fn load_credential(state_dir: &Path) -> Option<wist_control::GatewayCredentialBundle> {
+/// 读长期身份；不存在、损坏或不可解析 → `None`。
+pub fn load_credential(state_dir: &Path) -> Option<StoredCredential> {
     match credential_status(state_dir) {
-        CredentialStatus::Present(bundle) => Some(bundle),
+        CredentialStatus::Present(credential) => Some(credential),
         _ => None,
     }
 }
@@ -380,22 +430,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn stored_credential() -> StoredCredential {
+        StoredCredential {
+            bundle: GatewayCredentialBundle {
+                credential_id: "cred-1".into(),
+                gateway_id: "gw-1".into(),
+                instance_id: Some("gw-1/boot-1".into()),
+                certificate: "-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----\n".into(),
+                ca_bundle: None,
+                issued_at: "2026-10-04T00:00:00Z".into(),
+                not_before: Some("2026-10-04T00:00:00Z".into()),
+                not_after: Some("2026-11-04T00:00:00Z".into()),
+            },
+            private_key_pem: "-----BEGIN PRIVATE KEY-----\nA\n-----END PRIVATE KEY-----\n".into(),
+        }
+    }
+
     #[test]
     fn credential_saves_and_loads() {
         let dir = temp_dir("cred");
-        let bundle = wist_control::GatewayCredentialBundle {
-            credential_id: "cred-1".into(),
-            gateway_id: "gw-1".into(),
-            instance_id: "gw-1/boot-1".into(),
-            auth_scheme: "bearer".into(),
-            bearer_token: "rt_abc".into(),
-            issued_at: wist_control::DateTime::now(),
-            expires_at: wist_control::DateTime::now(),
-        };
-        save_credential(&dir, &bundle).expect("save");
-        assert_eq!(load_credential(&dir), Some(bundle.clone()));
-        assert_eq!(credential_status(&dir), CredentialStatus::Present(bundle));
+        let credential = stored_credential();
+        save_credential(&dir, &credential).expect("save");
+        assert_eq!(load_credential(&dir), Some(credential.clone()));
+        assert_eq!(
+            credential_status(&dir),
+            CredentialStatus::Present(credential)
+        );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stored_credential_builds_an_mtls_identity_pem() {
+        let credential = stored_credential();
+        let identity = credential.identity_pem();
+        assert!(identity.contains("BEGIN CERTIFICATE"));
+        assert!(identity.contains("BEGIN PRIVATE KEY"));
     }
 
     #[test]

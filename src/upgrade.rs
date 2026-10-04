@@ -185,13 +185,13 @@ impl UpgradeDriver {
                 match state::load_credential(&reporter.state_dir) {
                     Some(credential) => match reporter
                         .client
-                        .report_upgrade_result(&credential, &record)
+                        .report_upgrade_result(&credential.bundle.gateway_id, &record)
                         .await
                     {
                         Ok(()) => println!("event=UpgradeReported work_id={}", record.work_id),
                         Err(err) => eprintln!("event=UpgradeReportFailed error={err}"),
                     },
-                    None => eprintln!("event=UpgradeReportSkipped 无运行期凭据"),
+                    None => eprintln!("event=UpgradeReportSkipped 无长期身份"),
                 }
             }
         });

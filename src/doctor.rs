@@ -176,39 +176,44 @@ fn trust_check(config: &Config) -> Check {
 /// 运行期凭据：损坏→FAIL，缺失→WARN（首跑），就位→看有效期。
 fn credential_check(config: &Config) -> Check {
     match state::credential_status(&config.state_dir) {
-        CredentialStatus::Present(bundle) => {
-            let remaining = wist_control::DateTime::now().seconds_until(&bundle.expires_at);
+        CredentialStatus::Present(credential) => {
+            let remaining = credential.seconds_remaining();
             let lead = config.renew_lead_seconds.unwrap_or(3600);
+            let not_after = credential
+                .bundle
+                .not_after
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
             if remaining <= 0 {
                 Check::warn(
                     "credential.local",
-                    "运行期凭据已过期",
-                    format!("expires_at={}", bundle.expires_at.to_chrono().to_rfc3339()),
+                    "客户端证书已过期",
+                    format!("not_after={not_after}"),
                 )
-                .with_hint("等待自动续期，或在中心重置该实例后重跑")
+                .with_hint("等待自动轮换，或在中心重置该实例后重跑")
             } else if remaining <= lead {
                 Check::warn(
                     "credential.local",
-                    "运行期凭据即将过期",
-                    format!("还剩 {remaining}s（续期提前量 {lead}s）"),
+                    "客户端证书即将过期",
+                    format!("还剩 {remaining}s（轮换提前量 {lead}s）"),
                 )
             } else {
                 Check::ok(
                     "credential.local",
-                    "运行期凭据有效",
+                    "客户端证书有效",
                     format!("还剩 {remaining}s"),
                 )
             }
         }
         CredentialStatus::Missing => Check::warn(
             "credential.local",
-            "尚无运行期凭据",
+            "尚无客户端身份",
             "首跑会走 link-upstream → register",
         )
         .with_hint("设 WIST_GWLINKD_BOOTSTRAP_TOKEN 后运行 `wist-gwlinkd run` 完成首次置备"),
         CredentialStatus::Corrupt(detail) => Check::fail(
             "credential.local",
-            "运行期凭据损坏",
+            "客户端身份损坏",
             detail,
             "修复或删除 state/credential.json 后重跑；若中心已初始化该实例需先在中心重置",
         ),
