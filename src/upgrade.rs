@@ -4,6 +4,9 @@
 //! 执行器是**瞬态进程**，不被本常驻托管 —— 升级时本进程要能跨过它（这正是「容器外常驻」的意义）。
 
 use std::path::PathBuf;
+use std::process::Stdio;
+
+use crate::state::{self, UpgradeRecord};
 
 /// 缺省升级执行器程序名。
 pub const DEFAULT_UPGRADER_PROGRAM: &str = "gops";
@@ -26,6 +29,39 @@ impl UpgradeDriver {
         }
     }
 
-    // TODO(④): 调 `{program} prj upgrade --to <version>`；写 upgrade.json 与心跳；
-    //          幂等（同 plan_id + gateway_id 不重复执行）；回执 `upgrade-result`。
+    /// 驱动一次升级：写 `running` 记录 + 初始心跳，起执行器 `{program} prj upgrade --to <version>`。
+    ///
+    /// 返回后升级在后台进行；执行器（宿主侧）应周期 [`state::touch_heartbeat`]，超时无心跳即判死
+    /// （[`state::upgrader_is_declared_dead`]）。**执行器不被本进程托管**（跨重启）。
+    pub async fn start(
+        &self,
+        work_id: &str,
+        from_version: &str,
+        to_version: &str,
+    ) -> Result<(), String> {
+        let record = UpgradeRecord {
+            work_id: work_id.to_string(),
+            from_version: from_version.to_string(),
+            to_version: to_version.to_string(),
+            step: "fetch".to_string(),
+            status: "running".to_string(),
+            detail: String::new(),
+        };
+        state::write_upgrade_record(&self.state_dir, &record)?;
+        state::touch_heartbeat(&self.state_dir)?;
+
+        let mut child = tokio::process::Command::new(&self.program)
+            .args(["prj", "upgrade", "--to", to_version])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|err| format!("启动升级执行器 {} 失败: {err}", self.program))?;
+
+        // 回收子进程，避免僵尸（升级跨越本进程重启由执行器自身保证，不依赖此等待）。
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+            // TODO(④): 等完后写终态到 upgrade.json 并回执 `upgrade-result` 给中心。
+        });
+        Ok(())
+    }
 }

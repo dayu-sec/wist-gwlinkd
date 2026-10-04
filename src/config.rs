@@ -11,6 +11,8 @@ pub struct Config {
     pub trust_bundle: PathBuf,
     /// 状态目录（身份 / 凭据 / 升级记录 / 心跳）。
     pub state_dir: PathBuf,
+    /// 本网关在中心侧的标识（admin 创建实例时确定）。
+    pub gateway_id: String,
 }
 
 impl Config {
