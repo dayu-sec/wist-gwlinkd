@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-gwlinkd"
-version = "0.1.0" #@gxl:set(version)
+version = "0.1.1" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 description = "Host-side resident keeping a wist gateway stack linked to WistCenter (register / heartbeat / upgrade)"
