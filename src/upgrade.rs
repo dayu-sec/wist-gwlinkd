@@ -4,7 +4,8 @@
 //! 执行器是**瞬态进程**，不被本常驻托管 —— 升级时本进程要能跨过它（这正是「容器外常驻」的意义）。
 
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
+use std::time::Duration;
 
 use wist_control::GatewayCredentialBundle;
 
@@ -13,6 +14,9 @@ use crate::state::{self, UpgradeRecord};
 
 /// 缺省升级执行器程序名。
 pub const DEFAULT_UPGRADER_PROGRAM: &str = "gops";
+
+/// 升级期间的心跳刷新周期（远小于 [`state::UPGRADER_DEAD_AFTER`]）。
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 /// 升级回执的投递方（中心客户端 + 运行期凭据）。
 #[derive(Debug, Clone)]
@@ -39,11 +43,11 @@ impl UpgradeDriver {
         }
     }
 
-    /// 驱动一次升级：写 `running` 记录 + 初始心跳，起执行器 `{program} prj upgrade --to <version>`；
-    /// 执行器结束后写终态记录，并（若给了 `reporter`）**回执**中心。
+    /// 驱动一次升级：写 `running` 记录，起执行器 `{program} prj upgrade --to <version>`，
+    /// **升级期间持续刷心跳**；执行器结束后写终态记录，并（若给了 `reporter`）**回执**中心。
     ///
-    /// 返回后升级在后台进行；执行器（宿主侧）应周期 [`state::touch_heartbeat`]，超时无心跳即判死
-    /// （[`state::upgrader_is_declared_dead`]）。**执行器不被本进程托管**（跨重启）。
+    /// 心跳生产者就是本进程：它持有子进程句柄，知道执行器还活着 —— 这正是「判死判据」需要的信号源
+    /// （判据在 [`state::upgrader_is_declared_dead`]，但**必须有生产者**，否则长升级会被判假死）。
     pub async fn start(
         &self,
         work_id: &str,
@@ -71,10 +75,17 @@ impl UpgradeDriver {
 
         let state_dir = self.state_dir.clone();
         tokio::spawn(async move {
-            let (ok, detail) = match child.wait().await {
-                Ok(exit) if exit.success() => (true, format!("executor {exit}")),
-                Ok(exit) => (false, format!("executor {exit}")),
-                Err(err) => (false, format!("wait failed: {err}")),
+            let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+            // 「等执行器结束」与「周期刷心跳」并行：任一先到都推进 —— 心跳不新鲜会让升级被判假死。
+            let (ok, detail) = loop {
+                tokio::select! {
+                    status = child.wait() => break outcome_of(status),
+                    _ = heartbeat.tick() => {
+                        if let Err(err) = state::touch_heartbeat(&state_dir) {
+                            eprintln!("event=UpgradeHeartbeatFailed error={err}");
+                        }
+                    }
+                }
             };
             record.status = if ok { "done" } else { "failed" }.to_string();
             record.step = "verify".to_string();
@@ -94,5 +105,14 @@ impl UpgradeDriver {
             }
         });
         Ok(())
+    }
+}
+
+/// 把执行器退出结果折成 `(成功?, 说明)`。
+fn outcome_of(status: std::io::Result<ExitStatus>) -> (bool, String) {
+    match status {
+        Ok(exit) if exit.success() => (true, format!("executor {exit}")),
+        Ok(exit) => (false, format!("executor {exit}")),
+        Err(err) => (false, format!("wait failed: {err}")),
     }
 }

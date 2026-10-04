@@ -14,6 +14,32 @@ use wist_control::{
 /// 单次请求超时（避免中心/网关半死把常驻循环卡住）。
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 中心调用的错误：**区分「凭据被拒（401/403）」与其它** —— 前者要退避 + 提示重置备，
+/// 不能靠匹配错误串子串（响应体里也可能出现 "401"）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CenterError {
+    /// 401 / 403：凭据被拒。
+    Unauthorized(String),
+    /// 网络 / 5xx / 解析等其它错误。
+    Other(String),
+}
+
+impl CenterError {
+    /// 是否凭据被拒。
+    pub fn is_unauthorized(&self) -> bool {
+        matches!(self, Self::Unauthorized(_))
+    }
+}
+
+impl std::fmt::Display for CenterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unauthorized(message) => write!(f, "凭据被拒：{message}"),
+            Self::Other(message) => write!(f, "{message}"),
+        }
+    }
+}
+
 /// 建 HTTP 客户端：带超时；给了 `trust_bundle`（PEM）则作为**自定义信任锚**（自签中心证书时必需）。
 pub fn build_http_client(trust_bundle: Option<&Path>) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder().timeout(HTTP_TIMEOUT);
@@ -77,7 +103,7 @@ impl CenterClient {
         gateway_id: &str,
         bearer: &str,
         identity_token: Option<&str>,
-    ) -> Result<LinkUpstreamReturned, String> {
+    ) -> Result<LinkUpstreamReturned, CenterError> {
         let url = format!("{}/api/v1/gateway/link-upstream", self.endpoint);
         let mut request = self
             .http
@@ -91,7 +117,7 @@ impl CenterClient {
         let response = request
             .send()
             .await
-            .map_err(|err| format!("link-upstream 请求失败: {err}"))?;
+            .map_err(|err| CenterError::Other(format!("link-upstream 请求失败: {err}")))?;
         decode(response, "link-upstream").await
     }
 
@@ -100,7 +126,7 @@ impl CenterClient {
         &self,
         enrollment_token: &str,
         instance_id: &str,
-    ) -> Result<GatewayEnrollmentResult, String> {
+    ) -> Result<GatewayEnrollmentResult, CenterError> {
         let url = format!("{}/api/v1/gateway/register", self.endpoint);
         let payload = RegisterGateway {
             enrollment_token: enrollment_token.to_string(),
@@ -113,7 +139,7 @@ impl CenterClient {
             .json(&payload)
             .send()
             .await
-            .map_err(|err| format!("register 请求失败: {err}"))?;
+            .map_err(|err| CenterError::Other(format!("register 请求失败: {err}")))?;
         decode(response, "register").await
     }
 
@@ -122,7 +148,7 @@ impl CenterClient {
         &self,
         credential: &GatewayCredentialBundle,
         payload: &ReportGatewayStatus,
-    ) -> Result<(), String> {
+    ) -> Result<(), CenterError> {
         let url = format!("{}/api/v1/gateway/status", self.endpoint);
         let response = self
             .http
@@ -131,7 +157,7 @@ impl CenterClient {
             .json(payload)
             .send()
             .await
-            .map_err(|err| format!("status 请求失败: {err}"))?;
+            .map_err(|err| CenterError::Other(format!("status 请求失败: {err}")))?;
         let _: serde_json::Value = decode(response, "status").await?;
         Ok(())
     }
@@ -140,7 +166,7 @@ impl CenterClient {
     pub async fn renew_credential(
         &self,
         credential: &GatewayCredentialBundle,
-    ) -> Result<GatewayCredentialBundle, String> {
+    ) -> Result<GatewayCredentialBundle, CenterError> {
         let url = format!("{}/api/v1/gateway/credentials:renew", self.endpoint);
         let payload = serde_json::json!({
             "gateway_id": credential.gateway_id,
@@ -153,18 +179,16 @@ impl CenterClient {
             .json(&payload)
             .send()
             .await
-            .map_err(|err| format!("renew 请求失败: {err}"))?;
+            .map_err(|err| CenterError::Other(format!("renew 请求失败: {err}")))?;
         decode(response, "renew").await
     }
 
     /// 取升级目标：`GET /api/v1/gateway/upgrade-plan?gateway_id=`（`Bearer <rt_>`）。
-    ///
-    /// 返回该网关应升到的目标（来自覆盖它的已批准升级计划）；无则 `has_plan=false`。见 CR-002 C2。
     pub async fn get_upgrade_plan(
         &self,
         credential: &GatewayCredentialBundle,
         gateway_id: &str,
-    ) -> Result<GatewayUpgradePlan, String> {
+    ) -> Result<GatewayUpgradePlan, CenterError> {
         let url = format!("{}/api/v1/gateway/upgrade-plan", self.endpoint);
         let response = self
             .http
@@ -173,7 +197,7 @@ impl CenterClient {
             .bearer_auth(&credential.bearer_token)
             .send()
             .await
-            .map_err(|err| format!("upgrade-plan 请求失败: {err}"))?;
+            .map_err(|err| CenterError::Other(format!("upgrade-plan 请求失败: {err}")))?;
         decode(response, "upgrade-plan").await
     }
 
@@ -182,7 +206,7 @@ impl CenterClient {
         &self,
         credential: &GatewayCredentialBundle,
         record: &crate::state::UpgradeRecord,
-    ) -> Result<(), String> {
+    ) -> Result<(), CenterError> {
         let url = format!("{}/api/v1/gateway/upgrade-result", self.endpoint);
         let response = self
             .http
@@ -191,24 +215,124 @@ impl CenterClient {
             .json(record)
             .send()
             .await
-            .map_err(|err| format!("upgrade-result 请求失败: {err}"))?;
+            .map_err(|err| CenterError::Other(format!("upgrade-result 请求失败: {err}")))?;
         let _: serde_json::Value = decode(response, "upgrade-result").await?;
         Ok(())
     }
 }
 
-/// 解码响应：非 2xx → 带状态码与响应体的错误；2xx → 反序列化。
+/// 解码响应：401/403 → [`CenterError::Unauthorized`]；其它非 2xx / 解析失败 → [`CenterError::Other`]。
 async fn decode<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
     what: &str,
-) -> Result<T, String> {
+) -> Result<T, CenterError> {
     let status = response.status();
     let body = response
         .text()
         .await
-        .map_err(|err| format!("读取 {what} 响应体失败: {err}"))?;
+        .map_err(|err| CenterError::Other(format!("读取 {what} 响应体失败: {err}")))?;
     if !status.is_success() {
-        return Err(format!("{what} 失败（{status}）：{body}"));
+        let message = format!("{what} 失败（{status}）：{body}");
+        return Err(
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                CenterError::Unauthorized(message)
+            } else {
+                CenterError::Other(message)
+            },
+        );
     }
-    serde_json::from_str(&body).map_err(|err| format!("解析 {what} 响应失败: {err}；原文：{body}"))
+    serde_json::from_str(&body)
+        .map_err(|err| CenterError::Other(format!("解析 {what} 响应失败: {err}；原文：{body}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// 起一个一次性 HTTP 服务器，回固定响应；返回其 `http://127.0.0.1:<port>`。
+    async fn one_shot_server(status: &'static str, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0_u8; 2048];
+                let _ = socket.read(&mut buffer).await;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn credential() -> GatewayCredentialBundle {
+        GatewayCredentialBundle {
+            credential_id: "cred-1".into(),
+            gateway_id: "gw-1".into(),
+            instance_id: "gw-1/boot-1".into(),
+            auth_scheme: "bearer".into(),
+            bearer_token: "rt_abc".into(),
+            issued_at: wist_control::DateTime::now(),
+            expires_at: wist_control::DateTime::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_plan_parses_a_success_response() {
+        let endpoint =
+            one_shot_server("200 OK", r#"{"gateway_id":"gw-1","has_plan":false,"plan_id":null,"component":null,"to_version":null}"#)
+                .await;
+        let client = CenterClient::new(endpoint);
+        let plan = client
+            .get_upgrade_plan(&credential(), "gw-1")
+            .await
+            .expect("plan");
+        assert!(!plan.has_plan);
+        assert_eq!(plan.gateway_id, "gw-1");
+    }
+
+    #[tokio::test]
+    async fn a_401_is_classified_as_unauthorized_not_just_other() {
+        // 响应体刻意含 "401" —— 旧子串匹配会误判，类型化后不会。
+        let endpoint =
+            one_shot_server("401 Unauthorized", r#"{"error":"invalid rt_401 token"}"#).await;
+        let client = CenterClient::new(endpoint);
+        let err = client
+            .get_upgrade_plan(&credential(), "gw-1")
+            .await
+            .expect_err("must fail");
+        assert!(err.is_unauthorized(), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_500_is_not_unauthorized() {
+        let endpoint = one_shot_server("500 Internal Server Error", r#"{"error":"boom"}"#).await;
+        let client = CenterClient::new(endpoint);
+        let err = client
+            .report_status(&credential(), &status_payload())
+            .await
+            .expect_err("must fail");
+        assert!(!err.is_unauthorized(), "{err}");
+    }
+
+    fn status_payload() -> ReportGatewayStatus {
+        ReportGatewayStatus {
+            gateway_id: "gw-1".into(),
+            instance_id: "gw-1/boot-1".into(),
+            version: "0.1.0".into(),
+            status: "running".into(),
+            health: "ok".into(),
+            memory_bytes: None,
+            cpu_percent: None,
+            reported_at: wist_control::DateTime::now(),
+        }
+    }
 }

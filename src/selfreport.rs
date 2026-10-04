@@ -72,3 +72,44 @@ impl SelfReportClient {
             .map_err(|err| format!("解析 self-state 响应失败: {err}；原文：{body}"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 网关 `self_state.rs` 输出的**契约 fixture**（snake_case）。
+    /// 网关侧有同一份 fixture 的**序列化**测试（`serializes_the_self_state_contract_keys`）——
+    /// 两侧同钉一份形状，任一侧改名即在此处爆掉（防三份拷贝漂移）。
+    const GATEWAY_SELF_STATE_JSON: &str = r#"{"gateway_id":"gw-1","version":"0.1.15","collected_at":"2026-10-04T00:00:00Z","store_healthy":true,"agent_count":3,"uplink_enabled":true,"last_error":null}"#;
+
+    #[test]
+    fn parses_the_gateway_self_state_contract() {
+        let state: GatewaySelfState =
+            serde_json::from_str(GATEWAY_SELF_STATE_JSON).expect("parse gateway contract");
+        assert_eq!(state.gateway_id, "gw-1");
+        assert_eq!(state.version, "0.1.15");
+        assert_eq!(state.agent_count, 3);
+        assert!(state.store_healthy && state.uplink_enabled);
+        assert_eq!(state.health(), "ok");
+    }
+
+    #[test]
+    fn degraded_when_uplink_off_or_error_present() {
+        let off = GatewaySelfState {
+            gateway_id: "gw-1".into(),
+            version: "0.1.15".into(),
+            collected_at: wist_control::DateTime::now(),
+            store_healthy: true,
+            agent_count: 0,
+            uplink_enabled: false,
+            last_error: None,
+        };
+        assert_eq!(off.health(), "degraded");
+        let errored = GatewaySelfState {
+            uplink_enabled: true,
+            last_error: Some("boom".into()),
+            ..off
+        };
+        assert_eq!(errored.health(), "degraded");
+    }
+}

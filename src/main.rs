@@ -14,10 +14,10 @@ use wist_gwlinkd::upgrade::{DEFAULT_UPGRADER_PROGRAM, UpgradeDriver, UpgradeRepo
 
 /// 运行期状态上报周期（秒）。
 const STATUS_INTERVAL_SECS: u64 = 30;
-/// renew 失败后的初始退避（秒）。
-const RENEW_BACKOFF_BASE_SECS: u64 = 60;
-/// renew 退避上限（秒）。
-const RENEW_BACKOFF_MAX_SECS: u64 = 1800;
+/// 退避初始值（秒）：renew / status 被拒后指数退避，避免猛击中心。
+const BACKOFF_BASE_SECS: u64 = 60;
+/// 退避上限（秒）。
+const BACKOFF_MAX_SECS: u64 = 1800;
 
 fn config_path() -> PathBuf {
     std::env::var("WIST_GWLINKD_CONFIG")
@@ -100,9 +100,10 @@ async fn run(config: &Config) -> Result<(), String> {
     );
 
     let mut ticker = tokio::time::interval(Duration::from_secs(STATUS_INTERVAL_SECS));
-    // renew 退避：失败时指数退避，避免每 tick 猛击中心。
     let mut renew_backoff = Duration::ZERO;
     let mut next_renew_at = Instant::now();
+    let mut status_backoff = Duration::ZERO;
+    let mut next_status_at = Instant::now();
 
     loop {
         ticker.tick().await;
@@ -120,11 +121,7 @@ async fn run(config: &Config) -> Result<(), String> {
                     println!("event=CredentialRenewed gateway_id={}", config.gateway_id);
                 }
                 Err(err) => {
-                    renew_backoff = if renew_backoff.is_zero() {
-                        Duration::from_secs(RENEW_BACKOFF_BASE_SECS)
-                    } else {
-                        (renew_backoff * 2).min(Duration::from_secs(RENEW_BACKOFF_MAX_SECS))
-                    };
+                    renew_backoff = back_off(renew_backoff);
                     next_renew_at = Instant::now() + renew_backoff;
                     eprintln!("event=RenewFailed backoff={renew_backoff:?} error={err}");
                 }
@@ -179,66 +176,87 @@ async fn run(config: &Config) -> Result<(), String> {
             }
         }
 
-        // 拉网关自述面（准确状态的来源）；不答则把「沉默」当判断，上报 unknown。
-        let health = match &self_client {
+        // 拉网关自述面：**准确状态 + 网关版本**的来源；不答则把「沉默」当判断。
+        let (health, gateway_version) = match &self_client {
             Some(self_client) => match self_client.fetch(&config.gateway_id).await {
-                Ok(self_state) => self_state.health().to_string(),
+                Ok(self_state) => (self_state.health().to_string(), self_state.version.clone()),
                 Err(err) => {
                     eprintln!("event=SelfStateFailed error={err}");
-                    "unknown".to_string()
+                    ("unknown".to_string(), "unknown".to_string())
                 }
             },
-            None => "ok".to_string(),
+            // 未配自述面：**无证据**，报 unknown（不假装健康）。
+            None => ("unknown".to_string(), "unknown".to_string()),
         };
 
-        let payload = ReportGatewayStatus {
-            gateway_id: config.gateway_id.clone(),
-            instance_id: credential.instance_id.clone(),
-            version: wist_gwlinkd::VERSION.to_string(),
-            status: "running".to_string(),
-            health,
-            memory_bytes: None,
-            cpu_percent: None,
-            reported_at: DateTime::now(),
-        };
-        match client.report_status(&credential, &payload).await {
-            Ok(()) => println!("event=StatusReported gateway_id={}", config.gateway_id),
-            Err(err) if is_auth_failure(&err) => {
-                // 运行期凭据被拒（多为 renew 后崩溃丢新凭据）：要重走置备。
-                eprintln!(
-                    "event=CredentialRejected gateway_id={}（运行期凭据已失效，需重新置备：设 WIST_GWLINKD_BOOTSTRAP_TOKEN 后重跑）error={err}",
-                    config.gateway_id
-                );
+        if Instant::now() >= next_status_at {
+            let payload = ReportGatewayStatus {
+                gateway_id: config.gateway_id.clone(),
+                instance_id: credential.instance_id.clone(),
+                // 报的是**网关（容器）版本**，不是 gwlinkd 自身版本 —— 这条状态描述的是网关。
+                version: gateway_version,
+                status: "running".to_string(),
+                health,
+                memory_bytes: None,
+                cpu_percent: None,
+                reported_at: DateTime::now(),
+            };
+            match client.report_status(&credential, &payload).await {
+                Ok(()) => {
+                    status_backoff = Duration::ZERO;
+                    println!("event=StatusReported gateway_id={}", config.gateway_id);
+                }
+                Err(err) if err.is_unauthorized() => {
+                    // 运行期凭据被拒：**退避**（不每 30s 猛击），并明确要中心重置该实例。
+                    status_backoff = back_off(status_backoff);
+                    next_status_at = Instant::now() + status_backoff;
+                    eprintln!(
+                        "event=CredentialRejected gateway_id={} backoff={status_backoff:?}（运行期凭据已失效；需管理员在中心重置该实例后重新置备）error={err}",
+                        config.gateway_id
+                    );
+                }
+                Err(err) => eprintln!("event=StatusReportFailed error={err}"),
             }
-            Err(err) => eprintln!("event=StatusReportFailed error={err}"),
         }
     }
 }
 
-/// 401/403 视为凭据失效（`decode` 的错误串里带状态码）。
-fn is_auth_failure(err: &str) -> bool {
-    err.contains("401") || err.contains("403")
+/// 指数退避：0 → 初值，否则翻倍到上限。
+fn back_off(current: Duration) -> Duration {
+    if current.is_zero() {
+        Duration::from_secs(BACKOFF_BASE_SECS)
+    } else {
+        (current * 2).min(Duration::from_secs(BACKOFF_MAX_SECS))
+    }
 }
 
 /// 首跑置备：link-upstream（一次性 bootstrap + 身份头）→ 落链接配置 → register → 落运行期凭据。
 async fn onboard(client: &CenterClient, config: &Config, identity: &str) -> Result<(), String> {
     let bootstrap = std::env::var("WIST_GWLINKD_BOOTSTRAP_TOKEN").map_err(|_| {
-        "首跑需要 WIST_GWLINKD_BOOTSTRAP_TOKEN（中心 admin 创建实例时签发的引导 Token）".to_string()
+        "首跑需要 WIST_GWLINKD_BOOTSTRAP_TOKEN（中心 admin 创建实例时签发的引导 Token）；\
+         若本机曾有凭据，请检查 state/credential.json 是否损坏"
+            .to_string()
     })?;
     let instance_id = state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)?;
 
     println!("event=LinkUpstream gateway_id={}", config.gateway_id);
     let returned = client
         .link_upstream(&config.gateway_id, &bootstrap, Some(identity))
-        .await?;
+        .await
+        .map_err(|err| err.to_string())?;
     // 链接配置（信任锚 / 协议版本 / 注册 token 引用）落盘留痕 —— 不再丢弃。
     state::save_link_config(&config.state_dir, &returned.config)?;
-    let regist_token = returned
-        .regist_token
-        .ok_or_else(|| "中心未返回 regist_token（网关可能已初始化）".to_string())?;
+    let regist_token = returned.regist_token.ok_or_else(|| {
+        "中心认为该网关**已初始化**，但本地无运行期凭据 —— 无法自动恢复（CR-003 尚缺「身份重置」路径）。\
+         请在中心重置该实例后重跑，或把既有的运行期凭据写入 state/credential.json"
+            .to_string()
+    })?;
 
     println!("event=Register gateway_id={}", config.gateway_id);
-    let result = client.register(&regist_token, &instance_id).await?;
+    let result = client
+        .register(&regist_token, &instance_id)
+        .await
+        .map_err(|err| err.to_string())?;
     state::save_credential(&config.state_dir, &result.credential_bundle)?;
     println!(
         "event=Registered gateway_id={} credential_id={}",
