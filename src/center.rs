@@ -4,8 +4,8 @@
 //! `wist-control`（由 `wist-design/jumo` 模型生成）。
 
 use wist_control::{
-    GatewayCredentialBundle, GatewayEnrollmentResult, GatewayInitialConfig, RegisterGateway,
-    ReportGatewayStatus,
+    GatewayCredentialBundle, GatewayEnrollmentResult, GatewayInitialConfig, GatewayUpgradePlan,
+    RegisterGateway, ReportGatewayStatus,
 };
 
 /// link-upstream 的响应壳（中心侧 `InitialConfigReturned`）：配置 + 置备态一次性 RegistToken。
@@ -124,6 +124,26 @@ impl CenterClient {
             .await
             .map_err(|err| format!("renew 请求失败: {err}"))?;
         decode(response, "renew").await
+    }
+
+    /// 取升级目标：`GET /api/v1/gateway/upgrade-plan?gateway_id=`（`Bearer <rt_>`）。
+    ///
+    /// 返回该网关应升到的目标（来自覆盖它的已批准升级计划）；无则 `has_plan=false`。见 CR-002 C2。
+    pub async fn get_upgrade_plan(
+        &self,
+        credential: &GatewayCredentialBundle,
+        gateway_id: &str,
+    ) -> Result<GatewayUpgradePlan, String> {
+        let url = format!("{}/api/v1/gateway/upgrade-plan", self.endpoint);
+        let response = self
+            .http
+            .get(url)
+            .query(&[("gateway_id", gateway_id)])
+            .bearer_auth(&credential.bearer_token)
+            .send()
+            .await
+            .map_err(|err| format!("upgrade-plan 请求失败: {err}"))?;
+        decode(response, "upgrade-plan").await
     }
 
     /// 升级回执：`POST /api/v1/gateway/upgrade-result`（字段对齐 `upgrade.json`）。

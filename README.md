@@ -39,7 +39,7 @@ upgrader_program = "gops"                          # 升级执行器
 ```
 
 环境变量：`WIST_GWLINKD_CONFIG`（配置文件路径）、`WIST_GWLINKD_BOOTSTRAP_TOKEN`（首跑置备用的一次性引导 Token）、
-`WIST_GWLINKD_UPGRADE_TO`（手动触发一次升级，占位 CR-002 C2 的「拉 desired」）。
+`WIST_GWLINKD_UPGRADE_TO`（手动触发一次升级的**覆盖口**；正常由常驻周期从中心 `GET /api/v1/gateway/upgrade-plan` 拉 desired 驱动）。
 
 ## 交付与升级
 

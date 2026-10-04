@@ -92,6 +92,8 @@ async fn run(config: &Config) -> Result<(), String> {
     }
 
     let mut ticker = tokio::time::interval(Duration::from_secs(STATUS_INTERVAL_SECS));
+    // 已驱过的 plan_id：同一计划不重复驱动（幂等；跨重启由 upgrade.json 留痕继续判断）。
+    let mut last_driven: Option<String> = None;
     loop {
         ticker.tick().await;
 
@@ -105,6 +107,38 @@ async fn run(config: &Config) -> Result<(), String> {
                 }
                 Err(err) => eprintln!("event=RenewFailed error={err}"),
             }
+        }
+
+        // 拉升级目标（CR-002 C1/C2）：有覆盖本网关、目标非当前版本、且未驱过 → 驱动 + 回执。
+        match client
+            .get_upgrade_plan(&credential, &config.gateway_id)
+            .await
+        {
+            Ok(plan) if plan.has_plan => {
+                let to_version = plan.to_version.clone().unwrap_or_default();
+                let already = last_driven.as_deref() == plan.plan_id.as_deref();
+                if !to_version.is_empty() && to_version != wist_gwlinkd::VERSION && !already {
+                    println!(
+                        "event=UpgradeDriven plan_id={:?} to_version={to_version}",
+                        plan.plan_id
+                    );
+                    let reporter = UpgradeReporter {
+                        client: client.clone(),
+                        credential: credential.clone(),
+                    };
+                    driver
+                        .start(
+                            plan.plan_id.as_deref().unwrap_or("plan"),
+                            wist_gwlinkd::VERSION,
+                            &to_version,
+                            Some(reporter),
+                        )
+                        .await?;
+                    last_driven = plan.plan_id;
+                }
+            }
+            Ok(_) => {}
+            Err(err) => eprintln!("event=UpgradePlanFailed error={err}"),
         }
 
         // 拉网关自述面（准确状态的来源）；不答则把「沉默」当判断，上报 unknown。
