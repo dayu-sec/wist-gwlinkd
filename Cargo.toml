@@ -1,0 +1,26 @@
+# @jumo generated
+# @jumo hash=0000000000000000
+
+[package]
+name = "wist-gwlinkd"
+version = "0.1.0" #@gxl:set(version)
+edition = "2024"
+license = "Apache-2.0"
+description = "Host-side resident keeping a wist gateway stack linked to WistCenter (register / heartbeat / upgrade)"
+repository = "https://github.com/dayu-sec/wist-gwlinkd"
+readme = "README.md"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.1"
+tokio = { version = "1.48", features = ["full"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots"] }
+wist-control = "0.5"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wist-gwlinkd"
+path = "src/main.rs"
