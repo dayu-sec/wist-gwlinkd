@@ -283,3 +283,19 @@ fn run_diagnose(config: &Config) -> ExitCode {
         _ => ExitCode::SUCCESS,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn back_off_starts_then_doubles_to_the_cap() {
+        let first = back_off(Duration::ZERO);
+        assert_eq!(first, Duration::from_secs(BACKOFF_BASE_SECS));
+        assert_eq!(back_off(first), Duration::from_secs(BACKOFF_BASE_SECS * 2));
+        assert_eq!(
+            back_off(Duration::from_secs(BACKOFF_MAX_SECS)),
+            Duration::from_secs(BACKOFF_MAX_SECS)
+        );
+    }
+}

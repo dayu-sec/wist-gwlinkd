@@ -327,12 +327,137 @@ mod tests {
         ReportGatewayStatus {
             gateway_id: "gw-1".into(),
             instance_id: "gw-1/boot-1".into(),
-            version: "0.1.0".into(),
+            version: "0.1.15".into(),
             status: "running".into(),
             health: "ok".into(),
             memory_bytes: None,
             cpu_percent: None,
             reported_at: wist_control::DateTime::now(),
         }
+    }
+
+    /// 起一次性服务器，回固定响应并**捕获完整请求**；返回 (endpoint, 请求文本句柄)。
+    async fn capture_server(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::spawn(async move {
+            let mut request = Vec::new();
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0_u8; 4096];
+                // 读到无数据（50ms 静默）为止：小请求一次读全，含 body。
+                loop {
+                    match tokio::time::timeout(Duration::from_millis(50), socket.read(&mut buffer))
+                        .await
+                    {
+                        Ok(Ok(0)) | Err(_) => break,
+                        Ok(Ok(n)) => request.extend_from_slice(&buffer[..n]),
+                        Ok(Err(_)) => break,
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+            String::from_utf8_lossy(&request).to_string()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn link_upstream_sends_gateway_id_bearer_and_identity_header() {
+        let (endpoint, captured) = capture_server(
+            "200 OK",
+            r#"{"config":{"gateway_id":"gw-1","control_center_endpoint":"https://c","trust_bundle":null,"server_tls_required":false,"protocol_version":"1.0","enrollment_token_id":"e1"},"regist_token":"reg_xyz"}"#,
+        )
+        .await;
+        let client = CenterClient::new(endpoint);
+        let returned = client
+            .link_upstream("gw-1", "boot_tok", Some("ident_xyz"))
+            .await
+            .expect("ok");
+        assert_eq!(returned.regist_token.as_deref(), Some("reg_xyz"));
+        let request = captured.await.expect("request");
+        let lower = request.to_lowercase();
+        assert!(
+            lower.starts_with("get /api/v1/gateway/link-upstream?gateway_id=gw-1"),
+            "{request}"
+        );
+        assert!(
+            lower.contains("authorization: bearer boot_tok"),
+            "{request}"
+        );
+        assert!(
+            lower.contains("x-gateway-identity-token: ident_xyz"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_posts_enrollment_token_and_instance_id() {
+        let (endpoint, captured) = capture_server(
+            "200 OK",
+            r#"{"status":"accepted","gateway_id":"gw-1","instance_id":"inst-1","credential_id":"c1","initial_config":"v1","credential_bundle":{"credential_id":"c1","gateway_id":"gw-1","instance_id":"inst-1","auth_scheme":"bearer","bearer_token":"rt_x","issued_at":"2026-10-04T00:00:00Z","expires_at":"2026-11-04T00:00:00Z"}}"#,
+        )
+        .await;
+        let client = CenterClient::new(endpoint);
+        let result = client.register("reg_tok", "inst-1").await.expect("ok");
+        assert_eq!(result.credential_bundle.bearer_token, "rt_x");
+        let request = captured.await.expect("request");
+        assert!(
+            request
+                .to_lowercase()
+                .starts_with("post /api/v1/gateway/register"),
+            "{request}"
+        );
+        assert!(
+            request.contains("reg_tok") && request.contains("inst-1"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn renew_credential_parses_the_new_bundle() {
+        let (endpoint, _captured) = capture_server(
+            "200 OK",
+            r#"{"credential_id":"c2","gateway_id":"gw-1","instance_id":"inst-1","auth_scheme":"bearer","bearer_token":"rt_new","issued_at":"2026-10-04T00:00:00Z","expires_at":"2026-11-04T00:00:00Z"}"#,
+        )
+        .await;
+        let client = CenterClient::new(endpoint);
+        let bundle = client.renew_credential(&credential()).await.expect("ok");
+        assert_eq!(bundle.bearer_token, "rt_new");
+    }
+
+    #[tokio::test]
+    async fn report_upgrade_result_posts_the_record() {
+        let (endpoint, captured) = capture_server("200 OK", r#"{}"#).await;
+        let client = CenterClient::new(endpoint);
+        let record = crate::state::UpgradeRecord {
+            work_id: "w-1".into(),
+            from_version: "0.1.0".into(),
+            to_version: "0.1.16".into(),
+            step: "verify".into(),
+            status: "done".into(),
+            detail: "ok".into(),
+        };
+        client
+            .report_upgrade_result(&credential(), &record)
+            .await
+            .expect("ok");
+        let request = captured.await.expect("request");
+        assert!(
+            request
+                .to_lowercase()
+                .starts_with("post /api/v1/gateway/upgrade-result"),
+            "{request}"
+        );
+        assert!(request.contains("w-1"), "{request}");
     }
 }

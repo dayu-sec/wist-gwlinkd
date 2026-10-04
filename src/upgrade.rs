@@ -116,3 +116,91 @@ fn outcome_of(status: std::io::Result<ExitStatus>) -> (bool, String) {
         Err(err) => (false, format!("wait failed: {err}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("gwlinkd-upgrade-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    /// 写一个忽略参数、按给定码退出的脚本（跨平台无关：只靠 `sh`）。
+    fn script(dir: &Path, name: &str, exit_code: i32) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nexit {exit_code}\n")).expect("script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        path
+    }
+
+    #[test]
+    fn outcome_of_classifies_success_and_failure() {
+        let dir = temp_dir("outcome");
+        let ok = std::process::Command::new(script(&dir, "ok.sh", 0))
+            .status()
+            .expect("ok");
+        assert!(outcome_of(Ok(ok)).0);
+        let bad = std::process::Command::new(script(&dir, "bad.sh", 3))
+            .status()
+            .expect("bad");
+        assert!(!outcome_of(Ok(bad)).0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    async fn wait_terminal(state_dir: &Path) -> UpgradeRecord {
+        for _ in 0..100 {
+            if let Some(record) = state::read_upgrade_record(state_dir)
+                && record.status != "running"
+            {
+                return record;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("record never reached a terminal status");
+    }
+
+    #[tokio::test]
+    async fn start_writes_running_with_heartbeat_then_finishes_done() {
+        let dir = temp_dir("done");
+        let driver =
+            UpgradeDriver::new(script(&dir, "ok.sh", 0).to_string_lossy().to_string(), &dir);
+        driver
+            .start("w-1", "0.1.0", "0.1.16", None)
+            .await
+            .expect("start");
+        // 起手即 running + 心跳（判死判据的生产者）。
+        let record = state::read_upgrade_record(&dir).expect("record");
+        assert_eq!(record.status, "running");
+        assert!(state::heartbeat_is_fresh(
+            &dir,
+            std::time::SystemTime::now()
+        ));
+        // 执行器结束后写终态。
+        assert_eq!(wait_terminal(&dir).await.status, "done");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_failing_executor_finishes_failed() {
+        let dir = temp_dir("failed");
+        let driver = UpgradeDriver::new(
+            script(&dir, "bad.sh", 1).to_string_lossy().to_string(),
+            &dir,
+        );
+        driver
+            .start("w-2", "0.1.0", "0.1.16", None)
+            .await
+            .expect("start");
+        assert_eq!(wait_terminal(&dir).await.status, "failed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

@@ -147,3 +147,63 @@ fn upgrade_check(config: &Config) -> Check {
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gwlinkd-doctor-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    fn config(dir: &std::path::Path) -> Config {
+        Config {
+            control_center_endpoint: "https://center.example".into(),
+            trust_bundle: dir.join("ca.pem"),
+            state_dir: dir.to_path_buf(),
+            gateway_id: "gw-1".into(),
+            gateway_self_endpoint: None,
+            renew_lead_seconds: None,
+            upgrader_program: None,
+        }
+    }
+
+    #[test]
+    fn an_empty_endpoint_is_a_failure() {
+        let dir = temp_dir("empty");
+        let mut cfg = config(&dir);
+        cfg.control_center_endpoint = "   ".into();
+        assert_eq!(diagnose(&cfg).worst(), Status::Fail);
+    }
+
+    #[test]
+    fn a_missing_credential_is_a_warning_not_a_failure() {
+        let dir = temp_dir("cred");
+        assert_eq!(diagnose(&config(&dir)).worst(), Status::Warn);
+    }
+
+    #[test]
+    fn a_dead_upgrade_fails_and_a_live_one_does_not() {
+        let dir = temp_dir("upg");
+        let cfg = config(&dir);
+        crate::state::write_upgrade_record(
+            &dir,
+            &crate::state::UpgradeRecord {
+                work_id: "w-1".into(),
+                from_version: "0.1.0".into(),
+                to_version: "0.1.16".into(),
+                step: "restart".into(),
+                status: "running".into(),
+                detail: String::new(),
+            },
+        )
+        .expect("record");
+        assert_eq!(diagnose(&cfg).worst(), Status::Fail);
+        crate::state::touch_heartbeat(&dir).expect("heartbeat");
+        assert_ne!(diagnose(&cfg).worst(), Status::Fail);
+    }
+}

@@ -32,3 +32,49 @@ impl Config {
         toml::from_str(&text).map_err(|err| format!("解析配置失败 {}: {err}", path.display()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gwlinkd-config-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    #[test]
+    fn loads_required_fields_and_defaults_the_optional_ones() {
+        let dir = temp_dir("ok");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\n",
+        )
+        .expect("write");
+        let config = Config::load(&path).expect("load");
+        assert_eq!(config.control_center_endpoint, "https://c");
+        assert_eq!(config.gateway_id, "gw-1");
+        assert!(config.gateway_self_endpoint.is_none());
+        assert!(config.renew_lead_seconds.is_none());
+        assert!(config.upgrader_program.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_missing_required_field_is_an_error() {
+        let dir = temp_dir("bad");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(&path, "control_center_endpoint = \"https://c\"\n").expect("write");
+        assert!(Config::load(&path).is_err(), "缺 gateway_id 必须报错");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unreadable_path_is_a_clear_error() {
+        let dir = temp_dir("missing");
+        assert!(Config::load(&dir.join("nope.toml")).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
