@@ -3,7 +3,7 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.2.0] - 2026-10-04
+## [0.2.0-alpha] - 2026-10-04
 
 ### Changed（不兼容）
 - **网关长期身份改为客户端证书（mTLS）**：注册/轮换时本机生成密钥对、只交 CSR，中心用 CA-G 签出
