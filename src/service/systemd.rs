@@ -105,7 +105,10 @@ mod tests {
 
     #[test]
     fn systemd_arg_quotes_and_escapes_special_characters() {
-        assert_eq!(systemd_arg("/usr/local/bin/wist-gwlinkd"), "/usr/local/bin/wist-gwlinkd");
+        assert_eq!(
+            systemd_arg("/usr/local/bin/wist-gwlinkd"),
+            "/usr/local/bin/wist-gwlinkd"
+        );
         assert_eq!(systemd_arg("/opt/my app/bin"), "\"/opt/my app/bin\"");
         assert_eq!(systemd_arg("/a%i/bin"), "\"/a%%i/bin\"");
         assert_eq!(systemd_arg("/a$HOME/bin"), "\"/a$$HOME/bin\"");

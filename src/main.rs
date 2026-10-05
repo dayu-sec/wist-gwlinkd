@@ -324,18 +324,25 @@ async fn run(config: &Config) -> Result<(), String> {
             }
         }
 
-        // 拉网关自述面：**准确状态 + 网关版本**的来源；不答则把「沉默」当判断。
-        let (health, gateway_version) = match &self_client {
+        // 拉网关自述面：**准确状态 + 网关版本 + 进程资源**的来源；不答则把「沉默」当判断。
+        let self_state = match &self_client {
             Some(self_client) => match self_client.fetch(&config.gateway_id).await {
-                Ok(self_state) => (self_state.health().to_string(), self_state.version.clone()),
+                Ok(self_state) => Some(self_state),
                 Err(err) => {
                     eprintln!("event=SelfStateFailed error={err}");
-                    ("unknown".to_string(), "unknown".to_string())
+                    None
                 }
             },
-            // 未配自述面：**无证据**，报 unknown（不假装健康）。
-            None => ("unknown".to_string(), "unknown".to_string()),
+            None => None,
         };
+        let health = self_state
+            .as_ref()
+            .map(|state| state.health().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let gateway_version = self_state
+            .as_ref()
+            .map(|state| state.version.clone())
+            .unwrap_or_else(|| "unknown".to_string());
 
         if Instant::now() >= next_status_at {
             let payload = ReportGatewayStatus {
@@ -343,10 +350,51 @@ async fn run(config: &Config) -> Result<(), String> {
                 instance_id: instance_id.clone(),
                 // 报的是**网关（容器）版本**，不是 gwlinkd 自身版本 —— 这条状态描述的是网关。
                 version: gateway_version,
-                status: "running".to_string(),
+                // 中心侧约定：`status` 是**在线/离线**（中心按 `== "online"` 计数与展示）。
+                // 之前误发 `"running"`（那是生命周期 `Running` 的概念）→ 中心把在跑的网关算成离线。
+                status: "online".to_string(),
                 health,
-                memory_bytes: None,
-                cpu_percent: None,
+                // 网关**进程自身**资源：自述面量到的原样上报（量不出则 None，不假装 0）。
+                // `memory_bytes` 上报契约是 `i64`（自述面用 `u64`，正数转换无损）。
+                memory_bytes: self_state
+                    .as_ref()
+                    .and_then(|state| state.memory_bytes)
+                    .map(|bytes| bytes as i64),
+                cpu_percent: self_state.as_ref().and_then(|state| state.cpu_percent),
+                // 富化：机队 / 存储 / 数据面 / 主机资源（量不出即 None）—— 与自述面同一份值。
+                uptime_seconds: self_state.as_ref().map(|state| state.uptime_seconds),
+                agent_count: self_state.as_ref().map(|state| state.agent_count),
+                online_agents: self_state.as_ref().map(|state| state.online_agents),
+                offline_agents: self_state.as_ref().map(|state| state.offline_agents),
+                last_seen_lag_seconds: self_state.as_ref().map(|state| state.last_seen_lag_seconds),
+                store_bytes: self_state.as_ref().map(|state| state.store_bytes as i64),
+                ingest_accepted_total: self_state
+                    .as_ref()
+                    .map(|state| state.ingest_accepted_total as i64),
+                ingest_rejected_total: self_state
+                    .as_ref()
+                    .map(|state| state.ingest_rejected_total as i64),
+                last_ingest_at: self_state
+                    .as_ref()
+                    .and_then(|state| state.last_ingest_at.clone()),
+                memory_total_bytes: self_state
+                    .as_ref()
+                    .and_then(|state| state.memory_total_bytes)
+                    .map(|bytes| bytes as i64),
+                load_1m: self_state.as_ref().and_then(|state| state.load_1m),
+                load_5m: self_state.as_ref().and_then(|state| state.load_5m),
+                load_15m: self_state.as_ref().and_then(|state| state.load_15m),
+                disk_usage_percent: self_state
+                    .as_ref()
+                    .and_then(|state| state.disk_usage_percent),
+                disk_total_bytes: self_state
+                    .as_ref()
+                    .and_then(|state| state.disk_total_bytes)
+                    .map(|bytes| bytes as i64),
+                disk_available_bytes: self_state
+                    .as_ref()
+                    .and_then(|state| state.disk_available_bytes)
+                    .map(|bytes| bytes as i64),
                 reported_at: DateTime::now(),
             };
             match client.report_status(&payload).await {
@@ -787,7 +835,11 @@ fn service_command(action: &str, rest: &[String]) -> Result<(), String> {
             println!(
                 "service 定义 {}：{}",
                 layout.definition_path.display(),
-                if removed { "已删除" } else { "本就不存在" }
+                if removed {
+                    "已删除"
+                } else {
+                    "本就不存在"
+                }
             );
             Ok(())
         }
@@ -795,7 +847,10 @@ fn service_command(action: &str, rest: &[String]) -> Result<(), String> {
             let status = service::status(&layout, &spec)?;
             println!("platform={}", status.platform.as_str());
             println!("scope={}", status.scope.as_str());
-            println!("definition={}", service::path_state(&status.definition_path));
+            println!(
+                "definition={}",
+                service::path_state(&status.definition_path)
+            );
             println!("bin={}", service::path_state(&status.bin));
             println!("config={}", service::path_state(&status.config_path));
             if let Some(err) = &status.config_error {

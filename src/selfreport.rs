@@ -17,6 +17,41 @@ pub struct GatewaySelfState {
     pub uplink_enabled: bool,
     #[serde(default)]
     pub last_error: Option<String>,
+    // 以下为后加的富化字段：老版本网关照常无这些键 → `default` 兜底，不因缺字段而整条拉失败。
+    #[serde(default)]
+    pub uptime_seconds: i64,
+    #[serde(default)]
+    pub cpu_percent: Option<f64>,
+    #[serde(default)]
+    pub memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub online_agents: i64,
+    #[serde(default)]
+    pub offline_agents: i64,
+    #[serde(default)]
+    pub last_seen_lag_seconds: i64,
+    #[serde(default)]
+    pub store_bytes: u64,
+    #[serde(default)]
+    pub ingest_accepted_total: u64,
+    #[serde(default)]
+    pub ingest_rejected_total: u64,
+    #[serde(default)]
+    pub last_ingest_at: Option<wist_control::DateTime>,
+    #[serde(default)]
+    pub memory_total_bytes: Option<u64>,
+    #[serde(default)]
+    pub load_1m: Option<f64>,
+    #[serde(default)]
+    pub load_5m: Option<f64>,
+    #[serde(default)]
+    pub load_15m: Option<f64>,
+    #[serde(default)]
+    pub disk_usage_percent: Option<f64>,
+    #[serde(default)]
+    pub disk_total_bytes: Option<u64>,
+    #[serde(default)]
+    pub disk_available_bytes: Option<u64>,
 }
 
 impl GatewaySelfState {
@@ -92,7 +127,7 @@ mod tests {
     /// 网关 `self_state.rs` 输出的**契约 fixture**（snake_case）。
     /// 网关侧有同一份 fixture 的**序列化**测试（`serializes_the_self_state_contract_keys`）——
     /// 两侧同钉一份形状，任一侧改名即在此处爆掉（防三份拷贝漂移）。
-    const GATEWAY_SELF_STATE_JSON: &str = r#"{"gateway_id":"gw-1","version":"0.1.15","collected_at":"2026-10-04T00:00:00Z","store_healthy":true,"agent_count":3,"uplink_enabled":true,"last_error":null}"#;
+    const GATEWAY_SELF_STATE_JSON: &str = r#"{"gateway_id":"gw-1","version":"0.1.15","collected_at":"2026-10-04T00:00:00Z","store_healthy":true,"agent_count":3,"uplink_enabled":true,"last_error":null,"uptime_seconds":3600,"cpu_percent":1.5,"memory_bytes":104857600,"online_agents":2,"offline_agents":1,"last_seen_lag_seconds":30}"#;
 
     #[test]
     fn parses_the_gateway_self_state_contract() {
@@ -115,6 +150,23 @@ mod tests {
             agent_count: 0,
             uplink_enabled: false,
             last_error: None,
+            uptime_seconds: 0,
+            cpu_percent: None,
+            memory_bytes: None,
+            online_agents: 0,
+            offline_agents: 0,
+            last_seen_lag_seconds: 0,
+            store_bytes: 4096,
+            ingest_accepted_total: 0,
+            ingest_rejected_total: 0,
+            last_ingest_at: None,
+            memory_total_bytes: None,
+            load_1m: None,
+            load_5m: None,
+            load_15m: None,
+            disk_usage_percent: None,
+            disk_total_bytes: None,
+            disk_available_bytes: None,
         };
         assert_eq!(off.health(), "degraded");
         let errored = GatewaySelfState {

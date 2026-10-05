@@ -3,9 +3,12 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.5.0-alpha] - 2026-10-05
 
 ### Added
+- **网关状态上报富化**：主循环上报中心时填充**进程 / 机队 / 存储 / 数据面 / 主机资源**字段
+  （`uptime_seconds` / `cpu_percent` / `memory_bytes` / 机队 / `store_bytes` / ingest 计数 / 主机
+  `memory_total_bytes` / `load_*` / `disk_*`），与网关自述面同源（对齐 `wist-control` 0.6.1）。
 - **gwlinkd 状态心跳**：主循环每拍（含首跑等待期）把自身状态
   （`state` / `version` / `center_endpoint` / 客户端证书到期 / 最近上报中心时刻 / 最近错误）
   环回 `POST /api/v1/gateway/linkd-status` 推给网关（纯出站，无入站面）——网关 Web 据此展示

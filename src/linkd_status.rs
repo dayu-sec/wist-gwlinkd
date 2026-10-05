@@ -68,6 +68,46 @@ mod tests {
             assert!(object.contains_key(key), "缺 {key}: {value}");
         }
         assert!(!object.contains_key("last_error"), "None 应被跳过: {value}");
-        assert!(value["reported_at"].is_string(), "reported_at 应为 RFC3339 串: {value}");
+        assert!(
+            value["reported_at"].is_string(),
+            "reported_at 应为 RFC3339 串: {value}"
+        );
+    }
+
+    /// 可选字段有值时必须**如实序列化**（None 跳过 ≠ 有值也丢）。
+    #[test]
+    fn status_serializes_optional_fields_when_present() {
+        let status = GwlinkdStatus {
+            gateway_id: "gw-1".into(),
+            instance_id: "gw-1/inst-1".into(),
+            version: "0.4.0".into(),
+            center_endpoint: "https://center.example".into(),
+            state: STATE_DEGRADED.into(),
+            credential_expires_at: Some("2026-12-01T00:00:00Z".into()),
+            last_center_report_at: Some("2026-10-05T00:00:00Z".into()),
+            last_error: Some("中心不可达".into()),
+            reported_at: DateTime::now(),
+        };
+        let value = serde_json::to_value(&status).expect("serialize");
+        assert_eq!(value["state"], "Degraded");
+        assert_eq!(value["last_error"], "中心不可达");
+        assert!(value["credential_expires_at"].is_string(), "{value}");
+        assert!(value["last_center_report_at"].is_string(), "{value}");
+    }
+
+    /// `state` 字面量与网关侧同钉一份契约 —— 任一侧改字面量即爆（页面判定直接靠这个）。
+    #[test]
+    fn state_constants_match_the_contract() {
+        assert_eq!(STATE_WAITING_LINK_REQUEST, "WaitingLinkRequest");
+        assert_eq!(STATE_LINKED, "Linked");
+        assert_eq!(STATE_DEGRADED, "Degraded");
+    }
+
+    /// 心跳时刻必须是**非空 RFC3339 串**（网关按它解析 / 对齐排障）。
+    #[test]
+    fn now_rfc3339_is_a_non_empty_string() {
+        let now = now_rfc3339();
+        assert!(now.contains('T'), "应是 RFC3339（形如 2026-…T…）：{now}");
+        assert!(now.len() >= 19, "RFC3339 至少到秒：{now}");
     }
 }
