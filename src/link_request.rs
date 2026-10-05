@@ -102,6 +102,29 @@ impl LinkRequestClient {
         }
         Ok(())
     }
+
+    /// 上报 gwlinkd 自身状态（心跳）：`POST /api/v1/gateway/linkd-status`。
+    ///
+    /// 网关 Web 靠它展示「宿主侧常驻在不在跑 / 健不健康」（gwlinkd 纯出站，页面拉不到它）。
+    pub async fn report_linkd_status(
+        &self,
+        status: &crate::linkd_status::GwlinkdStatus,
+    ) -> Result<(), String> {
+        let url = format!("{}/api/v1/gateway/linkd-status", self.endpoint);
+        let response = self
+            .http
+            .post(url)
+            .json(status)
+            .send()
+            .await
+            .map_err(|err| format!("linkd-status 请求失败: {err}"))?;
+        let code = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !code.is_success() {
+            return Err(format!("linkd-status 失败（{code}）：{body}"));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

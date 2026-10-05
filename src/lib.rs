@@ -16,6 +16,7 @@ pub mod doctor;
 pub mod executor;
 pub mod identity;
 pub mod link_request;
+pub mod linkd_status;
 pub mod selfreport;
 pub mod service;
 pub mod state;

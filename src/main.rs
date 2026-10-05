@@ -11,6 +11,9 @@ use wist_gwlinkd::doctor::{self, Status};
 use wist_gwlinkd::executor::{DEFAULT_ON_FAILURE, DEFAULT_UPGRADER_PROGRAM, GopsExecutor};
 use wist_gwlinkd::identity;
 use wist_gwlinkd::link_request::LinkRequestClient;
+use wist_gwlinkd::linkd_status::{
+    self, GwlinkdStatus, STATE_DEGRADED, STATE_LINKED, STATE_WAITING_LINK_REQUEST,
+};
 use wist_gwlinkd::selfreport::SelfReportClient;
 use wist_gwlinkd::service;
 use wist_gwlinkd::state::{self, CredentialStatus, UpgradeCursor};
@@ -112,6 +115,14 @@ async fn run(config: &Config) -> Result<(), String> {
         )?),
         None => None,
     };
+    // gwlinkd 心跳：推自身状态给网关（页面拉不到 gwlinkd —— 它纯出站）。同环回面 + 同一信任锚。
+    let linkd_client = match config.gateway_self_endpoint.as_deref() {
+        Some(base) => Some(LinkRequestClient::with_trust(
+            base,
+            config.gateway_self_ca.as_deref(),
+        )?),
+        None => None,
+    };
     let renew_lead = config.renew_lead_seconds.unwrap_or(3600);
     let driver = UpgradeDriver::new(
         GopsExecutor::new(
@@ -152,6 +163,10 @@ async fn run(config: &Config) -> Result<(), String> {
     // 轮换收尾的三态对齐标记（内存 credential / 磁盘 / mTLS 客户端）：失败则下一轮自愈重试。
     let mut credential_dirty = false;
     let mut client_stale = false;
+    // gwlinkd 自身状态（心跳）的派生态：默认已接入；有失败转 `Degraded` 并记原因（成功即清）。
+    let mut linkd_state = STATE_LINKED.to_string();
+    let mut linkd_last_error: Option<String> = None;
+    let mut linkd_last_report_at: Option<String> = None;
 
     // 启动收尾：上次运行留下的「被判死」升级（升级器被中断，机器可能停在中间态）。
     // 放在循环外只做一次（这是「上一次运行」的遗留态，不是运行中会反复出现的东西）。
@@ -204,6 +219,8 @@ async fn run(config: &Config) -> Result<(), String> {
                 Err(err) => {
                     renew_backoff = back_off(renew_backoff);
                     next_renew_at = Instant::now() + renew_backoff;
+                    linkd_state = STATE_DEGRADED.to_string();
+                    linkd_last_error = Some(format!("续期密钥生成失败：{err}"));
                     eprintln!("event=RenewFailed backoff={renew_backoff:?} error={err}");
                     continue;
                 }
@@ -245,6 +262,8 @@ async fn run(config: &Config) -> Result<(), String> {
                 Err(err) => {
                     renew_backoff = back_off(renew_backoff);
                     next_renew_at = Instant::now() + renew_backoff;
+                    linkd_state = STATE_DEGRADED.to_string();
+                    linkd_last_error = Some(format!("凭据续期失败：{err}"));
                     eprintln!("event=RenewFailed backoff={renew_backoff:?} error={err}");
                 }
             }
@@ -333,18 +352,45 @@ async fn run(config: &Config) -> Result<(), String> {
             match client.report_status(&payload).await {
                 Ok(()) => {
                     status_backoff = Duration::ZERO;
+                    linkd_state = STATE_LINKED.to_string();
+                    linkd_last_error = None;
+                    linkd_last_report_at = Some(linkd_status::now_rfc3339());
                     println!("event=StatusReported gateway_id={}", config.gateway_id);
                 }
                 Err(err) if err.is_unauthorized() => {
                     // 客户端证书被拒：**退避**（不每 30s 猛击），并明确要中心重置该实例。
                     status_backoff = back_off(status_backoff);
                     next_status_at = Instant::now() + status_backoff;
+                    linkd_state = STATE_DEGRADED.to_string();
+                    linkd_last_error = Some(format!("中心拒绝了客户端证书：{err}"));
                     eprintln!(
                         "event=CredentialRejected gateway_id={} backoff={status_backoff:?}（客户端证书已失效；需管理员在中心重置该实例后重新置备）error={err}",
                         config.gateway_id
                     );
                 }
-                Err(err) => eprintln!("event=StatusReportFailed error={err}"),
+                Err(err) => {
+                    linkd_state = STATE_DEGRADED.to_string();
+                    linkd_last_error = Some(format!("状态上报失败：{err}"));
+                    eprintln!("event=StatusReportFailed error={err}");
+                }
+            }
+        }
+
+        // 推 gwlinkd 自身状态（心跳）给网关：页面据此展示「宿主侧常驻在不在跑」。
+        if let Some(linkd_client) = &linkd_client {
+            let status = GwlinkdStatus {
+                gateway_id: config.gateway_id.clone(),
+                instance_id: instance_id.clone(),
+                version: wist_gwlinkd::VERSION.to_string(),
+                center_endpoint: config.control_center_endpoint.clone(),
+                state: linkd_state.clone(),
+                credential_expires_at: credential.bundle.not_after.clone(),
+                last_center_report_at: linkd_last_report_at.clone(),
+                last_error: linkd_last_error.clone(),
+                reported_at: DateTime::now(),
+            };
+            if let Err(err) = linkd_client.report_linkd_status(&status).await {
+                eprintln!("event=LinkdStatusPushFailed error={err}");
             }
         }
     }
@@ -475,6 +521,22 @@ async fn wait_for_gateway_request(
             Ok(true) => return Ok(()),
             Ok(false) => {}
             Err(err) => eprintln!("event=LinkRequestFailed error={err}"),
+        }
+        // 心率：接入前也推一条「在跑、等待接入」——免得页面把「还没接」当成「gwlinkd 没跑」。
+        let waiting = GwlinkdStatus {
+            gateway_id: config.gateway_id.clone(),
+            instance_id: state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)
+                .unwrap_or_default(),
+            version: wist_gwlinkd::VERSION.to_string(),
+            center_endpoint: config.control_center_endpoint.clone(),
+            state: STATE_WAITING_LINK_REQUEST.to_string(),
+            credential_expires_at: None,
+            last_center_report_at: None,
+            last_error: None,
+            reported_at: DateTime::now(),
+        };
+        if let Err(err) = client.report_linkd_status(&waiting).await {
+            eprintln!("event=LinkdStatusPushFailed error={err}");
         }
         tokio::time::sleep(Duration::from_secs(STATUS_INTERVAL_SECS)).await;
     }

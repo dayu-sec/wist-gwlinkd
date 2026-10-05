@@ -6,6 +6,10 @@
 ## [Unreleased]
 
 ### Added
+- **gwlinkd 状态心跳**：主循环每拍（含首跑等待期）把自身状态
+  （`state` / `version` / `center_endpoint` / 客户端证书到期 / 最近上报中心时刻 / 最近错误）
+  环回 `POST /api/v1/gateway/linkd-status` 推给网关（纯出站，无入站面）——网关 Web 据此展示
+  「宿主侧常驻在不在跑」。设计 `wist-design/doc/design/edge/gateway-linkd-status.md`。
 - **OS 服务托管（长期后台运行）**：新增 `service` 子命令（`print` / `install` / `uninstall` / `status`）——
   渲染并安装 **systemd unit**（Linux，`Restart=always`，日志进 journald）或 **launchd plist**
   （macOS，`KeepAlive`，日志进 `/var/log/wist-gwlinkd`），开机自启 + 崩溃拉起 + 退出重启。
