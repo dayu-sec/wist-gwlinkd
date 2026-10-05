@@ -447,6 +447,9 @@ async fn onboard_from_gateway(
 }
 
 /// 等待页面提交接入请求，出现即接入；失败则记结果后继续等下一次。
+///
+/// 每轮先尝试**遗留 RegistToken** 的免接入券注册（link-upstream 已成功、register 未成、
+/// 随后终态而不再派发时靠它自愈）。
 async fn wait_for_gateway_request(
     config: &Config,
     trust: Option<&Path>,
@@ -458,6 +461,11 @@ async fn wait_for_gateway_request(
         config.gateway_id
     );
     loop {
+        match retry_leftover_registration(config, trust, identity).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(err) => eprintln!("event=RegisterRetryFailed error={err}"),
+        }
         match onboard_from_gateway(config, trust, identity, client).await {
             Ok(true) => return Ok(()),
             Ok(false) => {}
@@ -465,6 +473,32 @@ async fn wait_for_gateway_request(
         }
         tokio::time::sleep(Duration::from_secs(STATUS_INTERVAL_SECS)).await;
     }
+}
+
+/// 遗留 RegistToken 的免接入券注册：endpoint 优先取已落盘链接配置，trust 优先取页面带来的 CA。
+/// 返回 `Ok(true)` 已注册；`Ok(false)` 无遗留 token；`Err` 注册失败（unauthorized 时 onboard 已清 token）。
+async fn retry_leftover_registration(
+    config: &Config,
+    trust: Option<&Path>,
+    identity: &str,
+) -> Result<bool, String> {
+    if state::load_regist_token(&config.state_dir).is_none() {
+        return Ok(false);
+    }
+    let endpoint = state::load_link_config(&config.state_dir)
+        .map(|saved| saved.control_center_endpoint)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| config.control_center_endpoint.clone());
+    let saved_ca = config.state_dir.join(state::TRUST_BUNDLE_FILE);
+    let effective_trust: Option<&Path> = if saved_ca.exists() {
+        Some(saved_ca.as_path())
+    } else {
+        trust
+    };
+    let client = CenterClient::with_client(endpoint, center::build_http_client(effective_trust)?);
+    onboard(&client, config, identity, None)
+        .await
+        .map(|()| true)
 }
 
 /// 首跑置备：link-upstream（一次性接入券 + 身份头）→ 落链接配置 → 生成密钥对+CSR →

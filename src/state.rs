@@ -311,6 +311,13 @@ pub fn save_link_config(
     write_secret(&path_in(state_dir, LINK_CONFIG_FILE), &text)
 }
 
+/// 读取已落盘的链接配置（link-upstream 返回）：用于遗留 RegistToken 的**免接入券**重试
+/// （拿到当时的中心 endpoint）。文件不存在/解析失败 → `None`。
+pub fn load_link_config(state_dir: &Path) -> Option<wist_control::GatewayInitialConfig> {
+    let text = std::fs::read_to_string(path_in(state_dir, LINK_CONFIG_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 // ───────────────────────── 升级记录 / 心跳 / 游标 ─────────────────────────
 
 /// 读升级记录；不存在或不可解析 → `None`。
