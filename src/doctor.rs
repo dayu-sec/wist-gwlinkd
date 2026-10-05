@@ -112,7 +112,7 @@ pub fn diagnose(config: &Config) -> Report {
 }
 
 /// 首跑置备遗留：有未消费的 RegistToken（link-upstream 成功、register 未成）。
-/// 留着是好状态 —— 下次启动会**免 bootstrap** 直接重试注册。
+/// 留着是好状态 —— 下次启动会**免接入券**直接重试注册。
 fn regist_token_check(config: &Config) -> Check {
     match state::load_regist_token(&config.state_dir) {
         Some(_) => Check::warn(
@@ -120,7 +120,7 @@ fn regist_token_check(config: &Config) -> Check {
             "有未完成的注册（待消费 RegistToken）",
             "上次 link-upstream 成功但 register 未完成；不会丢，下次启动会重试",
         )
-        .with_hint("运行 `wist-gwlinkd run` 完成注册（**无需**再设 bootstrap token）"),
+        .with_hint("运行 `wist-gwlinkd run` 完成注册（**无需**再设接入券）"),
         None => Check::ok(
             "credential.pending_regist",
             "无待完成的注册",
@@ -229,7 +229,7 @@ fn credential_check(config: &Config) -> Check {
             "尚无客户端身份",
             "首跑会走 link-upstream → register",
         )
-        .with_hint("设 WIST_GWLINKD_BOOTSTRAP_TOKEN 后运行 `wist-gwlinkd run` 完成首次置备"),
+        .with_hint("设 WIST_GWLINKD_LINK_TOKEN 后运行 `wist-gwlinkd run` 完成首次置备"),
         CredentialStatus::Corrupt(detail) => Check::fail(
             "credential.local",
             "客户端身份损坏",

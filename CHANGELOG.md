@@ -3,6 +3,13 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Changed（不兼容）
+- **接入券环境变量改名**：`WIST_GWLINKD_BOOTSTRAP_TOKEN` → `WIST_GWLINKD_LINK_TOKEN`
+  （旧名仍可读，会打印弃用告警；下一版移除）。名字改准 —— 它只在**首跑接入**（`link-upstream`）
+  时用一次，gateway 容器部署/启动本身不需要它。
+
 ## [0.3.0-alpha] - 2026-10-05
 
 ### Added

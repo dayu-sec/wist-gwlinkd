@@ -30,7 +30,7 @@ pub const CREDENTIAL_FILE: &str = "credential.json";
 /// link-upstream 返回的链接配置（信任锚 / 协议版本 / 注册 token 引用）。
 pub const LINK_CONFIG_FILE: &str = "link-config.json";
 /// 首跑置备遗留的**注册 token**：link-upstream 已签发、register 尚未消费时落盘，
-/// 使 register 失败（网络）后下次可**免 bootstrap** 重试。
+/// 使 register 失败（网络）后下次可**免接入券**重试。
 pub const REGIST_TOKEN_FILE: &str = "regist-token";
 /// 单实例锁文件。
 pub const LOCK_FILE: &str = "gwlinkd.lock";

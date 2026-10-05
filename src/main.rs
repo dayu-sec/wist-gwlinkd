@@ -86,11 +86,14 @@ async fn run(config: &Config) -> Result<(), String> {
             state::clear_regist_token(&config.state_dir);
         }
         CredentialStatus::Missing => {
-            // 首跑还没客户端证书：用无身份的客户端走 link-upstream + register（bootstrap）。
-            let bootstrap = center::build_http_client(trust)?;
-            let bootstrap_client =
-                CenterClient::with_client(config.control_center_endpoint.clone(), bootstrap);
-            onboard(&bootstrap_client, config, &identity).await?;
+            // 首跑还没客户端证书：用无身份的客户端走 link-upstream + register（接入）。
+            let link_client = CenterClient::with_client(
+                config.control_center_endpoint.clone(),
+                center::build_http_client(trust)?,
+            );
+            // 接入券只从环境拿一次、作为可选传入 —— 有遗留 RegistToken 时不需要它。
+            let link_token = link_token_from_env();
+            onboard(&link_client, config, &identity, link_token.as_deref()).await?;
         }
         CredentialStatus::Corrupt(detail) => {
             // 损坏 ≠ 缺失：不能静默重置备（会覆盖掉唯一一份长期身份）。
@@ -356,12 +359,34 @@ fn back_off(current: Duration) -> Duration {
     }
 }
 
-/// 首跑置备：link-upstream（一次性 bootstrap + 身份头）→ 落链接配置 → 生成密钥对+CSR →
+/// 读取一次性接入券：优先 `WIST_GWLINKD_LINK_TOKEN`，回退旧名
+/// `WIST_GWLINKD_BOOTSTRAP_TOKEN`（弃用告警，下一版移除）。
+fn link_token_from_env() -> Option<String> {
+    if let Ok(token) = std::env::var("WIST_GWLINKD_LINK_TOKEN") {
+        return Some(token);
+    }
+    match std::env::var("WIST_GWLINKD_BOOTSTRAP_TOKEN") {
+        Ok(token) => {
+            eprintln!(
+                "warning: WIST_GWLINKD_BOOTSTRAP_TOKEN 已更名为 WIST_GWLINKD_LINK_TOKEN，请更新（旧名下一版移除）"
+            );
+            Some(token)
+        }
+        Err(_) => None,
+    }
+}
+
+/// 首跑置备：link-upstream（一次性接入券 + 身份头）→ 落链接配置 → 生成密钥对+CSR →
 /// register（中心签出客户端证书）→ 落长期身份（证书 + 私钥）。
 ///
 /// **可重试**：`link-upstream` 成功即把 RegistToken 落盘；若随后 `register` 失败（网络等），
-/// 下次直接拿落盘的 token 重试，**不再需要 bootstrap**（bootstrap 已被消费）。
-async fn onboard(client: &CenterClient, config: &Config, identity: &str) -> Result<(), String> {
+/// 下次直接拿落盘的 token 重试，**不再需要接入券**（已被消费）。
+async fn onboard(
+    client: &CenterClient,
+    config: &Config,
+    identity: &str,
+    link: Option<&str>,
+) -> Result<(), String> {
     let instance_id = state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)?;
 
     // 复用上次未消费的 RegistToken（link-upstream 已成功、register 未成的遗留）：直接重试注册。
@@ -373,7 +398,7 @@ async fn onboard(client: &CenterClient, config: &Config, identity: &str) -> Resu
                 return Ok(());
             }
             Err(err) if err.is_unauthorized() => {
-                // token 已失效/已被消费：丢弃，走完整首跑（需 bootstrap）。
+                // token 已失效/已被消费：丢弃，走完整首跑（需接入券）。
                 eprintln!("event=RegistTokenStale 清掉遗留 token，重走首跑");
                 state::clear_regist_token(&config.state_dir);
             }
@@ -382,15 +407,15 @@ async fn onboard(client: &CenterClient, config: &Config, identity: &str) -> Resu
         }
     }
 
-    let bootstrap = std::env::var("WIST_GWLINKD_BOOTSTRAP_TOKEN").map_err(|_| {
-        "首跑需要 WIST_GWLINKD_BOOTSTRAP_TOKEN（中心 admin 创建实例时签发的引导 Token）；\
+    let link = link.ok_or_else(|| {
+        "首跑需要 WIST_GWLINKD_LINK_TOKEN（中心 admin 创建实例时签发的接入 token）；\
          若本机曾有身份，请检查 state/credential.json 是否损坏"
             .to_string()
     })?;
 
     println!("event=LinkUpstream gateway_id={}", config.gateway_id);
     let returned = client
-        .link_upstream(&config.gateway_id, &bootstrap, Some(identity))
+        .link_upstream(&config.gateway_id, link, Some(identity))
         .await
         .map_err(|err| err.to_string())?;
     // 链接配置（信任锚 / 协议版本 / 注册 token 引用）落盘留痕 —— 不再丢弃。
@@ -400,7 +425,7 @@ async fn onboard(client: &CenterClient, config: &Config, identity: &str) -> Resu
          请在中心重置该实例后重跑，或把既有的客户端证书/私钥写入 state/credential.json"
             .to_string()
     })?;
-    // **先落盘再注册**：bootstrap 已消费，注册失败也要能靠这个 token 重试。
+    // **先落盘再注册**：接入券已消费，注册失败也要能靠这个 token 重试。
     state::save_regist_token(&config.state_dir, &regist_token)?;
 
     register_once(client, config, &regist_token, &instance_id)
@@ -480,5 +505,262 @@ mod tests {
             back_off(Duration::from_secs(BACKOFF_MAX_SECS)),
             Duration::from_secs(BACKOFF_MAX_SECS)
         );
+    }
+
+    // ── onboard 语义测试（中心用桩）──
+
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Stub {
+        /// 记录的 `"METHOD path"`（去 query）。
+        calls: Vec<String>,
+        /// link-upstream 的固定响应 `(status, body)`。
+        link: Option<(u16, String)>,
+        /// register 依次响应（多余调用重复最后一个）。
+        registers: Vec<(u16, String)>,
+        reg_idx: usize,
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("gwlinkd-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    fn test_config(dir: &std::path::Path, endpoint: String) -> Config {
+        Config {
+            control_center_endpoint: endpoint,
+            trust_bundle: dir.join("ca.pem"),
+            state_dir: dir.to_path_buf(),
+            gateway_id: "gw-1".into(),
+            gateway_self_endpoint: None,
+            renew_lead_seconds: None,
+            upgrader_program: None,
+            upgrade_on_failure: None,
+            upgrade_health_cmd: None,
+            upgrade_health_timeout_seconds: None,
+            upgrade_verify_timeout_seconds: None,
+            upgrade_project_dir: None,
+            upgrade_project_name: None,
+            upgrade_retry_on_dead: None,
+        }
+    }
+
+    fn link_body(regist_token: Option<&str>) -> String {
+        serde_json::json!({
+            "config": {
+                "gateway_id": "gw-1",
+                "control_center_endpoint": "https://center",
+                "trust_bundle": serde_json::Value::Null,
+                "server_tls_required": false,
+                "protocol_version": "1.0",
+                "enrollment_token_id": "enroll-1",
+            },
+            "regist_token": regist_token,
+        })
+        .to_string()
+    }
+
+    fn register_result_body() -> String {
+        serde_json::json!({
+            "status": "accepted",
+            "gateway_id": "gw-1",
+            "instance_id": "inst-1",
+            "credential_id": "cred-1",
+            "initial_config": "v1",
+            "credential_bundle": {
+                "credential_id": "cred-1",
+                "gateway_id": "gw-1",
+                "instance_id": "inst-1",
+                "certificate": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+                "ca_bundle": serde_json::Value::Null,
+                "issued_at": "2026-10-05T00:00:00Z",
+                "not_before": serde_json::Value::Null,
+                "not_after": serde_json::Value::Null,
+            }
+        })
+        .to_string()
+    }
+
+    /// 极简中心桩：按路径回固定响应，并记录调用序列。
+    async fn serve_center(stub: Arc<Mutex<Stub>>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let stub = Arc::clone(&stub);
+                tokio::spawn(async move {
+                    // 排空请求（头 + body）：小载荷一次就能读完，空闲即止。
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match tokio::time::timeout(
+                            Duration::from_millis(200),
+                            sock.read(&mut chunk),
+                        )
+                        .await
+                        {
+                            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf);
+                    let request_line = head.lines().next().unwrap_or_default();
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or_default().to_string();
+                    let path = parts.next().unwrap_or_default().to_string();
+                    let route = path.split('?').next().unwrap_or_default().to_string();
+                    let (status, body) = {
+                        let mut guard = stub.lock().unwrap();
+                        guard.calls.push(format!("{method} {route}"));
+                        if route == "/api/v1/gateway/link-upstream" {
+                            guard.link.clone().unwrap_or((404, "no link".into()))
+                        } else if route == "/api/v1/gateway/register" {
+                            let idx = guard.reg_idx.min(guard.registers.len().saturating_sub(1));
+                            guard.reg_idx += 1;
+                            guard
+                                .registers
+                                .get(idx)
+                                .cloned()
+                                .unwrap_or((404, "no register".into()))
+                        } else {
+                            (404, "not found".into())
+                        }
+                    };
+                    let reason = match status {
+                        200 => "OK",
+                        401 => "Unauthorized",
+                        500 => "Internal Server Error",
+                        _ => "Not Found",
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn onboard_retries_with_a_leftover_regist_token() {
+        let dir = temp_dir("onboard-retry");
+        wist_gwlinkd::state::save_regist_token(&dir, "reg-leftover").expect("save");
+        let stub = Arc::new(Mutex::new(Stub {
+            registers: vec![(200, register_result_body())],
+            ..Default::default()
+        }));
+        let url = serve_center(Arc::clone(&stub)).await;
+        let client = CenterClient::new(url);
+        let config = test_config(&dir, client.endpoint().to_string());
+
+        // 遗留 token → 直接注册，**不**再走 link-upstream（也不需要 link）。
+        onboard(&client, &config, "ident-1", None)
+            .await
+            .expect("onboard");
+        assert!(
+            wist_gwlinkd::state::load_credential(&dir).is_some(),
+            "应落长期身份"
+        );
+        assert!(
+            wist_gwlinkd::state::load_regist_token(&dir).is_none(),
+            "RegistToken 应已清"
+        );
+        assert_eq!(
+            stub.lock().unwrap().calls,
+            vec!["POST /api/v1/gateway/register"]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn onboard_falls_back_to_full_provision_when_token_is_stale() {
+        let dir = temp_dir("onboard-stale");
+        wist_gwlinkd::state::save_regist_token(&dir, "reg-stale").expect("save");
+        let stub = Arc::new(Mutex::new(Stub {
+            link: Some((200, link_body(Some("reg-new")))),
+            registers: vec![(401, "unauthorized".into()), (200, register_result_body())],
+            ..Default::default()
+        }));
+        let url = serve_center(Arc::clone(&stub)).await;
+        let client = CenterClient::new(url);
+        let config = test_config(&dir, client.endpoint().to_string());
+
+        onboard(&client, &config, "ident-1", Some("link-1"))
+            .await
+            .expect("onboard");
+        assert!(wist_gwlinkd::state::load_credential(&dir).is_some());
+        assert!(wist_gwlinkd::state::load_regist_token(&dir).is_none());
+        assert_eq!(
+            stub.lock().unwrap().calls,
+            vec![
+                "POST /api/v1/gateway/register",
+                "GET /api/v1/gateway/link-upstream",
+                "POST /api/v1/gateway/register",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn onboard_keeps_the_regist_token_on_a_transient_register_failure() {
+        let dir = temp_dir("onboard-transient");
+        wist_gwlinkd::state::save_regist_token(&dir, "reg-keep").expect("save");
+        let stub = Arc::new(Mutex::new(Stub {
+            registers: vec![(500, "boom".into())],
+            ..Default::default()
+        }));
+        let url = serve_center(Arc::clone(&stub)).await;
+        let client = CenterClient::new(url);
+        let config = test_config(&dir, client.endpoint().to_string());
+
+        let err = onboard(&client, &config, "ident-1", None).await;
+        assert!(err.is_err(), "500 应报错");
+        assert_eq!(
+            wist_gwlinkd::state::load_regist_token(&dir).as_deref(),
+            Some("reg-keep"),
+            "网络/服务错应**保留** token 以便下次重试"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn onboard_errors_when_center_says_initialized_but_no_local_credential() {
+        let dir = temp_dir("onboard-initialized");
+        let stub = Arc::new(Mutex::new(Stub {
+            link: Some((200, link_body(None))),
+            ..Default::default()
+        }));
+        let url = serve_center(Arc::clone(&stub)).await;
+        let client = CenterClient::new(url);
+        let config = test_config(&dir, client.endpoint().to_string());
+
+        let err = onboard(&client, &config, "ident-1", Some("link-1"))
+            .await
+            .expect_err("应报错");
+        assert!(err.contains("身份重置"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn onboard_requires_a_link_token_on_first_run() {
+        let dir = temp_dir("onboard-noboot");
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let url = serve_center(Arc::clone(&stub)).await;
+        let client = CenterClient::new(url);
+        let config = test_config(&dir, client.endpoint().to_string());
+
+        let err = onboard(&client, &config, "ident-1", None)
+            .await
+            .expect_err("应报错");
+        assert!(err.contains("WIST_GWLINKD_LINK_TOKEN"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

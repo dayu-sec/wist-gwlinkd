@@ -131,7 +131,7 @@ impl CenterClient {
 
     /// 链接上级：`GET /api/v1/gateway/link-upstream?gateway_id=`。
     ///
-    /// **只用于首跑置备**（本地还没有客户端证书时）：`Bearer <bootstrap>` +
+    /// **只用于首跑置备**（本地还没有客户端证书时）：`Bearer <link>` +
     /// `X-Gateway-Identity-Token: <ident_>`。已注册后不再调此端点（直接走 mTLS）。
     pub async fn link_upstream(
         &self,
@@ -425,7 +425,7 @@ mod tests {
         .await;
         let client = CenterClient::new(endpoint);
         let returned = client
-            .link_upstream("gw-1", "boot_tok", Some("ident_xyz"))
+            .link_upstream("gw-1", "link_tok", Some("ident_xyz"))
             .await
             .expect("ok");
         assert_eq!(returned.regist_token.as_deref(), Some("reg_xyz"));
@@ -436,7 +436,7 @@ mod tests {
             "{request}"
         );
         assert!(
-            lower.contains("authorization: bearer boot_tok"),
+            lower.contains("authorization: bearer link_tok"),
             "{request}"
         );
         assert!(

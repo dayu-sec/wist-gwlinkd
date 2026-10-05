@@ -44,7 +44,7 @@ upgrade_project_name = "wist-gateway"              # 只升该系统（缺省 = 
 upgrade_retry_on_dead = true                       # 判死后是否自动重驱同一计划（false = 只交管理面重派）
 ```
 
-环境变量：`WIST_GWLINKD_CONFIG`（配置文件路径）、`WIST_GWLINKD_BOOTSTRAP_TOKEN`（首跑置备用的一次性引导 Token）。
+环境变量：`WIST_GWLINKD_CONFIG`（配置文件路径）、`WIST_GWLINKD_LINK_TOKEN`（首跑置备用的一次性接入 token）。
 
 升级由常驻周期从中心 `GET /api/v1/gateway/upgrade-plan` 拉 desired 驱动（按 `plan_id` 幂等，游标落盘跨重启）。
 执行器经 [**适配层**](src/executor.rs) 调用（`gops` 只是其中一个 impl）：驱动只认「构造调用 + 归一化结局」。
