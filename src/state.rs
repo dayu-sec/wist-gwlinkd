@@ -279,6 +279,16 @@ pub fn save_regist_token(state_dir: &Path, token: &str) -> Result<(), String> {
     write_secret(&path_in(state_dir, REGIST_TOKEN_FILE), token)
 }
 
+/// 中心信任锚（CA-S）落盘文件名（PEM）。
+pub const TRUST_BUNDLE_FILE: &str = "control-center.pem";
+
+/// 落盘中心信任锚（CA-S PEM）：接入物从页面来时可免预置。返回落盘路径。
+pub fn save_trust_bundle(state_dir: &Path, pem: &str) -> Result<std::path::PathBuf, String> {
+    let path = path_in(state_dir, TRUST_BUNDLE_FILE);
+    write_secret(&path, pem)?;
+    Ok(path)
+}
+
 /// 读待消费的 RegistToken；不存在 / 空白 → `None`。
 pub fn load_regist_token(state_dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path_in(state_dir, REGIST_TOKEN_FILE)).ok()?;

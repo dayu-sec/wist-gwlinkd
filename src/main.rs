@@ -10,6 +10,7 @@ use wist_gwlinkd::config::Config;
 use wist_gwlinkd::doctor::{self, Status};
 use wist_gwlinkd::executor::{DEFAULT_ON_FAILURE, DEFAULT_UPGRADER_PROGRAM, GopsExecutor};
 use wist_gwlinkd::identity;
+use wist_gwlinkd::link_request::LinkRequestClient;
 use wist_gwlinkd::selfreport::SelfReportClient;
 use wist_gwlinkd::state::{self, CredentialStatus, UpgradeCursor};
 use wist_gwlinkd::upgrade::{RECOVERY_VERIFY_TIMEOUT, UpgradeDriver, UpgradeReporter};
@@ -86,14 +87,8 @@ async fn run(config: &Config) -> Result<(), String> {
             state::clear_regist_token(&config.state_dir);
         }
         CredentialStatus::Missing => {
-            // 首跑还没客户端证书：用无身份的客户端走 link-upstream + register（接入）。
-            let link_client = CenterClient::with_client(
-                config.control_center_endpoint.clone(),
-                center::build_http_client(trust)?,
-            );
-            // 接入券只从环境拿一次、作为可选传入 —— 有遗留 RegistToken 时不需要它。
-            let link_token = link_token_from_env();
-            onboard(&link_client, config, &identity, link_token.as_deref()).await?;
+            // 首跑还没客户端证书：先看网关页有没有提交「接入请求」（环回），否则回退 env 券。
+            first_run(config, trust, &identity).await?;
         }
         CredentialStatus::Corrupt(detail) => {
             // 损坏 ≠ 缺失：不能静默重置备（会覆盖掉唯一一份长期身份）。
@@ -376,6 +371,102 @@ fn link_token_from_env() -> Option<String> {
     }
 }
 
+/// 首跑：确保拿到长期身份（可能等待页面提交的接入请求）。
+async fn first_run(config: &Config, trust: Option<&Path>, identity: &str) -> Result<(), String> {
+    // 页面发起（环回接入请求）优先。
+    if let Some(base) = config.gateway_self_endpoint.as_deref() {
+        let client = LinkRequestClient::new(base);
+        if link_token_from_env().is_none() {
+            // 没有 env 券 → 页面发起路径：等到页面上提交了再接入，失败则继续等下一次。
+            return wait_for_gateway_request(config, trust, identity, &client).await;
+        }
+        // 有 env 券：优先环回请求，没有/失败则回退旧路径。
+        match onboard_from_gateway(config, trust, identity, &client).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(err) => eprintln!("event=LinkRequestFailed error={err}（回退 env 券路径）"),
+        }
+    }
+    // 旧路径：env 券（或报错）+ 配置 endpoint/trust。
+    let link_client = CenterClient::with_client(
+        config.control_center_endpoint.clone(),
+        center::build_http_client(trust)?,
+    );
+    onboard(
+        &link_client,
+        config,
+        identity,
+        link_token_from_env().as_deref(),
+    )
+    .await
+}
+
+/// 一次「从环回接入请求接入」：有待办则接入并回报结果，成功返回 `Ok(true)`；无待办 `Ok(false)`。
+async fn onboard_from_gateway(
+    config: &Config,
+    trust: Option<&Path>,
+    identity: &str,
+    client: &LinkRequestClient,
+) -> Result<bool, String> {
+    let request = client.fetch(&config.gateway_id).await?;
+    if !request.has_request {
+        return Ok(false);
+    }
+    // 页面带的 CA 落盘（免得还要先手工预置信任锚）。
+    let trust_path = if request.trust_bundle_pem.trim().is_empty() {
+        None
+    } else {
+        Some(state::save_trust_bundle(
+            &config.state_dir,
+            &request.trust_bundle_pem,
+        )?)
+    };
+    let effective_trust = trust_path.as_deref().or(trust);
+    let link_client = CenterClient::with_client(
+        request.center_endpoint.clone(),
+        center::build_http_client(effective_trust)?,
+    );
+    println!(
+        "event=LinkRequestPicked gateway_id={} center={}",
+        config.gateway_id, request.center_endpoint
+    );
+    match onboard(&link_client, config, identity, Some(&request.link_token)).await {
+        Ok(()) => {
+            let _ = client
+                .report_result(&config.gateway_id, "Connected", "")
+                .await;
+            Ok(true)
+        }
+        Err(err) => {
+            let _ = client
+                .report_result(&config.gateway_id, "Failed", &err)
+                .await;
+            Err(err)
+        }
+    }
+}
+
+/// 等待页面提交接入请求，出现即接入；失败则记结果后继续等下一次。
+async fn wait_for_gateway_request(
+    config: &Config,
+    trust: Option<&Path>,
+    identity: &str,
+    client: &LinkRequestClient,
+) -> Result<(), String> {
+    println!(
+        "event=WaitingLinkRequest gateway_id={}（等待页面「链接上级」提交接入请求）",
+        config.gateway_id
+    );
+    loop {
+        match onboard_from_gateway(config, trust, identity, client).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(err) => eprintln!("event=LinkRequestFailed error={err}"),
+        }
+        tokio::time::sleep(Duration::from_secs(STATUS_INTERVAL_SECS)).await;
+    }
+}
+
 /// 首跑置备：link-upstream（一次性接入券 + 身份头）→ 落链接配置 → 生成密钥对+CSR →
 /// register（中心签出客户端证书）→ 落长期身份（证书 + 私钥）。
 ///
@@ -517,6 +608,8 @@ mod tests {
         calls: Vec<String>,
         /// link-upstream 的固定响应 `(status, body)`。
         link: Option<(u16, String)>,
+        /// 网关环回 `link-request` 的固定响应 `(status, body)`。
+        link_request: Option<(u16, String)>,
         /// register 依次响应（多余调用重复最后一个）。
         registers: Vec<(u16, String)>,
         reg_idx: usize,
@@ -619,6 +712,13 @@ mod tests {
                         guard.calls.push(format!("{method} {route}"));
                         if route == "/api/v1/gateway/link-upstream" {
                             guard.link.clone().unwrap_or((404, "no link".into()))
+                        } else if route == "/api/v1/gateway/link-request" {
+                            guard
+                                .link_request
+                                .clone()
+                                .unwrap_or((404, "no request".into()))
+                        } else if route == "/api/v1/gateway/link-result" {
+                            (200, "{}".into())
                         } else if route == "/api/v1/gateway/register" {
                             let idx = guard.reg_idx.min(guard.registers.len().saturating_sub(1));
                             guard.reg_idx += 1;
@@ -677,6 +777,76 @@ mod tests {
             stub.lock().unwrap().calls,
             vec!["POST /api/v1/gateway/register"]
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 页面发起接入：有待办 → 接入并回报 `Connected`。
+    #[tokio::test]
+    async fn onboard_from_gateway_consumes_the_page_request() {
+        let dir = temp_dir("link-request");
+        let stub = Arc::new(Mutex::new(Stub {
+            link: Some((200, link_body(Some("reg-x")))),
+            registers: vec![(200, register_result_body())],
+            ..Default::default()
+        }));
+        let url = serve_center(Arc::clone(&stub)).await;
+        // 网关桩的 link-request 指向同一桩作 Center（endpoint 即 url）。
+        stub.lock().unwrap().link_request = Some((
+            200,
+            serde_json::json!({
+                "has_request": true,
+                "gateway_id": "gw-1",
+                "center_endpoint": url,
+                "link_token": "link_abc",
+                "trust_bundle_pem": "",
+                "status": "Pending",
+            })
+            .to_string(),
+        ));
+        let client = LinkRequestClient::new(url.clone());
+        let config = test_config(&dir, url);
+
+        let registered = onboard_from_gateway(&config, None, "ident-1", &client)
+            .await
+            .expect("onboard");
+        assert!(registered, "有待办应完成接入");
+        assert!(wist_gwlinkd::state::load_credential(&dir).is_some());
+        let calls = stub.lock().unwrap().calls.clone();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "GET /api/v1/gateway/link-request"),
+            "应拉取待办：{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "POST /api/v1/gateway/link-result"),
+            "应回报结果：{calls:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 无待办：返回 `Ok(false)`，不接入。
+    #[tokio::test]
+    async fn onboard_from_gateway_reports_no_request() {
+        let dir = temp_dir("link-request-none");
+        let stub = Arc::new(Mutex::new(Stub {
+            link_request: Some((
+                200,
+                r#"{"has_request":false,"gateway_id":"","center_endpoint":"","link_token":"","trust_bundle_pem":"","status":""}"#.into(),
+            )),
+            ..Default::default()
+        }));
+        let url = serve_center(Arc::clone(&stub)).await;
+        let client = LinkRequestClient::new(url.clone());
+        let config = test_config(&dir, url);
+
+        let registered = onboard_from_gateway(&config, None, "ident-1", &client)
+            .await
+            .expect("ok");
+        assert!(!registered);
+        assert!(wist_gwlinkd::state::load_credential(&dir).is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
