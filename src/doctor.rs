@@ -257,7 +257,7 @@ fn upgrader_check(config: &Config) -> Check {
     let program = config
         .upgrader_program
         .as_deref()
-        .unwrap_or(crate::upgrade::DEFAULT_UPGRADER_PROGRAM);
+        .unwrap_or(crate::executor::DEFAULT_UPGRADER_PROGRAM);
     match resolve_program(program) {
         Some(path) => Check::ok(
             "upgrader.program",
@@ -278,6 +278,16 @@ fn upgrade_check(config: &Config) -> Check {
     let now = SystemTime::now();
     match state::read_upgrade_record(&config.state_dir) {
         None => Check::ok("upgrade.local", "没有进行中的升级", "台账不存在"),
+        // 终态（done / failed / rolled_back / unverified...）：上一次升级已结束 —— 别再说「进行中」。
+        Some(record) if record.status != "running" => {
+            let detail = format!("status={} step={}", record.status, record.step);
+            if record.status == "done" {
+                Check::ok("upgrade.local", "上次升级已成功结束", detail)
+            } else {
+                Check::warn("upgrade.local", "上次升级未成功结束", detail)
+                    .with_hint("看执行器日志与台账；确认现场后到管理面重派升级")
+            }
+        }
         Some(_) if state::upgrader_is_declared_dead(&config.state_dir, now) => Check::fail(
             "upgrade.local",
             "升级器已失联（判定已死）",
@@ -404,6 +414,9 @@ mod tests {
             renew_lead_seconds: None,
             upgrader_program: Some("/bin/sh".into()),
             upgrade_on_failure: None,
+            upgrade_health_cmd: None,
+            upgrade_health_timeout_seconds: None,
+            upgrade_verify_timeout_seconds: None,
             upgrade_project_dir: None,
             upgrade_project_name: None,
             upgrade_retry_on_dead: None,
@@ -501,6 +514,49 @@ mod tests {
         assert_eq!(status_of(&diagnose(&cfg), "upgrade.local"), Status::Fail);
         crate::state::touch_heartbeat(&dir).expect("heartbeat");
         assert_eq!(status_of(&diagnose(&cfg), "upgrade.local"), Status::Ok);
+    }
+
+    #[test]
+    fn a_finished_upgrade_is_not_reported_as_in_progress() {
+        let dir = temp_dir("upg-finished");
+        let cfg = config(&dir);
+
+        // done：绿，且不再说「进行中」。
+        crate::state::write_upgrade_record(
+            &dir,
+            &crate::state::UpgradeRecord {
+                work_id: "w-1".into(),
+                from_version: "0.1.0".into(),
+                to_version: "0.1.16".into(),
+                step: "verify".into(),
+                status: "done".into(),
+                detail: String::new(),
+            },
+        )
+        .expect("record");
+        let check = diagnose(&cfg);
+        let upgrade = check.find("upgrade.local").expect("check");
+        assert_eq!(upgrade.status, Status::Ok);
+        assert!(!upgrade.title.contains("正在进行"), "{}", upgrade.title);
+
+        // 非 done 的终态：提示（Warn），但仍不判死、不说过行中。
+        crate::state::write_upgrade_record(
+            &dir,
+            &crate::state::UpgradeRecord {
+                work_id: "w-2".into(),
+                from_version: "0.1.0".into(),
+                to_version: "0.1.16".into(),
+                step: "verify".into(),
+                status: "unverified".into(),
+                detail: String::new(),
+            },
+        )
+        .expect("record");
+        let report = diagnose(&cfg);
+        let upgrade = report.find("upgrade.local").expect("check");
+        assert_eq!(upgrade.status, Status::Warn);
+        assert!(!upgrade.title.contains("正在进行"), "{}", upgrade.title);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

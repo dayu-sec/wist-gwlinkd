@@ -25,6 +25,15 @@ pub struct Config {
     /// 升级失败处置（`rollback-all` | `halt`；缺省 `rollback-all`）。
     #[serde(default)]
     pub upgrade_on_failure: Option<String>,
+    /// 栈外健康检查命令（给 gops `--health-cmd`；给 `sh -c`）：**给了才让 gops 据健康判定回滚**。
+    #[serde(default)]
+    pub upgrade_health_cmd: Option<String>,
+    /// 健康检查超时秒数（给 gops `--health-timeout`；缺省由 gops 定）。
+    #[serde(default)]
+    pub upgrade_health_timeout_seconds: Option<u64>,
+    /// 升级成功**佐证**的观测窗口秒数（执行器报成后，等网关自述面恢复健康的最长时间；缺省 300）。
+    #[serde(default)]
+    pub upgrade_verify_timeout_seconds: Option<u64>,
     /// gops 工程根（含 `ops-prj.yml`）：gops 从 cwd 解析工程，需在此指定。
     #[serde(default)]
     pub upgrade_project_dir: Option<PathBuf>,
@@ -96,11 +105,17 @@ mod tests {
         let path = dir.join("gwlinkd.toml");
         std::fs::write(
             &path,
-            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\nupgrade_on_failure = \"halt\"\nupgrade_project_dir = \"/opt/prj\"\nupgrade_project_name = \"wist-gateway\"\nupgrade_retry_on_dead = false\n",
+            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\nupgrade_on_failure = \"halt\"\nupgrade_health_cmd = \"curl -fsS http://127.0.0.1:3000/health\"\nupgrade_health_timeout_seconds = 45\nupgrade_verify_timeout_seconds = 7\nupgrade_project_dir = \"/opt/prj\"\nupgrade_project_name = \"wist-gateway\"\nupgrade_retry_on_dead = false\n",
         )
         .expect("write");
         let config = Config::load(&path).expect("load");
         assert_eq!(config.upgrade_on_failure.as_deref(), Some("halt"));
+        assert_eq!(
+            config.upgrade_health_cmd.as_deref(),
+            Some("curl -fsS http://127.0.0.1:3000/health")
+        );
+        assert_eq!(config.upgrade_health_timeout_seconds, Some(45));
+        assert_eq!(config.upgrade_verify_timeout_seconds, Some(7));
         assert_eq!(
             config.upgrade_project_dir.as_deref(),
             Some(std::path::Path::new("/opt/prj"))

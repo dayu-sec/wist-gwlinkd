@@ -37,6 +37,8 @@ gateway_self_endpoint = "https://127.0.0.1:3000"   # 网关容器自述面（环
 renew_lead_seconds = 3600                          # 凭据续期提前量
 upgrader_program = "gops"                          # 升级执行器
 upgrade_on_failure = "rollback-all"                # gops --on-failure（rollback-all | halt）
+upgrade_health_cmd = "curl -fsS http://127.0.0.1:3000/health"  # 栈外健康检查（给 gops --health-cmd）
+upgrade_health_timeout_seconds = 120               # 健康检查超时（给 gops --health-timeout）
 upgrade_project_dir = "/opt/wist/gateway-prj"      # gops 工程根（含 ops-prj.yml；gops 从 cwd 解析）
 upgrade_project_name = "wist-gateway"              # 只升该系统（缺省 = 全部已导入系统）
 upgrade_retry_on_dead = true                       # 判死后是否自动重驱同一计划（false = 只交管理面重派）
@@ -45,9 +47,13 @@ upgrade_retry_on_dead = true                       # 判死后是否自动重驱
 环境变量：`WIST_GWLINKD_CONFIG`（配置文件路径）、`WIST_GWLINKD_BOOTSTRAP_TOKEN`（首跑置备用的一次性引导 Token）。
 
 升级由常驻周期从中心 `GET /api/v1/gateway/upgrade-plan` 拉 desired 驱动（按 `plan_id` 幂等，游标落盘跨重启）。
-执行器调用契约（gops 2.2.x）：`gops prj upgrade --to <版本|URL|路径> --on-failure <rollback-all|halt> --json [NAME]`；
+执行器经 [**适配层**](src/executor.rs) 调用（`gops` 只是其中一个 impl）：驱动只认「构造调用 + 归一化结局」。
+gops 调用契约（2.2.x）：`gops prj upgrade --to <版本|URL|路径> --on-failure <rollback-all|halt>
+[--health-cmd <cmd> [--health-timeout <s>]] --json [NAME]`；
 `--on-failure` 现阶段**必填**（缺省全回滚），`--json` 出机读结局（成功/失败/已回滚），执行器日志落
-`state_dir/wist-upgrader.log`。**常驻退出时会收走执行器**（`kill_on_drop` + Linux `PR_SET_PDEATHSIG`），
+`state_dir/wist-upgrader.log`。**成功要佐证**：执行器报成后，若配了 `gateway_self_endpoint`，还会独立观测网关
+自述面是否恢复且健康，观测不到则记 `unverified`（不认 `done`）；没配自述面则回执细节里标注「未佐证」。
+**常驻退出时会收走执行器**（`kill_on_drop` + Linux `PR_SET_PDEATHSIG`），
 不留孤儿执行器继续动现场。其余：同机**单实例**（`flock` 锁）、HTTP 带**超时**、`trust_bundle` 作为**自定义信任锚**、
 凭据**原子落盘**。
 

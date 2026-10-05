@@ -3,6 +3,28 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0-alpha] - 2026-10-05
+
+### Added
+- **升级执行器适配层**（`executor` 模块）：驱动不再写死 gops，只认「构造调用 + 归一化结局」；
+  `GopsExecutor` 是其一。换执行器（别的交付器 / 站点脚本）只需另给一个 `UpgradeExecutor` impl。（CR-003 R4）
+- **升级成功佐证**：执行器报成后，再用网关**自述面**（`gateway_self_endpoint`）独立确认「网关确实回来了且健康」；
+  观测不到就记 `unverified` 而非 `done` —— 只信执行器一面之词会让「成功」可能是假的。
+- 配置项 `upgrade_health_cmd` / `upgrade_health_timeout_seconds`：给 gops `--health-cmd` / `--health-timeout`，
+  **给了才让 gops 据栈外健康判定回滚**。
+
+### Fixed
+- **未知 gops `status` 不再静默归 `failed`**：保留原值并加前缀（`unknown:<原值>`），契约漂移看得见。
+- **佐证单次探测按剩余窗口约束**：一次卡住的 fetch 不再把窗口拖到 `HTTP_TIMEOUT`（30s）。
+- **心跳覆盖整个升级事务**（含佐证窗口）：此前佐证期（最长 `verify_timeout`）心跳停跳，会被误判「已死」、
+  甚至重启后重驱同一计划；现用 RAII 守卫托管心跳任务（正常退出 / panic 都收走，不留孤儿）。
+- **并发排空执行器 stdout**：子进程写满管道会阻塞退出，原「先 `wait()` 再读」会死锁。
+- **执行器起不来 = 终态**：`spawn` 失败写 `status=failed`（`step=spawn`），不再把台账停在 `running`。
+- **`interpret()` 的 `ok` 与 `status` 对齐**：空 `status` + 退出码 0 此前会得到 `status=done` 但 `ok=false` 的不一致；
+  `ok` 现由 `status` 推导（调用方据 `ok` gate「成功佐证」）。
+- **诊断不再把终态升级误报为「进行中」**：`upgrade.local` 现在区分进行中与已结束 —— 终态 `done` 报绿，
+  非 `done` 终态（`failed` / `rolled_back` / `unverified`）报 **WARN**（提示但不判死）。
+
 ## [0.2.0-alpha] - 2026-10-04
 
 ### Changed（不兼容）

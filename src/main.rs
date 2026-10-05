@@ -8,12 +8,11 @@ use wist_control::{DateTime, ReportGatewayStatus};
 use wist_gwlinkd::center::{self, CenterClient, CenterError};
 use wist_gwlinkd::config::Config;
 use wist_gwlinkd::doctor::{self, Status};
+use wist_gwlinkd::executor::{DEFAULT_ON_FAILURE, DEFAULT_UPGRADER_PROGRAM, GopsExecutor};
 use wist_gwlinkd::identity;
 use wist_gwlinkd::selfreport::SelfReportClient;
 use wist_gwlinkd::state::{self, CredentialStatus, UpgradeCursor};
-use wist_gwlinkd::upgrade::{
-    DEFAULT_ON_FAILURE, DEFAULT_UPGRADER_PROGRAM, UpgradeDriver, UpgradeReporter,
-};
+use wist_gwlinkd::upgrade::{RECOVERY_VERIFY_TIMEOUT, UpgradeDriver, UpgradeReporter};
 
 /// 运行期状态上报周期（秒）。
 const STATUS_INTERVAL_SECS: u64 = 30;
@@ -112,22 +111,33 @@ async fn run(config: &Config) -> Result<(), String> {
         .map(SelfReportClient::new);
     let renew_lead = config.renew_lead_seconds.unwrap_or(3600);
     let driver = UpgradeDriver::new(
-        config
-            .upgrader_program
-            .clone()
-            .unwrap_or_else(|| DEFAULT_UPGRADER_PROGRAM.to_string()),
+        GopsExecutor::new(
+            config
+                .upgrader_program
+                .clone()
+                .unwrap_or_else(|| DEFAULT_UPGRADER_PROGRAM.to_string()),
+        )
+        .with_on_failure(
+            config
+                .upgrade_on_failure
+                .clone()
+                .unwrap_or_else(|| DEFAULT_ON_FAILURE.to_string()),
+        )
+        .with_project(
+            config.upgrade_project_dir.clone(),
+            config.upgrade_project_name.clone(),
+        )
+        .with_health_check(
+            config.upgrade_health_cmd.clone(),
+            config.upgrade_health_timeout_seconds,
+        ),
         config.state_dir.clone(),
     )
-    .with_on_failure(
+    .with_verify_timeout(Duration::from_secs(
         config
-            .upgrade_on_failure
-            .clone()
-            .unwrap_or_else(|| DEFAULT_ON_FAILURE.to_string()),
-    )
-    .with_project(
-        config.upgrade_project_dir.clone(),
-        config.upgrade_project_name.clone(),
-    );
+            .upgrade_verify_timeout_seconds
+            .unwrap_or(RECOVERY_VERIFY_TIMEOUT.as_secs()),
+    ));
 
     let mut ticker = tokio::time::interval(Duration::from_secs(STATUS_INTERVAL_SECS));
     // 一轮里有多次（30s 超时）的网络调用；慢轮后别突发补 tick。
@@ -258,6 +268,7 @@ async fn run(config: &Config) -> Result<(), String> {
                         let reporter = UpgradeReporter {
                             client: client.clone(),
                             state_dir: config.state_dir.clone(),
+                            self_client: self_client.clone(),
                         };
                         // **不**用 `?`：驱动失败（执行器缺失/架构不符…）绝不能把链路常驻整个拖死。
                         match driver
