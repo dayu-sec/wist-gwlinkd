@@ -16,6 +16,10 @@ pub struct Config {
     /// 本机网关容器**自述面** endpoint（如 `https://127.0.0.1:3000`；缺省则不消费自述面）。
     #[serde(default)]
     pub gateway_self_endpoint: Option<String>,
+    /// 网关容器 loopback 面（self-state / link-request）的**信任锚**（PEM 路径）。
+    /// 网关以自签证书提供 HTTPS 时需要；缺省 = 用系统根。
+    #[serde(default)]
+    pub gateway_self_ca: Option<PathBuf>,
     /// 客户端证书轮换提前量（秒，缺省 3600）。
     #[serde(default)]
     pub renew_lead_seconds: Option<i64>,
@@ -81,12 +85,34 @@ mod tests {
         assert_eq!(config.control_center_endpoint, "https://c");
         assert_eq!(config.gateway_id, "gw-1");
         assert!(config.gateway_self_endpoint.is_none());
+        assert!(config.gateway_self_ca.is_none());
         assert!(config.renew_lead_seconds.is_none());
         assert!(config.upgrader_program.is_none());
         assert!(config.upgrade_on_failure.is_none());
         assert!(config.upgrade_project_dir.is_none());
         assert!(config.upgrade_project_name.is_none());
         assert!(config.upgrade_retry_on_dead.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gateway_self_ca_parses_when_present() {
+        let dir = temp_dir("self-ca");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\ngateway_self_endpoint = \"https://127.0.0.1:3000\"\ngateway_self_ca = \"/self-ca.pem\"\n",
+        )
+        .expect("write");
+        let config = Config::load(&path).expect("load");
+        assert_eq!(
+            config.gateway_self_endpoint.as_deref(),
+            Some("https://127.0.0.1:3000")
+        );
+        assert_eq!(
+            config.gateway_self_ca.as_deref(),
+            Some(std::path::Path::new("/self-ca.pem"))
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -9,6 +9,9 @@
 - **页面发起接入**：新增环回 `link_request` 客户端，首跑优先拉取网关侧接入请求
   （中心地址 / 接入券 / CA），CA 落盘到 `<state_dir>/control-center.pem`；无待办且无 env 券时
   等待页面提交；接入成功/失败回报网关（`Connected` / `Failed`）。
+- **环回信任锚 `gateway_self_ca`**：网关 loopback 面（self-state / link-request）以**自签证书**
+  提供 HTTPS 时，用它作信任根（PEM）；缺省 = 系统根。没有它，真部署的 gwlinkd 够不到网关环回面
+  （纯 HTTP 桩会把这个缺口掩盖掉）。`diagnose` 同源新增 `self.ca` 检查：未配=OK，配了但缺失/非法=FAIL。
 
 ### Changed（不兼容）
 - **接入券环境变量改名**：`WIST_GWLINKD_BOOTSTRAP_TOKEN` → `WIST_GWLINKD_LINK_TOKEN`

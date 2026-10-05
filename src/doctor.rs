@@ -104,6 +104,7 @@ pub fn diagnose(config: &Config) -> Report {
         credential_check(config),
         regist_token_check(config),
         self_endpoint_check(config),
+        self_ca_check(config),
         upgrader_check(config),
         upgrade_check(config),
         reachability_check(config),
@@ -163,33 +164,31 @@ fn trust_check(config: &Config) -> Check {
         )
         .with_hint("自签中心必须提供 trust_bundle（PEM）");
     }
-    match std::fs::read_to_string(path) {
-        Ok(pem) if !pem.contains("-----BEGIN CERTIFICATE-----") => Check::fail(
+    match validate_pem_certificate(path) {
+        Ok(_) => Check::ok(
             "config.trust_bundle",
-            "信任锚不是 PEM 证书",
-            format!("{}: 不含 CERTIFICATE 块", path.display()),
+            "信任锚可解析",
+            path.display().to_string(),
+        ),
+        Err(detail) => Check::fail(
+            "config.trust_bundle",
+            "信任锚无效",
+            detail,
             "换成合法的 PEM 证书文件",
         ),
-        Ok(pem) => match reqwest::Certificate::from_pem(pem.as_bytes()) {
-            Ok(_) => Check::ok(
-                "config.trust_bundle",
-                "信任锚可解析",
-                path.display().to_string(),
-            ),
-            Err(err) => Check::fail(
-                "config.trust_bundle",
-                "信任锚无法解析",
-                format!("{}: {err}", path.display()),
-                "换成合法的 PEM 证书文件",
-            ),
-        },
-        Err(err) => Check::fail(
-            "config.trust_bundle",
-            "信任锚不可读",
-            format!("{}: {err}", path.display()),
-            "检查文件权限",
-        ),
     }
+}
+
+/// 读并校验一个 PEM 证书文件（存在为前提）：含 CERTIFICATE 块 + reqwest 可解析。
+/// 错误串带上路径，便于诊断直接展示。
+fn validate_pem_certificate(path: &Path) -> Result<(), String> {
+    let pem = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    if !pem.contains("-----BEGIN CERTIFICATE-----") {
+        return Err(format!("{}: 不含 CERTIFICATE 块", path.display()));
+    }
+    reqwest::Certificate::from_pem(pem.as_bytes())
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    Ok(())
 }
 
 /// 运行期凭据：损坏→FAIL，缺失→WARN（首跑），就位→看有效期。
@@ -249,6 +248,35 @@ fn self_endpoint_check(config: &Config) -> Check {
             "gateway_self_endpoint 为空：上报的健康度恒为 unknown",
         )
         .with_hint("在 gwlinkd.toml 配 gateway_self_endpoint（如 https://127.0.0.1:3000）"),
+    }
+}
+
+/// 环回面（self-state / link-request）信任锚：未配→用系统根（OK）；配了→**必须可解析**，
+/// 否则真部署会够不到网关（与 `run` 启动即报错同源）。
+fn self_ca_check(config: &Config) -> Check {
+    let Some(path) = config.gateway_self_ca.as_deref() else {
+        return Check::ok(
+            "self.ca",
+            "环回信任锚未配置（用系统根）",
+            "gateway_self_ca 为空：网关非自签时适用",
+        );
+    };
+    if !path.exists() {
+        return Check::fail(
+            "self.ca",
+            "环回信任锚文件缺失",
+            path.display().to_string(),
+            "自签网关必须提供 gateway_self_ca（PEM）；或删除该项改用系统根",
+        );
+    }
+    match validate_pem_certificate(path) {
+        Ok(()) => Check::ok("self.ca", "环回信任锚可解析", path.display().to_string()),
+        Err(detail) => Check::fail(
+            "self.ca",
+            "环回信任锚无效",
+            detail,
+            "换成合法的 PEM 证书文件",
+        ),
     }
 }
 
@@ -411,6 +439,7 @@ mod tests {
             state_dir: dir.to_path_buf(),
             gateway_id: "gw-1".into(),
             gateway_self_endpoint: None,
+            gateway_self_ca: None,
             renew_lead_seconds: None,
             upgrader_program: Some("/bin/sh".into()),
             upgrade_on_failure: None,
@@ -485,6 +514,21 @@ mod tests {
             status_of(&diagnose(&config(&dir)), "self.endpoint"),
             Status::Warn
         );
+    }
+
+    #[test]
+    fn an_unconfigured_self_ca_is_ok_and_a_missing_one_fails() {
+        let dir = temp_dir("self-ca");
+        let mut cfg = config(&dir);
+        // 未配 → 用系统根，OK。
+        assert_eq!(status_of(&diagnose(&cfg), "self.ca"), Status::Ok);
+        // 配了但文件不在 → FAIL（真部署会够不到网关）。
+        cfg.gateway_self_ca = Some(dir.join("self-ca.pem"));
+        assert_eq!(status_of(&diagnose(&cfg), "self.ca"), Status::Fail);
+        // 配了但不是合法 PEM → FAIL。
+        std::fs::write(dir.join("self-ca.pem"), b"not a pem").expect("write");
+        assert_eq!(status_of(&diagnose(&cfg), "self.ca"), Status::Fail);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -49,6 +49,18 @@ impl SelfReportClient {
         }
     }
 
+    /// 同 [`Self::new`]，但额外挂**信任锚**（PEM）：网关以**自签证书**提供环回 HTTPS 时必需。
+    /// 缺省（`None`）= 系统根。读/解析失败即报错，**不静默回落**（否则真部署会够不到自述面）。
+    pub fn with_trust(
+        endpoint: impl Into<String>,
+        trust: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            endpoint: endpoint.into().trim_end_matches('/').to_string(),
+            http: crate::center::build_http_client(trust)?,
+        })
+    }
+
     /// 拉取准确自述状态：`GET /api/v1/gateway/self-state?gateway_id=`。
     pub async fn fetch(&self, gateway_id: &str) -> Result<GatewaySelfState, String> {
         let url = format!("{}/api/v1/gateway/self-state", self.endpoint);
@@ -111,5 +123,16 @@ mod tests {
             ..off
         };
         assert_eq!(errored.health(), "degraded");
+    }
+
+    #[test]
+    fn with_trust_accepts_no_ca_and_rejects_a_missing_one() {
+        assert!(SelfReportClient::with_trust("https://127.0.0.1:3000", None).is_ok());
+        let err = SelfReportClient::with_trust(
+            "https://127.0.0.1:3000",
+            Some(std::path::Path::new("/definitely/not/here.pem")),
+        )
+        .expect_err("missing CA must error（不静默回落）");
+        assert!(err.contains("读取信任锚失败"), "{err}");
     }
 }

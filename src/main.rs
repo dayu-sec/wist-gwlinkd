@@ -103,10 +103,13 @@ async fn run(config: &Config) -> Result<(), String> {
     let mut client = mtls_client(config, trust, &credential)?;
     let instance_id = state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)?;
 
-    let self_client = config
-        .gateway_self_endpoint
-        .as_deref()
-        .map(SelfReportClient::new);
+    let self_client = match config.gateway_self_endpoint.as_deref() {
+        Some(base) => Some(SelfReportClient::with_trust(
+            base,
+            config.gateway_self_ca.as_deref(),
+        )?),
+        None => None,
+    };
     let renew_lead = config.renew_lead_seconds.unwrap_or(3600);
     let driver = UpgradeDriver::new(
         GopsExecutor::new(
@@ -375,7 +378,7 @@ fn link_token_from_env() -> Option<String> {
 async fn first_run(config: &Config, trust: Option<&Path>, identity: &str) -> Result<(), String> {
     // 页面发起（环回接入请求）优先。
     if let Some(base) = config.gateway_self_endpoint.as_deref() {
-        let client = LinkRequestClient::new(base);
+        let client = LinkRequestClient::with_trust(base, config.gateway_self_ca.as_deref())?;
         if link_token_from_env().is_none() {
             // 没有 env 券 → 页面发起路径：等到页面上提交了再接入，失败则继续等下一次。
             return wait_for_gateway_request(config, trust, identity, &client).await;
@@ -663,6 +666,7 @@ mod tests {
             state_dir: dir.to_path_buf(),
             gateway_id: "gw-1".into(),
             gateway_self_endpoint: None,
+            gateway_self_ca: None,
             renew_lead_seconds: None,
             upgrader_program: None,
             upgrade_on_failure: None,
