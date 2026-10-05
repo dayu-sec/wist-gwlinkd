@@ -3,6 +3,17 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Added
+- **OS 服务托管（长期后台运行）**：新增 `service` 子命令（`print` / `install` / `uninstall` / `status`）——
+  渲染并安装 **systemd unit**（Linux，`Restart=always`，日志进 journald）或 **launchd plist**
+  （macOS，`KeepAlive`，日志进 `/var/log/wist-gwlinkd`），开机自启 + 崩溃拉起 + 退出重启。
+  配置走**绝对路径**（`--config` → `WIST_GWLINKD_CONFIG`）；`--system`（默认）/ `--user` 两作用域。
+  与 `wist-agentd service` 同形，供栈的安装/升级阶段调用
+  （`wist-gwlinkd service install --system --bin <抽出件> --config <配置>`）。
+- `state::is_running`（`flock` 探活）供 `service status` 判「在跑否」。
+
 ## [0.4.0-alpha] - 2026-10-05
 
 ### Added

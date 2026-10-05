@@ -1,4 +1,4 @@
-//! `wist-gwlinkd` CLI：`run`（常驻，默认）/ `diagnose` / `version`。
+//! `wist-gwlinkd` CLI：`run`（常驻，默认）/ `diagnose` / `service` / `version`。
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -12,6 +12,7 @@ use wist_gwlinkd::executor::{DEFAULT_ON_FAILURE, DEFAULT_UPGRADER_PROGRAM, GopsE
 use wist_gwlinkd::identity;
 use wist_gwlinkd::link_request::LinkRequestClient;
 use wist_gwlinkd::selfreport::SelfReportClient;
+use wist_gwlinkd::service;
 use wist_gwlinkd::state::{self, CredentialStatus, UpgradeCursor};
 use wist_gwlinkd::upgrade::{RECOVERY_VERIFY_TIMEOUT, UpgradeDriver, UpgradeReporter};
 
@@ -43,6 +44,7 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        "service" => run_service(&std::env::args().skip(2).collect::<Vec<_>>()),
         "run" => match Config::load(&config_path()) {
             Ok(config) => match run(&config).await {
                 Ok(()) => ExitCode::SUCCESS,
@@ -57,7 +59,7 @@ async fn main() -> ExitCode {
             }
         },
         other => {
-            eprintln!("unknown command: {other}（可用：run | diagnose | version）");
+            eprintln!("unknown command: {other}（可用：run | diagnose | service | version）");
             ExitCode::from(2)
         }
     }
@@ -617,6 +619,174 @@ fn run_diagnose(config: &Config) -> ExitCode {
     match report.worst() {
         Status::Fail => ExitCode::FAILURE,
         _ => ExitCode::SUCCESS,
+    }
+}
+
+// ─────────────────────────── service（OS 服务管理器托管） ───────────────────────
+
+fn run_service(args: &[String]) -> ExitCode {
+    let Some(action) = args.first().map(String::as_str) else {
+        eprintln!(
+            "用法：wist-gwlinkd service <print|install|uninstall|status> [--system|--user] [--bin PATH] [--config PATH] [--force] [--no-activate]"
+        );
+        return ExitCode::from(2);
+    };
+    match service_command(action, &args[1..]) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("[FAIL] {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn service_command(action: &str, rest: &[String]) -> Result<(), String> {
+    let platform = service::ServicePlatform::current()
+        .ok_or_else(|| "当前平台非 Linux/macOS，不支持 service 托管".to_string())?;
+
+    let mut scope: Option<service::ServiceScope> = None;
+    let mut bin: Option<PathBuf> = None;
+    let mut config: Option<PathBuf> = None;
+    let mut force = false;
+    let mut activate = true;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--system" => {
+                scope = Some(service::ServiceScope::System);
+                i += 1;
+            }
+            "--user" => {
+                scope = Some(service::ServiceScope::User);
+                i += 1;
+            }
+            "--force" => {
+                force = true;
+                i += 1;
+            }
+            "--no-activate" => {
+                activate = false;
+                i += 1;
+            }
+            "--bin" => {
+                bin = Some(PathBuf::from(need_arg(rest, i + 1, "--bin")?));
+                i += 2;
+            }
+            "--config" => {
+                config = Some(PathBuf::from(need_arg(rest, i + 1, "--config")?));
+                i += 2;
+            }
+            other => return Err(format!("未知参数：{other}")),
+        }
+    }
+
+    // 默认 system（正式运行即系统级常驻）；要用户级就显式 --user。
+    let scope = scope.unwrap_or(service::ServiceScope::System);
+    let bin = match bin {
+        Some(bin) => bin,
+        None => service::default_bin()?,
+    };
+    let config = match config {
+        Some(config) => config,
+        None => service::default_config_path(scope)?,
+    };
+    let layout = service::ServiceLayout::resolve(platform, scope)?;
+    let spec = service::ServiceSpec::new(scope, bin, config);
+
+    match action {
+        "print" => {
+            print!("{}", service::render(&layout, &spec));
+            Ok(())
+        }
+        "install" => {
+            let report = service::install(&layout, &spec, force)?;
+            println!(
+                "service 定义已写：{}（{}{}）",
+                report.definition_path.display(),
+                report.platform.as_str(),
+                if report.overwritten { "，覆盖" } else { "" }
+            );
+            println!("bin={}", service::path_state(&spec.bin));
+            if activate {
+                run_service_commands(service::activate_commands(&layout, &spec))?;
+                println!("已启用并启动。");
+            } else {
+                println!("（--no-activate：只写定义，未启用）");
+            }
+            println!("logs: {}", service::log_hint(&layout)?);
+            for command in service::inspect_commands(platform, &spec) {
+                println!("check: {}", command.display_line());
+            }
+            Ok(())
+        }
+        "uninstall" => {
+            run_service_commands(service::deactivate_commands(platform, &spec))?;
+            let removed = service::remove(&layout)?;
+            println!(
+                "service 定义 {}：{}",
+                layout.definition_path.display(),
+                if removed { "已删除" } else { "本就不存在" }
+            );
+            Ok(())
+        }
+        "status" => {
+            let status = service::status(&layout, &spec)?;
+            println!("platform={}", status.platform.as_str());
+            println!("scope={}", status.scope.as_str());
+            println!("definition={}", service::path_state(&status.definition_path));
+            println!("bin={}", service::path_state(&status.bin));
+            println!("config={}", service::path_state(&status.config_path));
+            if let Some(err) = &status.config_error {
+                println!("config_error={err}");
+            }
+            if let Some(dir) = &status.state_dir {
+                println!("state_dir={}", dir.display());
+            }
+            println!(
+                "running={}",
+                match status.running {
+                    Some(true) => "yes",
+                    Some(false) => "no",
+                    None => "unknown",
+                }
+            );
+            println!("logs={}", status.log_hint);
+            for command in service::inspect_commands(platform, &spec) {
+                println!("check={}", command.display_line());
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "未知 service 动作：{other}（可用：print | install | uninstall | status）"
+        )),
+    }
+}
+
+fn need_arg(args: &[String], index: usize, flag: &str) -> Result<String, String> {
+    args.get(index)
+        .cloned()
+        .ok_or_else(|| format!("{flag} 需要一个值"))
+}
+
+fn run_service_commands(commands: Vec<service::ServiceCommand>) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for command in commands {
+        // 服务管理器拆除是异步的（尤其 launchd），瞬时失败靠有界重试吃掉。
+        let outcome = service::run_with_retries(&command)?;
+        if outcome.success || command.ignore_failure {
+            continue;
+        }
+        let detail = if outcome.stderr.is_empty() {
+            outcome.stdout.clone()
+        } else {
+            outcome.stderr.clone()
+        };
+        failures.push(format!("`{}` 失败: {detail}", command.display_line()));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n"))
     }
 }
 

@@ -137,6 +137,34 @@ pub fn acquire_single_instance_lock(state_dir: &Path) -> Result<LockGuard, Strin
     Ok(LockGuard { _file: file })
 }
 
+/// 单实例锁是否**已被持有**（= 已有 gwlinkd 在跑）。只读探测：拿得到锁就立刻释放并返回 `false`。
+/// 锁文件不存在 → `false`（没在跑）。供 `service status` 判活。
+pub fn is_running(state_dir: &Path) -> Result<bool, String> {
+    let path = path_in(state_dir, LOCK_FILE);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .map_err(|err| format!("打开锁文件失败 {}: {err}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: 同 acquire_single_instance_lock；只探测，拿到随即解锁。
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            return Ok(false);
+        }
+        Ok(true)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(false)
+    }
+}
+
 // ───────────────────────── 身份 / 实例 / 凭据 / 链接配置 ─────────────────────────
 
 /// 读或生成网关身份 `ident_`（首跑自生成，落盘 `0600`；中心不存）。

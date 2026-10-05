@@ -21,8 +21,38 @@
 ```bash
 wist-gwlinkd run              # 常驻（默认子命令）
 wist-gwlinkd diagnose         # 本地诊断；有 FAIL 则退出码非 0
+wist-gwlinkd service install --system   # 装成 OS 服务长期托管（开机自启/崩溃拉起）
+wist-gwlinkd service status  --system   # 看服务定义/二进制/配置/落点/在跑否
+wist-gwlinkd service print   --system   # 只渲染服务定义（systemd unit / launchd plist），不落盘
+wist-gwlinkd service uninstall --system # 停用并删定义
 wist-gwlinkd version
 ```
+
+### 长期后台运行（正式运行必装）
+
+`nohup &` 不是部署方式 —— 正式运行交给 OS 服务管理器，**开机自启 + 崩溃拉起 + 退出重启**：
+
+```bash
+# Linux（systemd unit: /etc/systemd/system/wist-gwlinkd.service，Restart=always）
+sudo install -m 0755 wist-gwlinkd /usr/local/bin/
+sudo wist-gwlinkd service install --system --bin /usr/local/bin/wist-gwlinkd \
+     --config /etc/wist-gwlinkd/gwlinkd.toml
+
+# macOS（LaunchDaemon: /Library/LaunchDaemons/com.dayu-sec.wist-gwlinkd.plist，KeepAlive）
+sudo wist-gwlinkd service install --system ...
+```
+
+- `--system`（默认）= 系统级（开机即起；Linux `multi-user.target` / macOS `LaunchDaemons`）；
+  `--user` = 登录后起（`~/.config/systemd/user` / `~/Library/LaunchAgents`）。
+- 配置走 **绝对路径**（`--config`，落进 `WIST_GWLINKD_CONFIG`；默认 system `/etc/wist-gwlinkd/gwlinkd.toml`、
+  user `~/.wist-gwlinkd/gwlinkd.toml`）—— 服务启动时工作目录不确定，不能用相对的 `gwlinkd.toml`。
+- 日志：Linux → journald（`journalctl -u wist-gwlinkd -f`）；macOS → `/var/log/wist-gwlinkd/gwlinkd.err`
+  （user：`~/Library/Logs/wist-gwlinkd/`）。
+- 重复实例由 state 目录 `flock` 兜底（前任未退出时新实例快速失败，再由 `Restart`/`KeepAlive` 重试）。
+- `service install` 会写定义 + `enable` + `restart`；只写定义不启用加 `--no-activate`；覆盖已有定义加 `--force`。
+
+> 栈的**安装 / 升级阶段**（网关镜像里带着 gwlinkd 制品）就调这条命令把宿主侧常驻装成 systemd 服务 ——
+> 与本文件「交付与升级」一节同一口径。
 
 配置（`WIST_GWLINKD_CONFIG` 指定路径，缺省 `gwlinkd.toml`）：
 
@@ -61,7 +91,8 @@ gops 调用契约（2.2.x）：`gops prj upgrade --to <版本|URL|路径> --on-f
 
 不单独发版通道：多平台**静态**制品（`{x86_64,aarch64}-unknown-linux-musl` +
 `{x86_64,aarch64}-apple-darwin`）**打包进网关镜像**当载体，栈的安装 / 升级阶段按宿主
-`uname -s`/`uname -m` 抽出对应件、装 systemd。**版本随栈**。
+`uname -s`/`uname -m` 抽出对应件、用 `wist-gwlinkd service install --system --bin <抽出件> --config <配置>`
+装成 **systemd / launchd** 服务长期托管。**版本随栈**。
 
 ## License
 

@@ -17,6 +17,7 @@ pub mod executor;
 pub mod identity;
 pub mod link_request;
 pub mod selfreport;
+pub mod service;
 pub mod state;
 pub mod upgrade;
 
