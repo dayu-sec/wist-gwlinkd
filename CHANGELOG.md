@@ -5,6 +5,11 @@
 
 ## [Unreleased]
 
+### Added
+- **页面发起接入**：新增环回 `link_request` 客户端，首跑优先拉取网关侧接入请求
+  （中心地址 / 接入券 / CA），CA 落盘到 `<state_dir>/control-center.pem`；无待办且无 env 券时
+  等待页面提交；接入成功/失败回报网关（`Connected` / `Failed`）。
+
 ### Changed（不兼容）
 - **接入券环境变量改名**：`WIST_GWLINKD_BOOTSTRAP_TOKEN` → `WIST_GWLINKD_LINK_TOKEN`
   （旧名仍可读，会打印弃用告警；下一版移除）。名字改准 —— 它只在**首跑接入**（`link-upstream`）
