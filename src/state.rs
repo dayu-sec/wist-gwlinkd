@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use ring::rand::{SecureRandom, SystemRandom};
-use wist_contracts::gateway_control::GatewayCredentialBundle;
+use wist_control::GatewayCredentialBundle;
 
 /// 心跳超过该时长即判死（与 `wist-agentd` 同量级）。
 pub const UPGRADER_DEAD_AFTER: Duration = Duration::from_secs(60);
@@ -211,7 +211,7 @@ pub fn load_or_create_instance_id(state_dir: &Path, gateway_id: &str) -> Result<
 /// 本机持有的网关长期身份：中心签发的**客户端证书** + 本机私钥（私钥永不出本机）。
 ///
 /// 取代旧的运行期 bearer `rt_`：mTLS 是网关↔中心的唯一凭据路径。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredCredential {
     /// 中心回执的凭据包（含客户端证书 PEM；`ca_bundle` / `not_after` 供排障）。
     pub bundle: GatewayCredentialBundle,
@@ -243,9 +243,8 @@ impl StoredCredential {
     pub fn seconds_remaining(&self) -> i64 {
         self.bundle
             .not_after
-            .as_deref()
-            .and_then(wist_control::types::DateTime::from_rfc3339)
-            .map(|expires| wist_control::DateTime::now().seconds_until(&expires))
+            .as_ref()
+            .map(|expires| wist_control::DateTime::now().seconds_until(expires))
             .unwrap_or(i64::MAX)
     }
 }
@@ -495,6 +494,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// RFC3339 字面量 → 模型 `DateTime`（测试夹具用）。
+    fn ts(value: &str) -> wist_control::DateTime {
+        wist_control::DateTime::from_rfc3339(value).expect("rfc3339")
+    }
+
     fn stored_credential() -> StoredCredential {
         StoredCredential {
             bundle: GatewayCredentialBundle {
@@ -503,9 +507,9 @@ mod tests {
                 instance_id: Some("gw-1/boot-1".into()),
                 certificate: "-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----\n".into(),
                 ca_bundle: None,
-                issued_at: "2026-10-04T00:00:00Z".into(),
-                not_before: Some("2026-10-04T00:00:00Z".into()),
-                not_after: Some("2026-11-04T00:00:00Z".into()),
+                issued_at: ts("2026-10-04T00:00:00Z"),
+                not_before: Some(ts("2026-10-04T00:00:00Z")),
+                not_after: Some(ts("2026-11-04T00:00:00Z")),
             },
             private_key_pem: "-----BEGIN PRIVATE KEY-----\nA\n-----END PRIVATE KEY-----\n".into(),
         }
@@ -566,10 +570,10 @@ mod tests {
         credential.bundle.not_after = None;
         assert_eq!(credential.seconds_remaining(), i64::MAX);
 
-        credential.bundle.not_after = Some("2000-01-01T00:00:00+00:00".into());
+        credential.bundle.not_after = Some(ts("2000-01-01T00:00:00+00:00"));
         assert_eq!(credential.seconds_remaining(), 0, "已过期应夹到 0");
 
-        credential.bundle.not_after = Some("2999-01-01T00:00:00+00:00".into());
+        credential.bundle.not_after = Some(ts("2999-01-01T00:00:00+00:00"));
         assert!(credential.seconds_remaining() > 0);
     }
 

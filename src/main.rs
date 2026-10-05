@@ -432,7 +432,11 @@ async fn run(config: &Config) -> Result<(), String> {
                 version: wist_gwlinkd::VERSION.to_string(),
                 center_endpoint: config.control_center_endpoint.clone(),
                 state: linkd_state.clone(),
-                credential_expires_at: credential.bundle.not_after.clone(),
+                credential_expires_at: credential
+                    .bundle
+                    .not_after
+                    .as_ref()
+                    .map(|expires| expires.to_chrono().to_rfc3339()),
                 last_center_report_at: linkd_last_report_at.clone(),
                 last_error: linkd_last_error.clone(),
                 reported_at: DateTime::now(),

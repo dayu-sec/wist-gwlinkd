@@ -615,14 +615,15 @@ mod tests {
     /// 佐证分支要 `gateway_id`（从长期身份读）——所以得先存在一份凭据。
     fn write_credential(dir: &Path, gateway_id: &str) {
         let credential = state::StoredCredential {
-            bundle: wist_contracts::gateway_control::GatewayCredentialBundle {
+            bundle: wist_control::GatewayCredentialBundle {
                 credential_id: "cred-test".into(),
                 gateway_id: gateway_id.into(),
                 instance_id: None,
                 certificate: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
                     .into(),
                 ca_bundle: None,
-                issued_at: "2026-10-04T00:00:00Z".into(),
+                issued_at: wist_control::DateTime::from_rfc3339("2026-10-04T00:00:00Z")
+                    .expect("rfc3339"),
                 not_before: None,
                 not_after: None,
             },

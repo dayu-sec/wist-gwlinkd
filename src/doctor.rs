@@ -200,7 +200,8 @@ fn credential_check(config: &Config) -> Check {
             let not_after = credential
                 .bundle
                 .not_after
-                .clone()
+                .as_ref()
+                .map(|expires| expires.to_chrono().to_rfc3339())
                 .unwrap_or_else(|| "unknown".to_string());
             if remaining <= 0 {
                 Check::warn(

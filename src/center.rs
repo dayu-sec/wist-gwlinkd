@@ -1,26 +1,19 @@
 //! 连 `WistCenter` 的客户端：link-upstream / register / status / credentials:renew / upgrade-plan / upgrade-result。
 //!
 //! 本进程是**网关客户端证书/私钥的唯一持有者** —— 全边缘只此一处与中心对话。长期身份走 **mTLS**
-//! （客户端证书），取代旧的对称 bearer `rt_`；wire 类型来自 `wist-contracts`（手工维护的
-//! `gateway_control`）与 `wist-control`（模型生成）。
+//! （客户端证书），取代旧的对称 bearer `rt_`；wire 类型全部来自 `wist-control`（模型生成）。
 
 use std::path::Path;
 use std::time::Duration;
 
-use wist_contracts::gateway_control::{
-    GatewayCredentialBundle, GatewayEnrollmentResult, RegisterGateway, RenewGatewayCredential,
-};
 use wist_control::{
-    GatewayInitialConfig, GatewayUpgradePlan, ReportGatewayStatus, ReportGatewayUpgradeResult,
+    DateTime, GatewayCredentialBundle, GatewayEnrollmentResult, GatewayInitialConfig,
+    GatewayUpgradePlan, RegisterGateway, RenewGatewayCredential, ReportGatewayStatus,
+    ReportGatewayUpgradeResult,
 };
 
 /// 单次请求超时（避免中心/网关半死把常驻循环卡住）。
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// 当前时刻的 RFC3339（契约时间戳为 `String`）。
-fn now_rfc3339() -> String {
-    wist_control::DateTime::now().to_chrono().to_rfc3339()
-}
 
 /// 中心调用的错误：**区分「凭据被拒（401/403）」与其它** —— 前者要退避 + 提示重置备，
 /// 不能靠匹配错误串子串（响应体里也可能出现 "401"）。
@@ -168,7 +161,7 @@ impl CenterClient {
             enrollment_token: enrollment_token.to_string(),
             instance_id: instance_id.to_string(),
             certificate_signing_request: certificate_signing_request.to_string(),
-            requested_at: now_rfc3339(),
+            requested_at: DateTime::now(),
         };
         let response = self
             .http
@@ -206,7 +199,7 @@ impl CenterClient {
             gateway_id: gateway_id.to_string(),
             current_certificate_serial: current_certificate_serial.to_string(),
             certificate_signing_request: certificate_signing_request.to_string(),
-            requested_at: now_rfc3339(),
+            requested_at: DateTime::now(),
         };
         let response = self
             .http

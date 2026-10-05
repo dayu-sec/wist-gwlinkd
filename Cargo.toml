@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-gwlinkd"
-version = "0.5.0" #@gxl:set(version)
+version = "0.5.1" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 description = "Host-side resident keeping a wist gateway stack linked to WistCenter (register / heartbeat / upgrade)"
@@ -18,9 +18,9 @@ ring = "0.17"
 tokio = { version = "1.48", features = ["full"] }
 libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls", "webpki-roots"] }
-wist-control = { version = "0.6" }
+wist-control = { version = "0.8" }
 # gateway↔center 注册/凭据契约（客户端证书 mTLS）。
-wist-contracts = "0.2"
+
 # 客户端密钥对 + CSR（私钥永不出本机）；x509-parser 读自家证书序列号（轮换时提交）。
 rcgen = { version = "0.13", features = ["x509-parser"] }
 x509-parser = "0.16"

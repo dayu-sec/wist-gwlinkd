@@ -3,6 +3,14 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.5.1-alpha] - 2026-10-06
+
+### Changed
+- **网关面 wire 类型统一到 `wist-control`**：link-upstream / register / status / credentials:renew /
+  upgrade-plan / upgrade-result 全部用模型生成类型（原 `wist-contracts::gateway_control` 手写副本已删）。
+  **线上 JSON 不变**；`requested_at` / `issued_at` / `not_before` / `not_after` 改为 `wist_control::DateTime`。
+- **依赖**：`wist-control` `0.6` → `0.8`；**移除 `wist-contracts` 依赖**。
+
 ## [0.5.0-alpha] - 2026-10-05
 
 ### Added
