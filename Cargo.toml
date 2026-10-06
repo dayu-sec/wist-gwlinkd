@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-gwlinkd"
-version = "0.5.1" #@gxl:set(version)
+version = "0.5.2" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 description = "Host-side resident keeping a wist gateway stack linked to WistCenter (register / heartbeat / upgrade)"
@@ -17,8 +17,11 @@ toml = "1.1"
 ring = "0.17"
 tokio = { version = "1.48", features = ["full"] }
 libc = "0.2"
-reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls", "webpki-roots"] }
-wist-control = { version = "0.8" }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
+# 注：不写 `webpki-roots` —— 0.13 里 TLS 根由 `rustls`（系统根）决定，它只是可选依赖的隐式 feature
+# （reqwest 源码不引用），0.13.5 已去掉；留着会把本仓钉死在 0.13.1。
+wist-control = { version = "0.9" }
+#wist-control = { version = "0.9", path = "../wist-control" }
 # gateway↔center 注册/凭据契约（客户端证书 mTLS）。
 
 # 客户端密钥对 + CSR（私钥永不出本机）；x509-parser 读自家证书序列号（轮换时提交）。

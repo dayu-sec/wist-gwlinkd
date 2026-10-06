@@ -11,6 +11,9 @@
 pub struct GatewaySelfState {
     pub gateway_id: String,
     pub version: String,
+    // 网关**对外基址**（对外域名）；老版本网关不带这个键 → `default` 兑底（`None`）。
+    #[serde(default)]
+    pub public_base_url: Option<String>,
     pub collected_at: wist_control::DateTime,
     pub store_healthy: bool,
     pub agent_count: i64,
@@ -127,7 +130,7 @@ mod tests {
     /// 网关 `self_state.rs` 输出的**契约 fixture**（snake_case）。
     /// 网关侧有同一份 fixture 的**序列化**测试（`serializes_the_self_state_contract_keys`）——
     /// 两侧同钉一份形状，任一侧改名即在此处爆掉（防三份拷贝漂移）。
-    const GATEWAY_SELF_STATE_JSON: &str = r#"{"gateway_id":"gw-1","version":"0.1.15","collected_at":"2026-10-04T00:00:00Z","store_healthy":true,"agent_count":3,"uplink_enabled":true,"last_error":null,"uptime_seconds":3600,"cpu_percent":1.5,"memory_bytes":104857600,"online_agents":2,"offline_agents":1,"last_seen_lag_seconds":30}"#;
+    const GATEWAY_SELF_STATE_JSON: &str = r#"{"gateway_id":"gw-1","version":"0.1.15","public_base_url":"https://gw.example.com","collected_at":"2026-10-04T00:00:00Z","store_healthy":true,"agent_count":3,"uplink_enabled":true,"last_error":null,"uptime_seconds":3600,"cpu_percent":1.5,"memory_bytes":104857600,"online_agents":2,"offline_agents":1,"last_seen_lag_seconds":30}"#;
 
     #[test]
     fn parses_the_gateway_self_state_contract() {
@@ -135,9 +138,21 @@ mod tests {
             serde_json::from_str(GATEWAY_SELF_STATE_JSON).expect("parse gateway contract");
         assert_eq!(state.gateway_id, "gw-1");
         assert_eq!(state.version, "0.1.15");
+        assert_eq!(
+            state.public_base_url.as_deref(),
+            Some("https://gw.example.com")
+        );
         assert_eq!(state.agent_count, 3);
         assert!(state.store_healthy && state.uplink_enabled);
         assert_eq!(state.health(), "ok");
+    }
+
+    /// 老网关不带 `public_base_url` 键：仍应可解，缺省为 `None`（不是解析失败）。
+    #[test]
+    fn parses_a_legacy_self_state_without_public_base_url() {
+        let legacy = r#"{"gateway_id":"gw-1","version":"0.1.24","collected_at":"2026-10-04T00:00:00Z","store_healthy":true,"agent_count":0,"uplink_enabled":true,"last_error":null}"#;
+        let state: GatewaySelfState = serde_json::from_str(legacy).expect("老自述面应可解");
+        assert_eq!(state.public_base_url, None);
     }
 
     #[test]
@@ -145,6 +160,7 @@ mod tests {
         let off = GatewaySelfState {
             gateway_id: "gw-1".into(),
             version: "0.1.15".into(),
+            public_base_url: None,
             collected_at: wist_control::DateTime::now(),
             store_healthy: true,
             agent_count: 0,

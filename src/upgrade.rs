@@ -78,6 +78,9 @@ impl UpgradeDriver {
     /// （判据在 [`state::upgrader_is_declared_dead`]，但**必须有生产者**，否则长升级会被判假死）。
     ///
     /// `component` 来自升级计划：当执行器未配固定系统名时，作为 gops 的 NAME 传入（只升该系统）。
+    ///
+    /// [`artifact_url`]：中心**派生**的制品下发地址。执行器取件的 `--to` 用它（`gops --to <url>`）；
+    /// 为 `None`（无对应 release）才回落用 [`to_version`]。**台账与回执仍记 `to_version`**（版本）。
     pub async fn start(
         &self,
         work_id: &str,
@@ -85,6 +88,7 @@ impl UpgradeDriver {
         to_version: &str,
         component: Option<&str>,
         reporter: Option<UpgradeReporter>,
+        artifact_url: Option<&str>,
     ) -> Result<(), String> {
         let mut record = UpgradeRecord {
             work_id: work_id.to_string(),
@@ -113,7 +117,8 @@ impl UpgradeDriver {
         };
 
         let invocation = ExecutorInvocation {
-            to_version,
+            // 执行器取件的 `--to`：优先用中心派生的制品地址，否则回落版本/路径。
+            to_version: artifact_url.unwrap_or(to_version),
             component,
         };
         let mut command = self.executor.command(&invocation);
@@ -411,7 +416,7 @@ mod tests {
             &dir,
         );
         driver
-            .start("w-1", "0.1.0", "0.1.16", None, None)
+            .start("w-1", "0.1.0", "0.1.16", None, None, None)
             .await
             .expect("start");
         // 起手即 running + 心跳（判死判据的生产者）。
@@ -434,7 +439,7 @@ mod tests {
             &dir,
         );
         driver
-            .start("w-2", "0.1.0", "0.1.16", None, None)
+            .start("w-2", "0.1.0", "0.1.16", None, None, None)
             .await
             .expect("start");
         assert_eq!(wait_terminal(&dir).await.status, "failed");
@@ -450,7 +455,7 @@ mod tests {
             &dir,
         );
         driver
-            .start("w-3", "0.1.0", "0.1.16", Some("gw-stack"), None)
+            .start("w-3", "0.1.0", "0.1.16", Some("gw-stack"), None, None)
             .await
             .expect("start");
         let _ = wait_terminal(&dir).await;
@@ -460,6 +465,27 @@ mod tests {
         assert!(args.contains("--on-failure halt"), "{args}");
         assert!(args.contains("--json"), "{args}");
         assert!(args.ends_with("gw-stack"), "{args}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn start_prefers_the_derived_artifact_url_over_the_version() {
+        let dir = temp_dir("args-artifact");
+        let driver = UpgradeDriver::new(
+            GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string()),
+            &dir,
+        );
+        let url = "https://center.example/api/v1/releases/artifact/warp-gateway/0.1.27/warp-gateway-0.1.27.tar.gz";
+        driver
+            .start("w-url", "0.1.0", "0.1.27", None, None, Some(url))
+            .await
+            .expect("start");
+        let _ = wait_terminal(&dir).await;
+        let args = std::fs::read_to_string(dir.join("args.txt")).expect("args");
+        assert!(args.contains(&format!("--to {url}")), "{args}");
+        // 台账/回执仍记**版本**（不是 URL）——回执语义要的是版本。
+        let record = state::read_upgrade_record(&dir).expect("record");
+        assert_eq!(record.to_version, "0.1.27");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -475,7 +501,7 @@ mod tests {
             &dir,
         );
         driver
-            .start("w-4", "0.1.0", "0.1.16", None, None)
+            .start("w-4", "0.1.0", "0.1.16", None, None, None)
             .await
             .expect("start");
         let _ = wait_terminal(&dir).await;
@@ -580,7 +606,7 @@ mod tests {
         let dir = temp_dir("custom");
         let driver = UpgradeDriver::new(FixedExecutor, &dir);
         driver
-            .start("w-c", "0.1.0", "0.1.16", None, None)
+            .start("w-c", "0.1.0", "0.1.16", None, None, None)
             .await
             .expect("start");
         let record = wait_terminal(&dir).await;
@@ -598,7 +624,7 @@ mod tests {
             &dir,
         );
         driver
-            .start("w-d", "0.1.0", "0.1.16", None, None)
+            .start("w-d", "0.1.0", "0.1.16", None, None, None)
             .await
             .expect("start");
         let _ = wait_terminal(&dir).await;
@@ -653,7 +679,14 @@ mod tests {
         )
         .with_verify_timeout(Duration::from_secs(5));
         driver
-            .start("w-ok", "0", "1", None, Some(reporter(&dir, Some(endpoint))))
+            .start(
+                "w-ok",
+                "0",
+                "1",
+                None,
+                Some(reporter(&dir, Some(endpoint))),
+                None,
+            )
             .await
             .expect("start");
         let record = wait_terminal(&dir).await;
@@ -679,6 +712,7 @@ mod tests {
                 "1",
                 None,
                 Some(reporter(&dir, Some(endpoint))),
+                None,
             )
             .await
             .expect("start");
@@ -696,7 +730,7 @@ mod tests {
             &dir,
         );
         driver
-            .start("w-none", "0", "1", None, Some(reporter(&dir, None)))
+            .start("w-none", "0", "1", None, Some(reporter(&dir, None)), None)
             .await
             .expect("start");
         let record = wait_terminal(&dir).await;
@@ -727,6 +761,7 @@ mod tests {
                 "1",
                 None,
                 Some(reporter(&dir, Some(endpoint))),
+                None,
             )
             .await
             .expect("start");
@@ -753,6 +788,7 @@ mod tests {
                 "1",
                 None,
                 Some(reporter(&dir, Some(endpoint))),
+                None,
             )
             .await
             .expect("start");
@@ -771,7 +807,9 @@ mod tests {
         // 起不来的执行器也算「终态」——否则台账停在 running 会被判死 / 误诊。
         let dir = temp_dir("spawn-fail");
         let driver = UpgradeDriver::new(GopsExecutor::new("/nonexistent/gops-xyz"), &dir);
-        let err = driver.start("w-s", "0.1.0", "0.1.16", None, None).await;
+        let err = driver
+            .start("w-s", "0.1.0", "0.1.16", None, None, None)
+            .await;
         assert!(err.is_err(), "spawn 失败应返回 Err");
         let record = state::read_upgrade_record(&dir).expect("record");
         assert_eq!(record.status, "failed");
@@ -790,7 +828,7 @@ mod tests {
             &dir,
         );
         driver
-            .start("w-chatty", "0.1.0", "0.1.16", None, None)
+            .start("w-chatty", "0.1.0", "0.1.16", None, None, None)
             .await
             .expect("start");
         // 旧实现会卡在 wait()（子进程阻塞在写）→ 记录一直 running → 这里超时 panic。

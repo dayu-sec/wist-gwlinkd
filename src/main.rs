@@ -300,6 +300,8 @@ async fn run(config: &Config) -> Result<(), String> {
                                 &to_version,
                                 plan.component.as_deref(),
                                 Some(reporter),
+                                // 中心派生的制品地址（执行器取件用它）；无则回落 `to_version`。
+                                plan.artifact_url.as_deref(),
                             )
                             .await
                         {
@@ -348,6 +350,10 @@ async fn run(config: &Config) -> Result<(), String> {
             let payload = ReportGatewayStatus {
                 gateway_id: config.gateway_id.clone(),
                 instance_id: instance_id.clone(),
+                // 网关对外域名（对外基址）：由自述面带来；老网关不吐这个键 → None。
+                public_base_url: self_state
+                    .as_ref()
+                    .and_then(|state| state.public_base_url.clone()),
                 // 报的是**网关（容器）版本**，不是 gwlinkd 自身版本 —— 这条状态描述的是网关。
                 version: gateway_version,
                 // 中心侧约定：`status` 是**在线/离线**（中心按 `== "online"` 计数与展示）。
@@ -632,11 +638,21 @@ async fn onboard(
     link: Option<&str>,
 ) -> Result<(), String> {
     let instance_id = state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)?;
+    // 网关**对外域名**：注册时尽力从自述面取（取不到就 None，不阻断注册）。
+    let public_base_url = fetch_gateway_public_base_url(config).await;
 
     // 复用上次未消费的 RegistToken（link-upstream 已成功、register 未成的遗留）：直接重试注册。
     if let Some(regist_token) = state::load_regist_token(&config.state_dir) {
         println!("event=RegisterRetry gateway_id={}", config.gateway_id);
-        match register_once(client, config, &regist_token, &instance_id).await {
+        match register_once(
+            client,
+            config,
+            &regist_token,
+            &instance_id,
+            public_base_url.as_deref(),
+        )
+        .await
+        {
             Ok(()) => {
                 state::clear_regist_token(&config.state_dir);
                 return Ok(());
@@ -672,11 +688,30 @@ async fn onboard(
     // **先落盘再注册**：接入券已消费，注册失败也要能靠这个 token 重试。
     state::save_regist_token(&config.state_dir, &regist_token)?;
 
-    register_once(client, config, &regist_token, &instance_id)
-        .await
-        .map_err(|err| err.to_string())?;
+    register_once(
+        client,
+        config,
+        &regist_token,
+        &instance_id,
+        public_base_url.as_deref(),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
     state::clear_regist_token(&config.state_dir);
     Ok(())
+}
+
+/// 尽力取网关**对外域名**（自述面 `public_base_url`）：注册时网关可能还没起来 / 未配
+/// `gateway_self_endpoint` —— 取不到就 `None`，不阻断注册（中心容忍缺该字段）；随后的周期
+/// 状态上报会自然补上。
+async fn fetch_gateway_public_base_url(config: &Config) -> Option<String> {
+    let base = config.gateway_self_endpoint.as_deref()?;
+    let client = SelfReportClient::with_trust(base, config.gateway_self_ca.as_deref()).ok()?;
+    client
+        .fetch(&config.gateway_id)
+        .await
+        .ok()
+        .and_then(|state| state.public_base_url)
 }
 
 /// 用 RegistToken 完成一次注册：当场生成密钥对（私钥不上送，只交 CSR）、落长期身份。
@@ -685,12 +720,13 @@ async fn register_once(
     config: &Config,
     regist_token: &str,
     instance_id: &str,
+    public_base_url: Option<&str>,
 ) -> Result<(), CenterError> {
     let keypair =
         identity::generate_client_keypair(&config.gateway_id).map_err(CenterError::Other)?;
     println!("event=Register gateway_id={}", config.gateway_id);
     let result = client
-        .register(regist_token, instance_id, &keypair.csr_pem)
+        .register(regist_token, instance_id, &keypair.csr_pem, public_base_url)
         .await?;
     let credential = state::StoredCredential {
         bundle: result.credential_bundle,

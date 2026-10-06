@@ -150,16 +150,21 @@ impl CenterClient {
     }
 
     /// 注册：`POST /api/v1/gateway/register`（消费 RegistToken；中心用 CA-G 按 CSR 签客户端证书）。
+    ///
+    /// `public_base_url` = 网关**对外域名**（由自述面取，见 [`crate::selfreport`]）；取不到传 `None`
+    /// （首次注册时网关可能还没起来）—— 中心容忍缺该字段。
     pub async fn register(
         &self,
         enrollment_token: &str,
         instance_id: &str,
         certificate_signing_request: &str,
+        public_base_url: Option<&str>,
     ) -> Result<GatewayEnrollmentResult, CenterError> {
         let url = format!("{}/api/v1/gateway/register", self.endpoint);
         let payload = RegisterGateway {
             enrollment_token: enrollment_token.to_string(),
             instance_id: instance_id.to_string(),
+            public_base_url: public_base_url.map(str::to_string),
             certificate_signing_request: certificate_signing_request.to_string(),
             requested_at: DateTime::now(),
         };
@@ -365,6 +370,7 @@ mod tests {
         ReportGatewayStatus {
             gateway_id: "gw-1".into(),
             instance_id: "gw-1/boot-1".into(),
+            public_base_url: Some("https://gw.example.com".into()),
             version: "0.1.15".into(),
             status: "online".into(),
             health: "ok".into(),
@@ -467,6 +473,7 @@ mod tests {
                 "reg_tok",
                 "inst-1",
                 "-----BEGIN CERTIFICATE REQUEST-----\nQ\n-----END CERTIFICATE REQUEST-----\n",
+                Some("https://gw.example.com"),
             )
             .await
             .expect("ok");
@@ -487,7 +494,9 @@ mod tests {
         assert!(
             request.contains("reg_tok")
                 && request.contains("inst-1")
-                && request.contains("certificate_signing_request"),
+                && request.contains("certificate_signing_request")
+                && request.contains("public_base_url")
+                && request.contains("https://gw.example.com"),
             "{request}"
         );
     }

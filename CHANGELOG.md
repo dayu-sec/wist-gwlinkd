@@ -3,6 +3,18 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.5.2-alpha] - 2026-10-06
+
+### Added
+- **注册与周期状态上报带上网关对外域名**：读网关自述面的 `public_base_url`，随 `register` 与
+  `report_status` 转带（老网关不带该键 → `None`，不阻断）。注册时若自述面取不到（网关还没起来 /
+  未配 `gateway_self_endpoint`）则不带，随后周期上报自然补上。
+- **执行器取件目标可带中心派生地址**：升级驱动新增「取件目标」入参；有计划派生的
+  `artifact_url` 就用它作 `gops --to <url>`，否则回落 `to_version`。**台账 / 回执仍记版本**。
+
+### Changed
+- **依赖**：`wist-control` `0.8` → `0.9`（新增可选字段 `public_base_url`）。
+
 ## [0.5.1-alpha] - 2026-10-06
 
 ### Changed
