@@ -38,7 +38,9 @@ pub struct Config {
     /// 升级成功**佐证**的观测窗口秒数（执行器报成后，等网关自述面恢复健康的最长时间；缺省 300）。
     #[serde(default)]
     pub upgrade_verify_timeout_seconds: Option<u64>,
-    /// gops 工程根（含 `ops-prj.yml`）：gops 从 cwd 解析工程，需在此指定。
+    /// gops 工程根（含 `ops-prj.yml`）：gops 从 **cwd** 解析工程，且 `gops prj upgrade` 没有
+    /// 「指定工程」的旗标 —— **用 gops 执行器时必配**（缺配/错配会在发执行器前被拒：
+    /// 见 `executor::GopsExecutor::preflight` 与 `diagnose` 的 `upgrade.project`）。
     #[serde(default)]
     pub upgrade_project_dir: Option<PathBuf>,
     /// 只升级该系统（gops 位置参数 NAME；缺省 = 工程里全部已导入系统）。

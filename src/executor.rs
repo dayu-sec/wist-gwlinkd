@@ -42,6 +42,13 @@ pub trait UpgradeExecutor: Send + Sync {
     /// 程序路径（诊断 / 日志用）。
     fn program(&self) -> &str;
 
+    /// 发执行器**之前**的前置校验：`Err(可读原因)` = 别发（驱动把它落成可读失败并回执）。
+    ///
+    /// 缺省无前置；`gops` 需要**工程根**（`ops-prj.yml`），见 [`GopsExecutor`]。
+    fn preflight(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// 构造调用（含参数、cwd、stdout 管道与回收策略）。**stderr 由驱动接管**（落执行器日志）。
     fn command(&self, invocation: &ExecutorInvocation<'_>) -> Command;
 
@@ -105,6 +112,30 @@ impl GopsExecutor {
 impl UpgradeExecutor for GopsExecutor {
     fn program(&self) -> &str {
         &self.program
+    }
+
+    fn preflight(&self) -> Result<(), String> {
+        // 工程根是 **gops 的要求**，只对 gops 生效（站点脚本执行器不要求）。
+        // gops 从 **cwd** 解析工程（`ops-prj.yml`），且 `gops prj upgrade` **没有**指定工程的旗标
+        // （见 `gops prj upgrade --help`）—— 所以工程根必须显式配。不配就会跑到进程 cwd，
+        // 以「executor exit status: 255」这种不可读的方式失败。这里前置成可读原因。
+        if !program_is_gops(&self.program) {
+            return Ok(());
+        }
+        let Some(dir) = self.project_dir.as_deref() else {
+            return Err(
+                "升级未配置工程根：upgrade_project_dir 未设置（gops 从 cwd 解析 ops-prj.yml，\
+                 不配就会以「executor exit status: 255」这种不可读的方式失败）"
+                    .to_string(),
+            );
+        };
+        if !dir.join("ops-prj.yml").is_file() {
+            return Err(format!(
+                "升级工程根 {} 里没有 ops-prj.yml（gops prj 需要一个运维工程根：`gops prj new` + `gops prj import`）",
+                dir.display()
+            ));
+        }
+        Ok(())
     }
 
     fn command(&self, invocation: &ExecutorInvocation<'_>) -> Command {
@@ -206,6 +237,16 @@ impl UpgradeExecutor for GopsExecutor {
             }
         }
     }
+}
+
+/// 程序是不是就是 **gops**（按 basename 精确判）。“工程根”这个要求只对 gops 成立；
+/// 站点脚本执行器（其它 program）不要求。
+pub(crate) fn program_is_gops(program: &str) -> bool {
+    std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name == "gops")
+        .unwrap_or(false)
 }
 
 /// `gops --json` 单行输出（只取关心的字段）。

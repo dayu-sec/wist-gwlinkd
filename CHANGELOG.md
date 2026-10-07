@@ -3,6 +3,15 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.0-alpha] - 2026-10-07
+
+### 变更
+
+- **升级执行前的前置校验**：gops 缺工程根（`upgrade_project_dir` 未设 / 无 `ops-prj.yml`）时**不再把执行器发出去**，
+  直接落可读失败并回执（此前只会在退出码 255 上失败、还读不出原因）。
+- **按中心派生的制品地址取件**：计划带的 `artifact_url` 交给执行器作 `--to <url>`；台账与回执仍记**版本**。
+- **失败时把本次运行的关键 stderr 折进回执**（有界），少让人翻日志。
+
 ## [0.5.2-alpha] - 2026-10-06
 
 ### Added

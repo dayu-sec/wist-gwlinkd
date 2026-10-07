@@ -101,12 +101,32 @@ impl UpgradeDriver {
         state::write_upgrade_record(&self.state_dir, &record)?;
         state::touch_heartbeat(&self.state_dir)?;
 
+        // 前置校验：执行器缺必要配置（gops 的工程根）就**别发** —— 发出去也只会以退出码失败，
+        // 回执读不出原因。这里前置成可读失败，并照常回执（否则中心条目会停在 dispatched）。
+        if let Err(reason) = self.executor.preflight() {
+            record.step = "preflight".to_string();
+            record.status = "failed".to_string();
+            record.detail = reason.clone();
+            if let Err(werr) = state::write_upgrade_record(&self.state_dir, &record) {
+                eprintln!("event=UpgradeRecordWriteFailed error={werr}");
+            }
+            if let Some(reporter) = reporter {
+                report_record(&reporter, &record).await;
+            }
+            return Err(reason);
+        }
+
         // 执行器的 stdout/stderr 落日志文件（失败时运维要能看现场）。stderr 由驱动接管；
         // stdout 由适配器置为管道，供解读结局。
+        let log_path = self.state_dir.join(UPGRADER_LOG_FILE);
+        // 本次运行前日志的长度：失败时只读**本次新增**的那段（不把上次的错误也带进回执）。
+        let stderr_offset = std::fs::metadata(&log_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.state_dir.join(UPGRADER_LOG_FILE))
+            .open(&log_path)
             .ok();
         let stderr = match &log {
             Some(file) => Stdio::from(
@@ -134,6 +154,10 @@ impl UpgradeDriver {
                 if let Err(werr) = state::write_upgrade_record(&self.state_dir, &record) {
                     eprintln!("event=UpgradeRecordWriteFailed error={werr}");
                 }
+                // 回执：否则中心条目会停在 dispatched（起不来也是终态，得让中心知道）。
+                if let Some(reporter) = reporter {
+                    report_record(&reporter, &record).await;
+                }
                 return Err(detail);
             }
         };
@@ -142,6 +166,7 @@ impl UpgradeDriver {
         let state_dir = self.state_dir.clone();
         let executor = Arc::clone(&self.executor);
         let verify_timeout = self.verify_timeout;
+        let log_path = log_path.clone();
         tokio::spawn(async move {
             // 心跳生产者：**覆盖整个升级事务**（执行器运行 + 成功佐证）。
             // 只在「等子进程」期间刷跳不够 —— 佐证最长 `verify_timeout`，期间若心跳陈旧：
@@ -171,7 +196,19 @@ impl UpgradeDriver {
                 Some(handle) => handle.await.unwrap_or_default(),
                 None => String::new(),
             };
-            let mut outcome = executor.interpret(ok, &raw, detail);
+            // 失败时把**本次运行**的执行器 stderr（关键错误行）折进回执说明 ——
+            // 只留退出码（255）等于让人去翻日志。
+            let fallback = if ok {
+                detail
+            } else {
+                let tail = read_run_stderr(&log_path, stderr_offset, 4096);
+                if tail.is_empty() {
+                    detail
+                } else {
+                    format!("{detail}; {}", oneline(&tail))
+                }
+            };
+            let mut outcome = executor.interpret(ok, &raw, fallback);
 
             // 佐证只用网关 id（不随 renew 变）；回执另现读最新凭据（见下）。
             let gateway_id = reporter
@@ -228,21 +265,53 @@ impl UpgradeDriver {
             }
             if let Some(reporter) = reporter {
                 // 回执**现读**最新凭据：升级可能跨越一次 renew（旧证书立即失效）。
-                match state::load_credential(&reporter.state_dir) {
-                    Some(credential) => match reporter
-                        .client
-                        .report_upgrade_result(&credential.bundle.gateway_id, &record)
-                        .await
-                    {
-                        Ok(()) => println!("event=UpgradeReported work_id={}", record.work_id),
-                        Err(err) => eprintln!("event=UpgradeReportFailed error={err}"),
-                    },
-                    None => eprintln!("event=UpgradeReportSkipped 无长期身份"),
-                }
+                report_record(&reporter, &record).await;
             }
         });
         Ok(())
     }
+}
+
+/// 把一条终态记录回执给中心（现读最新凭据；无长期身份就跳过）。
+async fn report_record(reporter: &UpgradeReporter, record: &UpgradeRecord) {
+    match state::load_credential(&reporter.state_dir) {
+        Some(credential) => match reporter
+            .client
+            .report_upgrade_result(&credential.bundle.gateway_id, record)
+            .await
+        {
+            Ok(()) => println!("event=UpgradeReported work_id={}", record.work_id),
+            Err(err) => eprintln!("event=UpgradeReportFailed error={err}"),
+        },
+        None => eprintln!("event=UpgradeReportSkipped 无长期身份"),
+    }
+}
+
+/// 读执行器日志里**本次运行**新增的那段（有界）。失败时把关键行进回执，少让人翻日志。
+fn read_run_stderr(path: &std::path::Path, offset: u64, cap: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let Ok(len) = file.metadata().map(|meta| meta.len()) else {
+        return String::new();
+    };
+    if len <= offset {
+        return String::new();
+    }
+    // 只取尾部 `cap` 字节（错误行通常在末尾），且不越过本次运行的起点。
+    let start = offset.max(len.saturating_sub(cap));
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut buffer = Vec::new();
+    let _ = file.take(cap).read_to_end(&mut buffer);
+    String::from_utf8_lossy(&buffer).trim().to_string()
+}
+
+/// 把多行错误折成一行（折叠空白），便于进 `detail`。
+fn oneline(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 impl std::fmt::Debug for UpgradeDriver {
@@ -355,6 +424,13 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         path
+    }
+
+    /// 测试用 gops 执行器：`program` 的 basename 必须是 `gops`（那才走 gops 的前置校验），
+    /// 并给一个含 `ops-prj.yml` 的工程根。
+    fn gops_script(dir: &Path, program: String) -> GopsExecutor {
+        std::fs::write(dir.join("ops-prj.yml"), "kind: ops\n").expect("write ops-prj.yml");
+        GopsExecutor::new(program).with_project(Some(dir.to_path_buf()), None)
     }
 
     #[test]
@@ -834,6 +910,89 @@ mod tests {
         // 旧实现会卡在 wait()（子进程阻塞在写）→ 记录一直 running → 这里超时 panic。
         let record = wait_terminal(&dir).await;
         assert_eq!(record.status, "done");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_gops_executor_without_a_project_root_fails_fast_without_spawning() {
+        // 缺 `upgrade_project_dir`：别把 gops 发出去（它只会以退出码 255 失败、还读不出原因）。
+        let dir = temp_dir("preflight-none");
+        let driver = UpgradeDriver::new(GopsExecutor::new("gops"), &dir);
+        let err = driver
+            .start("w-pf", "0.1.0", "0.1.16", None, None, None)
+            .await;
+        assert!(err.is_err(), "缺工程根应前置失败");
+        let record = state::read_upgrade_record(&dir).expect("record");
+        assert_eq!(record.status, "failed");
+        assert_eq!(record.step, "preflight");
+        assert!(
+            record.detail.contains("upgrade_project_dir"),
+            "回执应说明缺配什么：{}",
+            record.detail
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_gops_project_dir_without_ops_prj_yml_fails_fast() {
+        let dir = temp_dir("preflight-marker");
+        // 显式给了工程根，但里面没有 ops-prj.yml。
+        let driver = UpgradeDriver::new(
+            GopsExecutor::new("gops").with_project(Some(dir.clone()), None),
+            &dir,
+        );
+        let err = driver
+            .start("w-pf2", "0.1.0", "0.1.16", None, None, None)
+            .await;
+        assert!(err.is_err());
+        let record = state::read_upgrade_record(&dir).expect("record");
+        assert_eq!(record.step, "preflight");
+        assert!(
+            record.detail.contains("ops-prj.yml"),
+            "回执应点名缺 ops-prj.yml：{}",
+            record.detail
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_gops_program_with_a_project_root_proceeds_to_execution() {
+        // 前置校验过了才真发：脚本名就叫 `gops`（basename 判据），工程根带 ops-prj.yml。
+        let dir = temp_dir("preflight-ok");
+        let script = write_exec(&dir, "gops", "#!/bin/sh\nexit 0\n");
+        let driver = UpgradeDriver::new(
+            gops_script(&dir, script.to_string_lossy().to_string()),
+            &dir,
+        );
+        driver
+            .start("w-ok", "0.1.0", "0.1.16", None, None, None)
+            .await
+            .expect("start");
+        assert_eq!(wait_terminal(&dir).await.status, "done");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_failing_executor_stderr_reaches_the_record_detail() {
+        // 只留 `executor exit status: 255` 等于让人去翻日志；关键错误行要进回执。
+        let dir = temp_dir("stderr-detail");
+        let body = "#!/bin/sh\necho 'Run Error (Code: 203)' >&2\necho '当前目录没有 ops-prj.yml' >&2\nexit 255\n";
+        let script = write_exec(&dir, "noisy-fail.sh", body);
+        let driver = UpgradeDriver::new(
+            gops_script(&dir, script.to_string_lossy().to_string()),
+            &dir,
+        );
+        driver
+            .start("w-detail", "0.1.0", "0.1.16", None, None, None)
+            .await
+            .expect("start");
+        let record = wait_terminal(&dir).await;
+        assert_eq!(record.status, "failed");
+        assert!(
+            record.detail.contains("ops-prj.yml"),
+            "stderr 关键行应进 detail：{}",
+            record.detail
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

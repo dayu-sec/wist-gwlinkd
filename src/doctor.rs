@@ -106,6 +106,7 @@ pub fn diagnose(config: &Config) -> Report {
         self_endpoint_check(config),
         self_ca_check(config),
         upgrader_check(config),
+        upgrade_project_check(config),
         upgrade_check(config),
         reachability_check(config),
     ];
@@ -299,6 +300,48 @@ fn upgrader_check(config: &Config) -> Check {
             format!("{program}（不在 PATH，也不是可执行文件）"),
             "安装 gops 或把 upgrader_program 指向绝对路径",
         ),
+    }
+}
+
+/// 升级**工程根**：gops 从工程根解析 `ops-prj.yml`（`gops prj upgrade` **无**「指定工程」的旗标）。
+/// 没配 / 配错 → 第一次升级必失败，且报错只有退出码 —— 前置到诊断。
+///
+/// 只对 **gops** 执行器适用：站点脚本执行器不要求工程根。
+fn upgrade_project_check(config: &Config) -> Check {
+    let program = config
+        .upgrader_program
+        .as_deref()
+        .unwrap_or(crate::executor::DEFAULT_UPGRADER_PROGRAM);
+    if !crate::executor::program_is_gops(program) {
+        return Check::ok(
+            "upgrade.project",
+            "非 gops 执行器：不校验工程根",
+            format!("upgrader_program = {program}"),
+        );
+    }
+    match config.upgrade_project_dir.as_deref() {
+        None => Check::fail(
+            "upgrade.project",
+            "升级未配置工程根",
+            "upgrade_project_dir 未设置（gops 从 cwd 解析工程，缺失会让升级以退出码失败）",
+            "把 upgrade_project_dir 指向含 ops-prj.yml 的运维工程根（`gops prj new` + `gops prj import`）",
+        ),
+        Some(dir) => {
+            if dir.join("ops-prj.yml").is_file() {
+                Check::ok(
+                    "upgrade.project",
+                    "升级工程根已配置",
+                    format!("{}（含 ops-prj.yml）", dir.display()),
+                )
+            } else {
+                Check::fail(
+                    "upgrade.project",
+                    "升级工程根里没有 ops-prj.yml",
+                    format!("{} 下找不到 ops-prj.yml", dir.display()),
+                    "在工程根运行 `gops prj new` / `gops prj import`，或把 upgrade_project_dir 指对",
+                )
+            }
+        }
     }
 }
 
@@ -538,6 +581,37 @@ mod tests {
         let mut cfg = config(&dir);
         cfg.upgrader_program = Some("/nonexistent/gops-xyz".into());
         assert_eq!(status_of(&diagnose(&cfg), "upgrader.program"), Status::Fail);
+    }
+
+    #[test]
+    fn an_unconfigured_upgrade_project_fails_for_the_gops_executor() {
+        let dir = temp_dir("proj");
+        let mut cfg = config(&dir);
+        cfg.upgrader_program = None; // 缺省 = gops
+        assert_eq!(status_of(&diagnose(&cfg), "upgrade.project"), Status::Fail);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_gops_project_root_needs_the_ops_prj_marker() {
+        let dir = temp_dir("proj-marker");
+        let mut cfg = config(&dir);
+        cfg.upgrader_program = Some("gops".into());
+        cfg.upgrade_project_dir = Some(dir.join("prj"));
+        std::fs::create_dir_all(dir.join("prj")).expect("mkdir");
+        // 目录在、但没 ops-prj.yml → FAIL。
+        assert_eq!(status_of(&diagnose(&cfg), "upgrade.project"), Status::Fail);
+        std::fs::write(dir.join("prj").join("ops-prj.yml"), "kind: ops\n").expect("write");
+        assert_eq!(status_of(&diagnose(&cfg), "upgrade.project"), Status::Ok);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_non_gops_upgrader_skips_the_project_check() {
+        let dir = temp_dir("proj-skip");
+        let cfg = config(&dir); // upgrader_program = /bin/sh
+        assert_eq!(status_of(&diagnose(&cfg), "upgrade.project"), Status::Ok);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
