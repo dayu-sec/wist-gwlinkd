@@ -811,14 +811,14 @@ mod tests {
 
     #[tokio::test]
     async fn corroborate_recovery_passes_when_healthy_and_fails_when_degraded() {
-        let healthy = r#"{"gateway_id":"gw-1","version":"0.1.18-alpha","collected_at":"2026-10-04T00:00:00Z","store_healthy":true,"agent_count":0,"uplink_enabled":true,"last_error":null}"#;
+        let healthy = r#"{"gateway_id":"gw-1","version":"0.1.18-alpha","collected_at":"2026-10-04T00:00:00Z","store_healthy":true,"agent_count":0,"last_error":null}"#;
         let client = SelfReportClient::new(serve_self_state(healthy).await);
         let evidence = corroborate_recovery(&client, "gw-1", Duration::from_secs(5))
             .await
             .expect("healthy gateway corroborates");
         assert!(evidence.contains("佐证"), "{evidence}");
 
-        let degraded = r#"{"gateway_id":"gw-1","version":"0.1.18-alpha","collected_at":"2026-10-04T00:00:00Z","store_healthy":true,"agent_count":0,"uplink_enabled":false,"last_error":null}"#;
+        let degraded = r#"{"gateway_id":"gw-1","version":"0.1.18-alpha","collected_at":"2026-10-04T00:00:00Z","store_healthy":false,"agent_count":0,"last_error":null}"#;
         let client = SelfReportClient::new(serve_self_state(degraded).await);
         let err = corroborate_recovery(&client, "gw-1", Duration::from_secs(4))
             .await
@@ -1118,8 +1118,8 @@ mod tests {
 
     // ── 驱动级「成功佐证」映射 ──
 
-    const SELF_STATE_HEALTHY: &str = r#"{"gateway_id":"gw-1","version":"0.1.18-alpha","collected_at":"2026-10-04T00:00:00Z","store_healthy":true,"agent_count":0,"uplink_enabled":true,"last_error":null}"#;
-    const SELF_STATE_DEGRADED: &str = r#"{"gateway_id":"gw-1","version":"0.1.18-alpha","collected_at":"2026-10-04T00:00:00Z","store_healthy":true,"agent_count":0,"uplink_enabled":false,"last_error":null}"#;
+    const SELF_STATE_HEALTHY: &str = r#"{"gateway_id":"gw-1","version":"0.1.18-alpha","collected_at":"2026-10-04T00:00:00Z","store_healthy":true,"agent_count":0,"last_error":null}"#;
+    const SELF_STATE_DEGRADED: &str = r#"{"gateway_id":"gw-1","version":"0.1.18-alpha","collected_at":"2026-10-04T00:00:00Z","store_healthy":false,"agent_count":0,"last_error":null}"#;
 
     /// 佐证分支要 `gateway_id`（从长期身份读）——所以得先存在一份凭据。
     fn write_credential(dir: &Path, gateway_id: &str) {

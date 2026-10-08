@@ -17,7 +17,6 @@ pub struct GatewaySelfState {
     pub collected_at: wist_control::DateTime,
     pub store_healthy: bool,
     pub agent_count: i64,
-    pub uplink_enabled: bool,
     #[serde(default)]
     pub last_error: Option<String>,
     // 以下为后加的富化字段：老版本网关照常无这些键 → `default` 兜底，不因缺字段而整条拉失败。
@@ -58,9 +57,9 @@ pub struct GatewaySelfState {
 }
 
 impl GatewaySelfState {
-    /// 派生上报用健康度：存储不健康 / 上送未启用 / 有最后错误 → `degraded`。
+    /// 派生上报用健康度：存储不健康 / 有最后错误 → `degraded`。
     pub fn health(&self) -> &'static str {
-        if self.store_healthy && self.uplink_enabled && self.last_error.is_none() {
+        if self.store_healthy && self.last_error.is_none() {
             "ok"
         } else {
             "degraded"
@@ -130,7 +129,7 @@ mod tests {
     /// 网关 `self_state.rs` 输出的**契约 fixture**（snake_case）。
     /// 网关侧有同一份 fixture 的**序列化**测试（`serializes_the_self_state_contract_keys`）——
     /// 两侧同钉一份形状，任一侧改名即在此处爆掉（防三份拷贝漂移）。
-    const GATEWAY_SELF_STATE_JSON: &str = r#"{"gateway_id":"gw-1","version":"0.1.15","public_base_url":"https://gw.example.com","collected_at":"2026-10-04T00:00:00Z","store_healthy":true,"agent_count":3,"uplink_enabled":true,"last_error":null,"uptime_seconds":3600,"cpu_percent":1.5,"memory_bytes":104857600,"online_agents":2,"offline_agents":1,"last_seen_lag_seconds":30}"#;
+    const GATEWAY_SELF_STATE_JSON: &str = r#"{"gateway_id":"gw-1","version":"0.1.15","public_base_url":"https://gw.example.com","collected_at":"2026-10-04T00:00:00Z","store_healthy":true,"agent_count":3,"last_error":null,"uptime_seconds":3600,"cpu_percent":1.5,"memory_bytes":104857600,"online_agents":2,"offline_agents":1,"last_seen_lag_seconds":30}"#;
 
     #[test]
     fn parses_the_gateway_self_state_contract() {
@@ -143,28 +142,27 @@ mod tests {
             Some("https://gw.example.com")
         );
         assert_eq!(state.agent_count, 3);
-        assert!(state.store_healthy && state.uplink_enabled);
+        assert!(state.store_healthy);
         assert_eq!(state.health(), "ok");
     }
 
     /// 老网关不带 `public_base_url` 键：仍应可解，缺省为 `None`（不是解析失败）。
     #[test]
     fn parses_a_legacy_self_state_without_public_base_url() {
-        let legacy = r#"{"gateway_id":"gw-1","version":"0.1.24","collected_at":"2026-10-04T00:00:00Z","store_healthy":true,"agent_count":0,"uplink_enabled":true,"last_error":null}"#;
+        let legacy = r#"{"gateway_id":"gw-1","version":"0.1.24","collected_at":"2026-10-04T00:00:00Z","store_healthy":true,"agent_count":0,"last_error":null}"#;
         let state: GatewaySelfState = serde_json::from_str(legacy).expect("老自述面应可解");
         assert_eq!(state.public_base_url, None);
     }
 
     #[test]
-    fn degraded_when_uplink_off_or_error_present() {
-        let off = GatewaySelfState {
+    fn degraded_when_store_unhealthy_or_error_present() {
+        let unhealthy = GatewaySelfState {
             gateway_id: "gw-1".into(),
             version: "0.1.15".into(),
             public_base_url: None,
             collected_at: wist_control::DateTime::now(),
-            store_healthy: true,
+            store_healthy: false,
             agent_count: 0,
-            uplink_enabled: false,
             last_error: None,
             uptime_seconds: 0,
             cpu_percent: None,
@@ -184,11 +182,11 @@ mod tests {
             disk_total_bytes: None,
             disk_available_bytes: None,
         };
-        assert_eq!(off.health(), "degraded");
+        assert_eq!(unhealthy.health(), "degraded");
         let errored = GatewaySelfState {
-            uplink_enabled: true,
+            store_healthy: true,
             last_error: Some("boom".into()),
-            ..off
+            ..unhealthy
         };
         assert_eq!(errored.health(), "degraded");
     }
