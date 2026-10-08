@@ -19,6 +19,7 @@
 ## 用法
 
 ```bash
+wist-gwlinkd init-config [路径]  # 生成一份带注释的 gwlinkd.toml（路径缺省 = 当前配置路径）
 wist-gwlinkd run              # 常驻（默认子命令）
 wist-gwlinkd diagnose         # 本地诊断；有 FAIL 则退出码非 0
 wist-gwlinkd service install --system   # 装成 OS 服务长期托管（开机自启/崩溃拉起）

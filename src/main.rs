@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use wist_control::{DateTime, ReportGatewayStatus};
 use wist_gwlinkd::center::{self, CenterClient, CenterError, GatewayUpgradeTarget};
-use wist_gwlinkd::config::{Config, UpgradeInstall};
+use wist_gwlinkd::config::{Config, UpgradeInstall, upsert_link_settings};
 use wist_gwlinkd::doctor::{self, Status};
 use wist_gwlinkd::executor::{DEFAULT_ON_FAILURE, DEFAULT_UPGRADER_PROGRAM, GopsExecutor};
 use wist_gwlinkd::identity;
@@ -50,43 +50,72 @@ async fn main() -> ExitCode {
             }
         },
         "service" => run_service(&std::env::args().skip(2).collect::<Vec<_>>()),
-        "run" => match Config::load(&config_path()) {
-            Ok(config) => match run(&config).await {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(err) => {
-                    eprintln!("[FAIL] {err}");
-                    ExitCode::FAILURE
-                }
-            },
+        "init-config" => match init_config_command(std::env::args().nth(2)) {
+            Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
-                eprintln!("[FAIL] 配置不可读：{err}");
+                eprintln!("[FAIL] {err}");
                 ExitCode::FAILURE
             }
         },
+        "run" => {
+            let path = config_path();
+            match Config::load(&path) {
+                Ok(config) => match run(&config, &path).await {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(err) => {
+                        eprintln!("[FAIL] {err}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(err) => {
+                    eprintln!("[FAIL] 配置不可读：{err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         other => {
-            eprintln!("unknown command: {other}（可用：run | diagnose | service | version）");
+            eprintln!(
+                "unknown command: {other}（可用：run | diagnose | service | init-config | version）"
+            );
             ExitCode::from(2)
         }
     }
 }
 
+/// 生成一份带注释的 `gwlinkd.toml` 骶架（`init-config [路径]`）。
+///
+/// 与 `wist-gateway init-config` 同一套路：由程序生成，避免手抄。**不含密钥**；接入券
+/// `link_token` 由「链接上级」页 / gwlinkd 自联时写回。已存在同名文件时**覆盖**（会在输出里注明）。
+fn init_config_command(out_arg: Option<String>) -> Result<(), String> {
+    let out_path = out_arg.map(PathBuf::from).unwrap_or_else(config_path);
+    if let Some(parent) = out_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("创建目录失败 {}: {err}", parent.display()))?;
+    }
+    let existed = out_path.exists();
+    std::fs::write(&out_path, wist_gwlinkd::config::default_config_text())
+        .map_err(|err| format!("写入失败 {}: {err}", out_path.display()))?;
+    if existed {
+        println!("已覆盖原有配置：{}", out_path.display());
+    } else {
+        println!("已生成配置：{}", out_path.display());
+    }
+    println!(
+        "下一步：填 control_center_endpoint（自签中心再配 trust_bundle），然后 `wist-gwlinkd run`；"
+    );
+    println!("       或走网关「链接上级」页提交接入链接 —— gwlinkd 拉到后会把值写回本文件。");
+    Ok(())
+}
+
 /// 常驻：单实例 → 首跑置备（若未注册）→ 周期【续期 / 拉升级目标 / 拉自述面 / 上报状态】。
-async fn run(config: &Config) -> Result<(), String> {
+async fn run(config: &Config, path: &Path) -> Result<(), String> {
     // 单实例：同机只允许一个常驻（否则双重上报 + 双重驱动升级）。持有到进程退出。
     let _lock = state::acquire_single_instance_lock(&config.state_dir)?;
 
     let identity = state::load_or_create_identity(&config.state_dir)?;
-    // 信任锚：配置给了且文件在，就作为自定义根（自签中心必需）；否则回落公共根（并记一笔）。
-    let trust_bundle = config.trust_bundle.as_path();
-    let trust: Option<&Path> = if trust_bundle.exists() {
-        Some(trust_bundle)
-    } else {
-        eprintln!(
-            "event=TrustBundleMissing path={}（回落公共根）",
-            trust_bundle.display()
-        );
-        None
-    };
 
     match state::credential_status(&config.state_dir) {
         CredentialStatus::Present(_) => {
@@ -95,7 +124,9 @@ async fn run(config: &Config) -> Result<(), String> {
         }
         CredentialStatus::Missing => {
             // 首跑还没客户端证书：先看网关页有没有提交「接入请求」（环回），否则回退 env 券。
-            first_run(config, trust, &identity).await?;
+            let trust_bundle = config.trust_bundle.clone();
+            let trust: Option<&Path> = trust_bundle.exists().then_some(trust_bundle.as_path());
+            first_run(path, config, trust, &identity).await?;
         }
         CredentialStatus::Corrupt(detail) => {
             // 损坏 ≠ 缺失：不能静默重置备（会覆盖掉唯一一份长期身份）。
@@ -104,6 +135,21 @@ async fn run(config: &Config) -> Result<(), String> {
             ));
         }
     }
+    // 首跑那步可能**改写了配置文件**（写入 gateway_id / center endpoint / 券）——在这里**重读**一次：
+    // 否则后续周期（上报 / 续期 / 升级）仍用**旧 gateway_id**，中心按客户端证书认人 → `certificate_mismatch`。
+    let reloaded = Config::load(path)?;
+    let config: &Config = &reloaded;
+    let trust_bundle = config.trust_bundle.clone();
+    let trust: Option<&Path> = if trust_bundle.exists() {
+        Some(trust_bundle.as_path())
+    } else {
+        eprintln!(
+            "event=TrustBundleMissing path={}（回落公共根）",
+            trust_bundle.display()
+        );
+        None
+    };
+
     let mut credential = state::load_credential(&config.state_dir)
         .ok_or_else(|| "注册后仍无长期身份".to_string())?;
     // 注册后所有网关面调用都走 **mTLS**（客户端证书认人）；续期后重建。
@@ -510,6 +556,16 @@ fn back_off(current: Duration) -> Duration {
     }
 }
 
+/// 配置里的接入券（`gwlinkd.toml` `link_token`）：**空白视为未配置**（`None`）。
+fn link_token_from_config(config: &Config) -> Option<String> {
+    config
+        .link_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+}
+
 /// 读取一次性接入券：优先 `WIST_GWLINKD_LINK_TOKEN`，回退旧名
 /// `WIST_GWLINKD_BOOTSTRAP_TOKEN`（弃用告警，下一版移除）。
 fn link_token_from_env() -> Option<String> {
@@ -528,37 +584,38 @@ fn link_token_from_env() -> Option<String> {
 }
 
 /// 首跑：确保拿到长期身份（可能等待页面提交的接入请求）。
-async fn first_run(config: &Config, trust: Option<&Path>, identity: &str) -> Result<(), String> {
-    // 页面发起（环回接入请求）优先。
+async fn first_run(
+    path: &Path,
+    config: &Config,
+    trust: Option<&Path>,
+    identity: &str,
+) -> Result<(), String> {
+    // 接入券来源（按序）：配置 `link_token`（gwlinkd.toml）→ 环境变量（兼容 dev / 旧路径）。
+    // 有券即**直接接入**（不再经网关页面）。「券进配置」= 写好 gwlinkd.toml、起进程就自联上。
+    let link_token = link_token_from_config(config).or_else(link_token_from_env);
+    if let Some(token) = link_token.as_deref() {
+        let link_client = CenterClient::with_client(
+            config.control_center_endpoint.clone(),
+            center::build_http_client(trust)?,
+        );
+        return onboard(&link_client, config, identity, Some(token)).await;
+    }
+    // 无券：页面发起（环回接入请求）—— 拉取后在**这一步改写 gwlinkd.toml**。
     if let Some(base) = config.gateway_self_endpoint.as_deref() {
         let client = LinkRequestClient::with_trust(base, config.gateway_self_ca.as_deref())?;
-        if link_token_from_env().is_none() {
-            // 没有 env 券 → 页面发起路径：等到页面上提交了再接入，失败则继续等下一次。
-            return wait_for_gateway_request(config, trust, identity, &client).await;
-        }
-        // 有 env 券：优先环回请求，没有/失败则回退旧路径。
-        match onboard_from_gateway(config, trust, identity, &client).await {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
-            Err(err) => eprintln!("event=LinkRequestFailed error={err}（回退 env 券路径）"),
-        }
+        return wait_for_gateway_request(path, config, trust, identity, &client).await;
     }
-    // 旧路径：env 券（或报错）+ 配置 endpoint/trust。
+    // 都没配：无券直跑 onboard，由其给出清晰错误。
     let link_client = CenterClient::with_client(
         config.control_center_endpoint.clone(),
         center::build_http_client(trust)?,
     );
-    onboard(
-        &link_client,
-        config,
-        identity,
-        link_token_from_env().as_deref(),
-    )
-    .await
+    onboard(&link_client, config, identity, None).await
 }
 
 /// 一次「从环回接入请求接入」：有待办则接入并回报结果，成功返回 `Ok(true)`；无待办 `Ok(false)`。
 async fn onboard_from_gateway(
+    path: &Path,
     config: &Config,
     trust: Option<&Path>,
     identity: &str,
@@ -577,25 +634,40 @@ async fn onboard_from_gateway(
             &request.trust_bundle_pem,
         )?)
     };
+    // **在接入这一步改写本机配置**：把接入物落成 gwlinkd.toml —— 链接关系的持久记录（不走 DB）。
+    upsert_link_settings(
+        path,
+        &request.center_endpoint,
+        &request.gateway_id,
+        &request.link_token,
+        trust_path.as_deref(),
+    )?;
+    println!(
+        "event=LinkRequestPersisted path={} center={}",
+        path.display(),
+        request.center_endpoint
+    );
+    // 以改写后的配置为准（endpoint / gateway_id / trust 都从文件读回）。
+    let updated = Config::load(path)?;
     let effective_trust = trust_path.as_deref().or(trust);
     let link_client = CenterClient::with_client(
-        request.center_endpoint.clone(),
+        updated.control_center_endpoint.clone(),
         center::build_http_client(effective_trust)?,
     );
     println!(
         "event=LinkRequestPicked gateway_id={} center={}",
-        config.gateway_id, request.center_endpoint
+        updated.gateway_id, updated.control_center_endpoint
     );
-    match onboard(&link_client, config, identity, Some(&request.link_token)).await {
+    match onboard(&link_client, &updated, identity, Some(&request.link_token)).await {
         Ok(()) => {
             let _ = client
-                .report_result(&config.gateway_id, "Connected", "")
+                .report_result(&updated.gateway_id, "Connected", "")
                 .await;
             Ok(true)
         }
         Err(err) => {
             let _ = client
-                .report_result(&config.gateway_id, "Failed", &err)
+                .report_result(&updated.gateway_id, "Failed", &err)
                 .await;
             Err(err)
         }
@@ -607,6 +679,7 @@ async fn onboard_from_gateway(
 /// 每轮先尝试**遗留 RegistToken** 的免接入券注册（link-upstream 已成功、register 未成、
 /// 随后终态而不再派发时靠它自愈）。
 async fn wait_for_gateway_request(
+    path: &Path,
     config: &Config,
     trust: Option<&Path>,
     identity: &str,
@@ -622,7 +695,7 @@ async fn wait_for_gateway_request(
             Ok(false) => {}
             Err(err) => eprintln!("event=RegisterRetryFailed error={err}"),
         }
-        match onboard_from_gateway(config, trust, identity, client).await {
+        match onboard_from_gateway(path, config, trust, identity, client).await {
             Ok(true) => return Ok(()),
             Ok(false) => {}
             Err(err) => eprintln!("event=LinkRequestFailed error={err}"),
@@ -715,7 +788,8 @@ async fn onboard(
     }
 
     let link = link.ok_or_else(|| {
-        "首跑需要 WIST_GWLINKD_LINK_TOKEN（中心 admin 创建实例时签发的接入 token）；\
+        "首跑需要接入券：在 gwlinkd.toml 配 `link_token`（或设 WIST_GWLINKD_LINK_TOKEN）\
+         —— 中心 admin 创建实例时签发的接入 token；\
          若本机曾有身份，请检查 state/credential.json 是否损坏"
             .to_string()
     })?;
@@ -1039,6 +1113,7 @@ mod tests {
             trust_bundle: dir.join("ca.pem"),
             state_dir: dir.to_path_buf(),
             gateway_id: "gw-1".into(),
+            link_token: None,
             gateway_self_endpoint: None,
             gateway_self_ca: None,
             renew_lead_seconds: None,
@@ -1194,6 +1269,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn init_config_writes_a_loadable_config() {
+        let dir = temp_dir("init-config");
+        let path = dir.join("gwlinkd.toml");
+        init_config_command(Some(path.display().to_string())).expect("init-config");
+        let config = Config::load(&path).expect("生成的配置必须可加载");
+        assert_eq!(config.gateway_id, "gw-local");
+        assert!(config.link_token.is_none());
+        // 注释里的 `# link_token = ""` 不能被当成真配置。
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_link_token_ignores_blank_values() {
+        let dir = temp_dir("cfg-token");
+        let mut config = test_config(&dir, "https://c".to_string());
+        assert_eq!(link_token_from_config(&config), None, "未配置 → None");
+        config.link_token = Some("   ".to_string());
+        assert_eq!(link_token_from_config(&config), None, "空白不算配置");
+        config.link_token = Some(" link_x ".to_string());
+        assert_eq!(link_token_from_config(&config).as_deref(), Some("link_x"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// 页面发起接入：有待办 → 接入并回报 `Connected`。
     #[tokio::test]
     async fn onboard_from_gateway_consumes_the_page_request() {
@@ -1218,12 +1317,26 @@ mod tests {
             .to_string(),
         ));
         let client = LinkRequestClient::new(url.clone());
-        let config = test_config(&dir, url);
+        let config = test_config(&dir, url.clone());
+        // 配置文件的路径：接入那一步会**改写它**（把接入物落盘）。
+        let config_path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "control_center_endpoint = \"{url}\"\ngateway_id = \"gw-old\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"{state}\"\n",
+                state = dir.display()
+            ),
+        )
+        .expect("write config");
 
-        let registered = onboard_from_gateway(&config, None, "ident-1", &client)
+        let registered = onboard_from_gateway(&config_path, &config, None, "ident-1", &client)
             .await
             .expect("onboard");
         assert!(registered, "有待办应完成接入");
+        // 接入物已改写进配置文件（= 链接关系的持久记录）。
+        let written = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(written.contains("link_token = \"link_abc\""), "{written}");
+        assert!(written.contains("gateway_id = \"gw-1\""), "{written}");
         assert!(wist_gwlinkd::state::load_credential(&dir).is_some());
         let calls = stub.lock().unwrap().calls.clone();
         assert!(
@@ -1254,9 +1367,18 @@ mod tests {
         }));
         let url = serve_center(Arc::clone(&stub)).await;
         let client = LinkRequestClient::new(url.clone());
-        let config = test_config(&dir, url);
+        let config = test_config(&dir, url.clone());
+        let config_path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "control_center_endpoint = \"{url}\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"{state}\"\n",
+                state = dir.display()
+            ),
+        )
+        .expect("write config");
 
-        let registered = onboard_from_gateway(&config, None, "ident-1", &client)
+        let registered = onboard_from_gateway(&config_path, &config, None, "ident-1", &client)
             .await
             .expect("ok");
         assert!(!registered);

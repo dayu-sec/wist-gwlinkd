@@ -231,7 +231,7 @@ fn credential_check(config: &Config) -> Check {
             "尚无客户端身份",
             "首跑会走 link-upstream → register",
         )
-        .with_hint("设 WIST_GWLINKD_LINK_TOKEN 后运行 `wist-gwlinkd run` 完成首次置备"),
+        .with_hint("在 gwlinkd.toml 配 `link_token`（或设 WIST_GWLINKD_LINK_TOKEN）后运行 `wist-gwlinkd run` 完成首次置备"),
         CredentialStatus::Corrupt(detail) => Check::fail(
             "credential.local",
             "客户端身份损坏",
@@ -545,6 +545,7 @@ mod tests {
             trust_bundle: dir.join("ca.pem"),
             state_dir: dir.to_path_buf(),
             gateway_id: "gw-1".into(),
+            link_token: None,
             gateway_self_endpoint: None,
             gateway_self_ca: None,
             renew_lead_seconds: None,

@@ -13,6 +13,14 @@ pub struct Config {
     pub state_dir: PathBuf,
     /// 本网关在中心侧的标识（admin 创建实例时确定）。
     pub gateway_id: String,
+    /// 一次性接入券（Center「生成/轮换接入券」给出）：首跑（本机还没有客户端证书）时
+    /// 用它做 link-upstream → register，**被消费即废**。
+    ///
+    /// 放在这里 = 「什么都不做就自联上」：写好这份配置、起 gwlinkd 即完成接入。
+    /// 已注册后不再使用（要重接：改这项，或清 `state_dir` 重新注册）。
+    /// 缺省（空 / 不写）= 本机没有待接入的券。
+    #[serde(default)]
+    pub link_token: Option<String>,
     /// 本机网关容器**自述面** endpoint（如 `https://127.0.0.1:3000`；缺省则不消费自述面）。
     #[serde(default)]
     pub gateway_self_endpoint: Option<String>,
@@ -105,6 +113,154 @@ impl Config {
     }
 }
 
+/// 把页面提交的接入物落到本机配置文件（`gwlinkd.toml`）：改写
+/// `control_center_endpoint` / `gateway_id` / `link_token` / `trust_bundle`
+/// （存在即替换、不存在即追加），**保留其余行与注释**。
+///
+/// 为什么写文件：链接关系是**部署接线**，落成配置文件即「持久记录」—— 这正是
+/// 「在页面那一下 action 里改写配置」的落点（不落 DB）。
+/// 空 `gateway_id` / 空 `link_token` 不覆盖已存值（页面允许留空）。
+pub fn upsert_link_settings(
+    path: &Path,
+    center_endpoint: &str,
+    gateway_id: &str,
+    link_token: &str,
+    trust_bundle: Option<&Path>,
+) -> Result<(), String> {
+    let original = std::fs::read_to_string(path)
+        .map_err(|err| format!("读取配置失败 {}: {err}", path.display()))?;
+    let mut text = original;
+    text = upsert_scalar(
+        &text,
+        "control_center_endpoint",
+        &toml_string(center_endpoint.trim()),
+    );
+    if !gateway_id.trim().is_empty() {
+        text = upsert_scalar(&text, "gateway_id", &toml_string(gateway_id.trim()));
+    }
+    if !link_token.trim().is_empty() {
+        text = upsert_scalar(&text, "link_token", &toml_string(link_token.trim()));
+    }
+    if let Some(ca) = trust_bundle {
+        text = upsert_scalar(
+            &text,
+            "trust_bundle",
+            &toml_string(&ca.display().to_string()),
+        );
+    }
+    write_atomic(path, &text)
+}
+
+/// 把**顶层**标量键 `key` 替换为 `key = <literal>`；没有则**插到第一个 `[section]` 之前**
+/// （顶层键必须落在所有段之前，否则会被 TOML 解析成那个段里的键）。
+fn upsert_scalar(text: &str, key: &str, literal: &str) -> String {
+    let replacement = format!("{key} = {literal}");
+    let lines: Vec<&str> = text.lines().collect();
+    let first_section = lines.iter().position(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with('[') && trimmed.ends_with(']')
+    });
+    let top_end = first_section.unwrap_or(lines.len());
+    let mut out = String::new();
+    match lines[..top_end]
+        .iter()
+        .position(|line| line_matches_key(line.trim_start(), key))
+    {
+        // 顶层已有该键：原地替换。
+        Some(index) => {
+            for (i, line) in lines.iter().enumerate() {
+                out.push_str(if i == index { &replacement } else { line });
+                out.push('\n');
+            }
+        }
+        // 顶层没有：插到第一个段头之前（无段则追加到末尾）。
+        None => {
+            for (i, line) in lines.iter().enumerate() {
+                if i == top_end {
+                    out.push_str(&replacement);
+                    out.push('\n');
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+            if top_end == lines.len() {
+                out.push_str(&replacement);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// 该行是否是顶层标量 `key = ……`（避免误命中 `key_extra = ……` / `==`）。
+fn line_matches_key(trimmed: &str, key: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix(key) else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    rest.starts_with('=') && !rest.starts_with("==")
+}
+
+/// TOML 基本字符串字面量（转义 `\` 与 `"`）。
+fn toml_string(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// 原子写：先写临时文件再 rename，避免写一半损坏配置。
+fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("创建目录失败 {}: {err}", parent.display()))?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, content).map_err(|err| format!("写入失败 {}: {err}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|err| format!("落盘失败 {}: {err}", path.display()))
+}
+
+/// `wist-gwlinkd init-config` 写出去的默认配置文本（带注释的 `gwlinkd.toml` 骶架）。
+///
+/// 由程序生成（与 `wist-gateway init-config` 同一套路）：不含任何密钥；接入券 `link_token`
+/// 由「链接上级」页 / gwlinkd 自联时写回，或手工填。生成的文本必须能被 [`Config::load`] 解析
+/// （有测试钉着）—— 否则现场 `init-config` 出来的配置一启动就报 missing field。
+pub fn default_config_text() -> String {
+    DEFAULT_CONFIG_TEMPLATE.to_string()
+}
+
+/// 默认配置路径（供 `init-config` 不传参数时用）。
+pub fn default_config_path() -> PathBuf {
+    PathBuf::from(crate::DEFAULT_CONFIG_PATH)
+}
+
+/// 默认配置模板（由 [`default_config_text`] 返回）。
+const DEFAULT_CONFIG_TEMPLATE: &str = r#"# wist-gwlinkd 本机配置（由 `wist-gwlinkd init-config` 生成）。
+#
+# 把本网关接入上级控制中心：填 control_center_endpoint；自签中心再指向它的 CA（trust_bundle）。
+# 首次接入的**一次性接入券**二选一：
+#   * 走网关「链接上级」页提交接入链接 —— gwlinkd 拉到后会把值写回本文件；或
+#   * 直接在本文件写 `link_token = "…"` —— 起进程即自联。
+# 已注册后不要再动这些项；要重接：改本文件，或清 state_dir 重新注册。
+
+# 上级控制中心地址（空 = 尚未接入）
+control_center_endpoint = ""
+
+# 中心 CA-S 信任锚路径（自签中心必需；公网中心可不配，回落系统根）
+trust_bundle = "state/control-center.pem"
+
+# 状态/身份目录（客户端证书与私钥落这里；**要备份**）
+state_dir = "state"
+
+# 本网关在中心侧的标识（须与中心实例名一致）
+gateway_id = "gw-local"
+
+# 可选：本机网关自述面 / 环回面（「链接上级」页面路才需要）
+# gateway_self_endpoint = "https://127.0.0.1:3000"
+# gateway_self_ca = "state/gateway-ca.crt.pem"
+
+# 可选：一次性接入券（写上 = 起进程即自联；被消费即废）
+# link_token = ""
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +284,7 @@ mod tests {
         let config = Config::load(&path).expect("load");
         assert_eq!(config.control_center_endpoint, "https://c");
         assert_eq!(config.gateway_id, "gw-1");
+        assert!(config.link_token.is_none());
         assert!(config.gateway_self_endpoint.is_none());
         assert!(config.gateway_self_ca.is_none());
         assert!(config.renew_lead_seconds.is_none());
@@ -139,6 +296,129 @@ mod tests {
         assert!(config.upgrade_tool_require_arch.is_none());
         assert!(config.upgrade.component.is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn link_token_parses_when_present() {
+        let dir = temp_dir("link-token");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\nlink_token = \"link_abc\"\n",
+        )
+        .expect("write");
+        let config = Config::load(&path).expect("load");
+        assert_eq!(config.link_token.as_deref(), Some("link_abc"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn upsert_link_settings_replaces_and_preserves_comments() {
+        let dir = temp_dir("upsert");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            "# 头部注释\ncontrol_center_endpoint = \"https://old\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/old.pem\"\nstate_dir = \"/s\"\n",
+        )
+        .expect("write");
+        upsert_link_settings(
+            &path,
+            "https://new",
+            "gw-2",
+            "link_new",
+            Some(Path::new("/new.pem")),
+        )
+        .expect("upsert");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("# 头部注释"), "注释应保留：{text}");
+        assert!(
+            text.contains("control_center_endpoint = \"https://new\""),
+            "{text}"
+        );
+        assert!(text.contains("gateway_id = \"gw-2\""), "{text}");
+        assert!(text.contains("link_token = \"link_new\""), "{text}");
+        assert!(text.contains("trust_bundle = \"/new.pem\""), "{text}");
+        // 改完仍是合法配置。
+        let config = Config::load(&path).expect("load");
+        assert_eq!(config.link_token.as_deref(), Some("link_new"));
+        assert_eq!(config.control_center_endpoint, "https://new");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn upsert_link_settings_appends_missing_keys() {
+        let dir = temp_dir("upsert-append");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\n",
+        )
+        .expect("write");
+        upsert_link_settings(&path, "https://c", "", "link_abc", None).expect("upsert");
+        let config = Config::load(&path).expect("load");
+        // 追加了 link_token；空 gateway_id 不覆盖已存值。
+        assert_eq!(config.link_token.as_deref(), Some("link_abc"));
+        assert_eq!(config.gateway_id, "gw-1");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn upsert_link_settings_inserts_before_the_first_section() {
+        let dir = temp_dir("upsert-section");
+        let path = dir.join("gwlinkd.toml");
+        // 已有段：新键必须插在 `[upgrade]` **之前**，否则会被并进那个段（解析不到 / 静默忽略）。
+        std::fs::write(
+            &path,
+            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\n\n[upgrade]\n",
+        )
+        .expect("write");
+        upsert_link_settings(&path, "https://c", "", "link_abc", None).expect("upsert");
+        let text = std::fs::read_to_string(&path).expect("read");
+        let token_at = text.find("link_token").expect("token present");
+        let section_at = text.find("[upgrade]").expect("section present");
+        assert!(token_at < section_at, "顶层键必须在段之前：\n{text}");
+        assert_eq!(
+            Config::load(&path).expect("load").link_token.as_deref(),
+            Some("link_abc")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn upsert_link_settings_is_idempotent() {
+        let dir = temp_dir("upsert-idem");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\n",
+        )
+        .expect("write");
+        upsert_link_settings(&path, "https://c", "gw-1", "link_abc", None).expect("first");
+        let once = std::fs::read_to_string(&path).expect("read");
+        upsert_link_settings(&path, "https://c", "gw-1", "link_abc", None).expect("second");
+        let twice = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(once, twice, "重复调用结果应稳定");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn line_matches_key_only_matches_top_level_assignments() {
+        assert!(line_matches_key("link_token = \"x\"", "link_token"));
+        assert!(line_matches_key("link_token=\"x\"", "link_token"));
+        // 更长的键名（前缀命中）不算。
+        assert!(!line_matches_key("link_token_extra = \"x\"", "link_token"));
+        // 注释行不算。
+        assert!(!line_matches_key("# link_token = \"x\"", "link_token"));
+    }
+
+    #[test]
+    fn default_config_text_is_a_loadable_config() {
+        // init-config 生成的配置必须能被解析 —— 否则现场一启动就报 missing field。
+        let parsed: Config = toml::from_str(&default_config_text()).expect("默认配置必须可解析");
+        assert_eq!(parsed.gateway_id, "gw-local");
+        assert_eq!(parsed.control_center_endpoint, "");
+        assert!(parsed.link_token.is_none());
+        // 注释里的 `# link_token = ""` 不能被当成真配置（否则这里会是 Some("")）。
     }
 
     #[test]
