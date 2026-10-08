@@ -108,6 +108,7 @@ pub fn diagnose(config: &Config) -> Report {
         upgrader_check(config),
         upgrade_project_check(config),
         upgrade_check(config),
+        upgrade_tools_check(config),
         reachability_check(config),
     ];
     Report { checks }
@@ -374,6 +375,68 @@ fn upgrade_check(config: &Config) -> Check {
     }
 }
 
+/// 无状态工具（`install = "tool-copy"`）组件体检：目录、`binary` 配置与 `PATH` 命中。
+///
+/// 直接对着「表面修了其实没生效」的坑：配置里**没有** `tool-copy` 目录 → 升级会静默回退到 gops。
+fn upgrade_tools_check(config: &Config) -> Check {
+    use crate::config::UpgradeInstall;
+
+    let tools: Vec<&crate::config::UpgradeComponentConfig> = config
+        .upgrade
+        .component
+        .iter()
+        .filter(|entry| entry.install == UpgradeInstall::ToolCopy)
+        .collect();
+    let require_arch = config.upgrade_tool_require_arch.unwrap_or(true);
+    if tools.is_empty() {
+        return Check::ok(
+            "upgrade.tool",
+            "无无状态工具（tool-copy）组件",
+            format!("组件目录里没有 install=tool-copy 的项（require_arch={require_arch}）"),
+        );
+    }
+
+    let mut lines = Vec::new();
+    let mut has_bad_binary = false;
+    let mut has_missing = false;
+    for entry in &tools {
+        let binary = entry.binary.as_deref().unwrap_or("").trim();
+        if binary.is_empty() {
+            has_bad_binary = true;
+            lines.push(format!("{} → 未配 binary", entry.name));
+            continue;
+        }
+        match crate::tool_install::which_binary(binary) {
+            Some(path) => lines.push(format!("{} → {binary}（{}）", entry.name, path.display())),
+            None => {
+                has_missing = true;
+                lines.push(format!("{} → {binary} 不在 PATH", entry.name));
+            }
+        }
+    }
+    lines.push(format!("require_arch={require_arch}"));
+    let detail = lines.join("；");
+
+    if has_bad_binary {
+        Check::fail(
+            "upgrade.tool",
+            "无状态工具组件缺 binary",
+            detail,
+            "在 [[upgrade.component]] 给 install=tool-copy 的项补上 binary（如 galaxy-ops → gops）",
+        )
+    } else if has_missing {
+        Check::warn("upgrade.tool", "无状态工具未装到 PATH", detail).with_hint(
+            "tool-copy 就地覆盖 PATH 上的原二进制：先把工具装上，或把 binary 指向绝对路径",
+        )
+    } else {
+        Check::ok(
+            "upgrade.tool",
+            format!("无状态工具组件可用（{} 个）", tools.len()),
+            detail,
+        )
+    }
+}
+
 /// 中心可达性：解析 endpoint → TCP 连通。
 fn reachability_check(config: &Config) -> Check {
     let endpoint = config.control_center_endpoint.trim();
@@ -493,6 +556,8 @@ mod tests {
             upgrade_project_dir: None,
             upgrade_project_name: None,
             upgrade_retry_on_dead: None,
+            upgrade_tool_require_arch: None,
+            upgrade: Default::default(),
         }
     }
 
@@ -704,5 +769,83 @@ mod tests {
             ("::1".to_string(), 9000)
         );
         assert!(parse_host_port("c.example").is_err());
+    }
+
+    // ── 无状态工具（tool-copy）组件体检 ──
+
+    use crate::config::{UpgradeComponentConfig, UpgradeInstall};
+
+    fn tool_component(name: &str, binary: Option<&str>) -> UpgradeComponentConfig {
+        UpgradeComponentConfig {
+            name: name.into(),
+            install: UpgradeInstall::ToolCopy,
+            binary: binary.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn no_tool_copy_components_is_ok() {
+        let dir = temp_dir("tool-none");
+        let cfg = config(&dir);
+        assert_eq!(status_of(&diagnose(&cfg), "upgrade.tool"), Status::Ok);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_tool_copy_component_without_a_binary_fails() {
+        let dir = temp_dir("tool-nobinary");
+        let mut cfg = config(&dir);
+        cfg.upgrade.component = vec![tool_component("galaxy-ops", None)];
+        assert_eq!(status_of(&diagnose(&cfg), "upgrade.tool"), Status::Fail);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_tool_copy_component_missing_from_path_warns() {
+        let dir = temp_dir("tool-missing");
+        let mut cfg = config(&dir);
+        // 绝对路径但不存在 → 定位不到（与安装前置同一判据）。
+        cfg.upgrade.component = vec![tool_component("galaxy-flow", Some("/nonexistent/gx"))];
+        assert_eq!(status_of(&diagnose(&cfg), "upgrade.tool"), Status::Warn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_tool_copy_component_present_on_path_is_ok_and_reports_arch_policy() {
+        let dir = temp_dir("tool-ok");
+        let bin = dir.join("gops");
+        std::fs::write(&bin, b"x").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let mut cfg = config(&dir);
+        cfg.upgrade.component = vec![tool_component("galaxy-ops", bin.to_str())];
+        let report = diagnose(&cfg);
+        let check = report.find("upgrade.tool").expect("check");
+        assert_eq!(check.status, Status::Ok);
+        assert!(check.detail.contains("galaxy-ops"), "{}", check.detail);
+        assert!(
+            check.detail.contains("require_arch=true"),
+            "{}",
+            check.detail
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_tool_check_reports_the_relaxed_arch_policy() {
+        let dir = temp_dir("tool-relaxed");
+        let mut cfg = config(&dir);
+        cfg.upgrade_tool_require_arch = Some(false);
+        let report = diagnose(&cfg);
+        let check = report.find("upgrade.tool").expect("check");
+        assert!(
+            check.detail.contains("require_arch=false"),
+            "{}",
+            check.detail
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -3,10 +3,36 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.1-alpha] - 2026-10-08
+
+### 变更
+
+- **拉升级目标时自述本机平台**：`GET /api/v1/gateway/upgrade-plan` 带上 `platform=<target-triple>`
+  （`HostTarget::target_triple`，如 `aarch64-apple-darwin`），中心据此挑**平台匹配**的制品下发地址。
+  多平台组件（`galaxy-ops` / `galaxy-flow`）此前会拿到错平台制品 —— 在架构护栏处拒装（
+  `架构校验失败，未覆盖 gops：制品操作系统 linux 与本机 macos 不符`）。认不出平台的 OS 不声明（退化为旧行为）。
+
 ## [0.6.0-alpha] - 2026-10-07
 
 ### 变更
 
+- **无状态工具安装前的摘要校验**（`tool-copy`）：覆盖原二进制**之前**先核制品 sha256 —— 期望值取自中心计划带的
+  `artifact_sha256`（有就用，`sha256:` 前缀/大小写容忍；形态不对即拒）＞制品名的内容寻址前缀
+  （`pkg-<sha256 前 16 位>`）。实得不符 → **拒装**，绝不用来路不明的字节覆盖本机工具。
+  `artifact_sha256` 不在 `wist-control` 0.9 的 `GatewayUpgradePlan` 里 —— 用 `#[serde(flatten)]` **宽容读取**：
+  中心带上就校验，不带（或契约未升）就自动回落内容寻址前缀，**不等契约升级也能用**。
+- **`diagnose` 新增 `upgrade.tool` 体检**：列出 `install=tool-copy` 的组件及其 `binary` / `PATH` 命中 / `require_arch`
+  策略；缺 `binary` → FAIL，`binary` 不在 `PATH` → WARN（直接对着「表面修了其实没生效、静默回退 gops」的坑）。
+- **无状态工具安装前的架构护栏**（`tool-copy`）：覆盖 `PATH` 上的原二进制**之前**先核制品 target-triple ——
+  架构/操作系统与本机**不符必拒**，**读不出**架构缺省也拒（配置 `upgrade_tool_require_arch = false` 才放宽「读不出」
+  这一种；已识别出的不符仍拒）。此前不校验，x86_64 制品会「装成功」却把 Darwin arm64 的 Mach-O 覆盖成
+  Linux ELF，工具**静默报废**。判定**整段精确比**（不用 `contains`，32 位 x86 宿主不会误放行 `x86_64`）、与词表
+  顺序无关，也不把组件名里的架构词（`wist-arm-tool-…`）误当三元组。识别口径与发布域同源（新模块 `src/target.rs`）。
+- **取件来源形状前置校验**（`tool-copy`）：来源必须是 `https://…` 或 `/abs/path`。中心没派 `artifact_url`、只剩裸
+  版本串时**报可读失败**，不再把它当 URL 去误取。
+- **解包定位放宽**：`tool-copy` 找包内二进制的最大深度 4 → 16 层（报错里列出的包内文件也相应增多），覆盖更深一层
+  的布局。
+- **解包对 `..` 条目的行为写明**：`tar` 的路径穿越条目会被**静默跳过**（不报错、也不写到目标之外）—— 补测固定该行为。
 - **升级执行前的前置校验**：gops 缺工程根（`upgrade_project_dir` 未设 / 无 `ops-prj.yml`）时**不再把执行器发出去**，
   直接落可读失败并回执（此前只会在退出码 255 上失败、还读不出原因）。
 - **按中心派生的制品地址取件**：计划带的 `artifact_url` 交给执行器作 `--to <url>`；台账与回执仍记**版本**。

@@ -12,6 +12,20 @@ use wist_control::{
     ReportGatewayUpgradeResult,
 };
 
+/// 升级目标 + **宽容读取**的可选附加件。
+///
+/// `artifact_sha256` 目前不在 `wist-control` 0.9 的 [`GatewayUpgradePlan`] 里。用
+/// `#[serde(flatten)]` 宽容读取：中心带上（并校验）就用，不带（或契约未升）就为 `None`，不报错
+/// —— 不用等契约升级就能先用上摘要校验。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GatewayUpgradeTarget {
+    #[serde(flatten)]
+    pub plan: GatewayUpgradePlan,
+    /// 中心派发计划可带的**期望制品摘要**（sha256，裸 hex / `sha256:` 前缀）。
+    #[serde(default)]
+    pub artifact_sha256: Option<String>,
+}
+
 /// 单次请求超时（避免中心/网关半死把常驻循环卡住）。
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -122,6 +136,13 @@ impl CenterClient {
         &self.endpoint
     }
 
+    /// 取制品的 HTTP 客户端（与中心调用同源：带信任锚 / 客户端证书）。
+    ///
+    /// 无状态工具安装取制品（中心派生的制品地址）复用它 —— **自签中心**也能拉（制品端点本身不鉴权）。
+    pub fn artifact_http_client(&self) -> reqwest::Client {
+        self.http.clone()
+    }
+
     /// 链接上级：`GET /api/v1/gateway/link-upstream?gateway_id=`。
     ///
     /// **只用于首跑置备**（本地还没有客户端证书时）：`Bearer <link>` +
@@ -216,16 +237,25 @@ impl CenterClient {
         decode(response, "renew").await
     }
 
-    /// 取升级目标：`GET /api/v1/gateway/upgrade-plan?gateway_id=`（客户端证书 mTLS 鉴权）。
+    /// 取升级目标：`GET /api/v1/gateway/upgrade-plan?gateway_id=&platform=`（客户端证书 mTLS 鉴权）。
+    ///
+    /// `platform` 为本机 target-triple（见 [`crate::target::HostTarget::target_triple`]）：
+    /// 中心据此挑**平台匹配**的制品下发地址。多平台组件（`galaxy-ops` / `galaxy-flow`）不声明
+    /// 平台，中心无从判定，只会拿到错平台制品 —— 在架构护栏处拒装、升级直接失败。
     pub async fn get_upgrade_plan(
         &self,
         gateway_id: &str,
-    ) -> Result<GatewayUpgradePlan, CenterError> {
+        platform: Option<&str>,
+    ) -> Result<GatewayUpgradeTarget, CenterError> {
         let url = format!("{}/api/v1/gateway/upgrade-plan", self.endpoint);
+        let mut query: Vec<(&str, &str)> = vec![("gateway_id", gateway_id)];
+        if let Some(platform) = platform {
+            query.push(("platform", platform));
+        }
         let response = self
             .http
             .get(url)
-            .query(&[("gateway_id", gateway_id)])
+            .query(&query)
             .send()
             .await
             .map_err(|err| CenterError::Other(format!("upgrade-plan 请求失败: {err}")))?;
@@ -316,15 +346,77 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// 同 [`one_shot_server`]，但把收到的原始请求回传（断言 query 参数用）。
+    async fn one_shot_server_capturing(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0_u8; 2048];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buffer[..read]).to_string());
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[tokio::test]
+    async fn upgrade_plan_declares_the_local_platform_to_the_center() {
+        let (endpoint, request) = one_shot_server_capturing(
+            "200 OK",
+            r#"{"gateway_id":"gw-1","has_plan":false,"plan_id":null,"component":null,"to_version":null}"#,
+        )
+        .await;
+        let client = CenterClient::new(endpoint);
+        let _ = client
+            .get_upgrade_plan("gw-1", Some("aarch64-apple-darwin"))
+            .await
+            .expect("plan");
+        let request = request.await.expect("request captured");
+        assert!(request.contains("gateway_id=gw-1"), "{request}");
+        assert!(
+            request.contains("platform=aarch64-apple-darwin"),
+            "{request}"
+        );
+    }
+
     #[tokio::test]
     async fn upgrade_plan_parses_a_success_response() {
         let endpoint =
             one_shot_server("200 OK", r#"{"gateway_id":"gw-1","has_plan":false,"plan_id":null,"component":null,"to_version":null}"#)
                 .await;
         let client = CenterClient::new(endpoint);
-        let plan = client.get_upgrade_plan("gw-1").await.expect("plan");
-        assert!(!plan.has_plan);
-        assert_eq!(plan.gateway_id, "gw-1");
+        let plan = client.get_upgrade_plan("gw-1", None).await.expect("plan");
+        assert!(!plan.plan.has_plan);
+        assert_eq!(plan.plan.gateway_id, "gw-1");
+        assert!(plan.artifact_sha256.is_none());
+    }
+
+    /// 中心带上 `artifact_sha256`（契约尚未固定）→ 宽容读出来；不带则 `None`。
+    #[tokio::test]
+    async fn upgrade_plan_tolerantly_reads_an_optional_artifact_sha256() {
+        let endpoint = one_shot_server(
+            "200 OK",
+            r#"{"gateway_id":"gw-1","has_plan":true,"plan_id":"plan-1","component":"galaxy-ops","to_version":"v0.18.2","artifact_url":"https://c/pkg-955e0dc75215c3a6","artifact_sha256":"sha256:deadbeef"}"#,
+        )
+        .await;
+        let client = CenterClient::new(endpoint);
+        let target = client.get_upgrade_plan("gw-1", None).await.expect("plan");
+        assert!(target.plan.has_plan);
+        assert_eq!(target.plan.component.as_deref(), Some("galaxy-ops"));
+        assert_eq!(target.artifact_sha256.as_deref(), Some("sha256:deadbeef"));
     }
 
     #[tokio::test]
@@ -334,7 +426,7 @@ mod tests {
             one_shot_server("401 Unauthorized", r#"{"error":"invalid rt_401 token"}"#).await;
         let client = CenterClient::new(endpoint);
         let err = client
-            .get_upgrade_plan("gw-1")
+            .get_upgrade_plan("gw-1", None)
             .await
             .expect_err("must fail");
         assert!(err.is_unauthorized(), "{err}");

@@ -20,6 +20,8 @@ pub mod linkd_status;
 pub mod selfreport;
 pub mod service;
 pub mod state;
+pub mod target;
+pub mod tool_install;
 pub mod upgrade;
 
 /// 当前版本（由 gx 同步 `Cargo.toml` / `version.txt`）。

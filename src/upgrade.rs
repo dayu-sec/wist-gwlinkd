@@ -15,9 +15,10 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 
 use crate::center::CenterClient;
-use crate::executor::{ExecutorInvocation, UpgradeExecutor};
+use crate::executor::{ExecutorInvocation, Outcome, UpgradeExecutor};
 use crate::selfreport::SelfReportClient;
 use crate::state::{self, UpgradeRecord};
+use crate::tool_install::ToolInstaller;
 
 /// 升级执行器日志文件（放状态目录，运维固定地方找）。
 pub const UPGRADER_LOG_FILE: &str = "wist-upgrader.log";
@@ -53,6 +54,8 @@ pub struct UpgradeDriver {
     pub state_dir: PathBuf,
     /// 成功佐证的观测窗口（执行器报成后，等网关自述面恢复健康的最长时间）。
     pub verify_timeout: Duration,
+    /// **无状态工具**的进程内安装器：目录里标了 `tool-copy` 的组件走它（不经 gops）。缺省无。
+    pub tools: Option<Arc<ToolInstaller>>,
 }
 
 impl UpgradeDriver {
@@ -62,6 +65,7 @@ impl UpgradeDriver {
             executor: Arc::new(executor),
             state_dir: state_dir.into(),
             verify_timeout: RECOVERY_VERIFY_TIMEOUT,
+            tools: None,
         }
     }
 
@@ -71,7 +75,78 @@ impl UpgradeDriver {
         self
     }
 
-    /// 驱动一次升级：写 `running` 记录，起执行器，**升级期间持续刷心跳**；执行器结束后写终态记录，
+    /// 装配无状态工具的进程内安装器（目录里标了 `tool-copy` 的组件走它）。
+    pub fn with_tools(mut self, tools: ToolInstaller) -> Self {
+        self.tools = Some(Arc::new(tools));
+        self
+    }
+
+    /// 驱动一次升级：按**组件目录**判机制 —— 标了 `tool-copy` 的组件走
+    /// [`Self::start_tool`]（进程内装无状态工具），其余走 [`Self::start_gops`]（gops 执行器）。
+    ///
+    /// 不额外声明期望摘要：无状态工具路径会从**内容寻址的制品名**（`pkg-<hex16>`）自推前缀校验。
+    pub async fn start(
+        &self,
+        work_id: &str,
+        from_version: &str,
+        to_version: &str,
+        component: Option<&str>,
+        reporter: Option<UpgradeReporter>,
+        artifact_url: Option<&str>,
+    ) -> Result<(), String> {
+        self.start_with_digest(
+            work_id,
+            from_version,
+            to_version,
+            component,
+            reporter,
+            artifact_url,
+            None,
+        )
+        .await
+    }
+
+    /// 同 [`Self::start`]，但额外带**中心契约的期望摘要**（`artifact_sha256`）。
+    ///
+    /// gops 路径忽略它（执行器自己取件自验）；无状态工具路径用它该校 `tool-copy` 取的制品。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_digest(
+        &self,
+        work_id: &str,
+        from_version: &str,
+        to_version: &str,
+        component: Option<&str>,
+        reporter: Option<UpgradeReporter>,
+        artifact_url: Option<&str>,
+        expected_sha256: Option<&str>,
+    ) -> Result<(), String> {
+        if let (Some(tools), Some(component)) = (self.tools.as_ref(), component)
+            && tools.handles(component)
+        {
+            return self
+                .start_tool(
+                    work_id,
+                    from_version,
+                    to_version,
+                    component,
+                    reporter,
+                    artifact_url,
+                    expected_sha256,
+                )
+                .await;
+        }
+        self.start_gops(
+            work_id,
+            from_version,
+            to_version,
+            component,
+            reporter,
+            artifact_url,
+        )
+        .await
+    }
+
+    /// 驱动一次升级（gops 执行器）：写 `running` 记录，起执行器，**升级期间持续刷心跳**；执行器结束后写终态记录，
     /// （若报成）用自述面**佐证**「网关确实回来了」，再（若给了 `reporter`）**回执**中心。
     ///
     /// 心跳生产者就是本进程：它持有子进程句柄，知道执行器还活着 —— 这正是「判死判据」需要的信号源
@@ -81,7 +156,7 @@ impl UpgradeDriver {
     ///
     /// [`artifact_url`]：中心**派生**的制品下发地址。执行器取件的 `--to` 用它（`gops --to <url>`）；
     /// 为 `None`（无对应 release）才回落用 [`to_version`]。**台账与回执仍记 `to_version`**（版本）。
-    pub async fn start(
+    async fn start_gops(
         &self,
         work_id: &str,
         from_version: &str,
@@ -270,6 +345,106 @@ impl UpgradeDriver {
         });
         Ok(())
     }
+
+    /// 驱动一次升级（**进程内装无状态工具**）：写 `running` 记录 → 后台取制品 / 核摘要 / 核架构 / 解包 / 覆盖。
+    ///
+    /// 与 [`Self::start_gops`] 的差别：**不起子进程**（解包 + 覆盖在本进程 blocking 线程里做）、
+    /// **不做成功佐证**（工具不影响网关容器/自述面 —— 佐证无对象）。取制品用带信任锚的 HTTP 客户端。
+    #[allow(clippy::too_many_arguments)]
+    async fn start_tool(
+        &self,
+        work_id: &str,
+        from_version: &str,
+        to_version: &str,
+        component: &str,
+        reporter: Option<UpgradeReporter>,
+        artifact_url: Option<&str>,
+        expected_sha256: Option<&str>,
+    ) -> Result<(), String> {
+        let tools = Arc::clone(self.tools.as_ref().expect("tool 路径必经 with_tools 装配"));
+        let mut record = UpgradeRecord {
+            work_id: work_id.to_string(),
+            from_version: from_version.to_string(),
+            to_version: to_version.to_string(),
+            step: "fetch".to_string(),
+            status: "running".to_string(),
+            detail: String::new(),
+        };
+        state::write_upgrade_record(&self.state_dir, &record)?;
+        state::touch_heartbeat(&self.state_dir)?;
+
+        // 前置：组件在目录里、binary 能定位（找不到就**别发** —— 发出去只会以不可读的方式失败）。
+        if let Err(reason) = tools.preflight(component).map(|_| ()) {
+            record.step = "preflight".to_string();
+            record.status = "failed".to_string();
+            record.detail = reason.clone();
+            if let Err(werr) = state::write_upgrade_record(&self.state_dir, &record) {
+                eprintln!("event=UpgradeRecordWriteFailed error={werr}");
+            }
+            if let Some(reporter) = reporter {
+                report_record(&reporter, &record).await;
+            }
+            return Err(reason);
+        }
+
+        let state_dir = self.state_dir.clone();
+        let component = component.to_string();
+        let artifact = artifact_url.unwrap_or(to_version).to_string();
+        // 摘要要在 spawn 前转成 owned（异步块要求 'static）。
+        let expected_sha256 = expected_sha256.map(str::to_string);
+        tokio::spawn(async move {
+            // 心跳生产者覆盖**整个安装事务**（取制品 + 解包 + 覆盖可能跨多秒）。
+            let heartbeat_state = state_dir.clone();
+            let _heartbeat = AbortOnDrop(tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+                loop {
+                    ticker.tick().await;
+                    if let Err(err) = state::touch_heartbeat(&heartbeat_state) {
+                        eprintln!("event=UpgradeHeartbeatFailed error={err}");
+                    }
+                }
+            }));
+
+            // 进安装步就把台账步进到 install，诊断看起来才与事实一致。
+            record.step = "install".to_string();
+            if let Err(err) = state::write_upgrade_record(&state_dir, &record) {
+                eprintln!("event=UpgradeRecordWriteFailed error={err}");
+            }
+
+            let outcome = match tools
+                .install_with_digest(&component, &artifact, expected_sha256.as_deref())
+                .await
+            {
+                Ok(detail) => Outcome {
+                    ok: true,
+                    status: "done".to_string(),
+                    step: "install".to_string(),
+                    detail,
+                },
+                Err(reason) => {
+                    eprintln!("event=ToolInstallFailed component={component} {reason}");
+                    Outcome {
+                        ok: false,
+                        status: "failed".to_string(),
+                        step: "install".to_string(),
+                        detail: reason,
+                    }
+                }
+            };
+
+            record.status = outcome.status;
+            record.step = outcome.step;
+            record.detail = outcome.detail;
+            if let Err(err) = state::write_upgrade_record(&state_dir, &record) {
+                eprintln!("event=UpgradeRecordWriteFailed error={err}");
+            }
+            if let Some(reporter) = reporter {
+                // 回执**现读**最新凭据（安装可能跨多次心跳，期间可能已 renew）。
+                report_record(&reporter, &record).await;
+            }
+        });
+        Ok(())
+    }
 }
 
 /// 把一条终态记录回执给中心（现读最新凭据；无长期身份就跳过）。
@@ -391,6 +566,7 @@ fn outcome_of(status: std::io::Result<ExitStatus>) -> (bool, String) {
 mod tests {
     use super::*;
     use crate::executor::{GopsExecutor, Outcome};
+    use crate::target::HostTarget;
     use std::path::Path;
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -431,6 +607,25 @@ mod tests {
     fn gops_script(dir: &Path, program: String) -> GopsExecutor {
         std::fs::write(dir.join("ops-prj.yml"), "kind: ops\n").expect("write ops-prj.yml");
         GopsExecutor::new(program).with_project(Some(dir.to_path_buf()), None)
+    }
+
+    /// 造一个 tar.gz：包内单条目 `entry` = `payload`。
+    fn tool_archive(entry: &str, payload: &[u8]) -> Vec<u8> {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, entry, payload)
+                .expect("append");
+            builder.finish().expect("finish");
+        }
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &tar_bytes).expect("gzip");
+        encoder.finish().expect("gzip finish")
     }
 
     #[test]
@@ -689,6 +884,218 @@ mod tests {
         assert_eq!(record.status, "done");
         assert_eq!(record.step, "custom");
         assert_eq!(record.detail, "by custom executor");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 目录里标了 `tool-copy` 的组件走**进程内安装**（解包覆盖），**不经 gops 执行器**，也不佐证。
+    #[tokio::test]
+    async fn a_tool_copy_component_is_installed_in_process_not_via_gops() {
+        use std::collections::BTreeMap;
+
+        let dir = temp_dir("tool-route");
+        // 已安装的工具（原位置，可执行）与待装的制品。
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin");
+        let target = write_exec(&bin_dir, "gops", "OLD");
+        let artifact = dir.join("galaxy-ops.tar.gz");
+        std::fs::write(
+            &artifact,
+            tool_archive("galaxy-ops-0.1.0-aarch64-apple-darwin/gops", b"NEW"),
+        )
+        .expect("artifact");
+
+        // 若路由错走 gops，这个脚本会落下 args.txt —— 用它证明「没走 gops」。
+        let gops = GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string());
+        let tools = ToolInstaller::new(
+            BTreeMap::from([(
+                "galaxy-ops".to_string(),
+                target.to_string_lossy().to_string(),
+            )]),
+            &dir,
+            reqwest::Client::new(),
+        )
+        .with_host_target(HostTarget::new("aarch64", "macos", true));
+        let driver = UpgradeDriver::new(gops, &dir).with_tools(tools);
+        driver
+            .start(
+                "w-tool",
+                "0.0.1",
+                "0.1.0",
+                Some("galaxy-ops"),
+                None,
+                Some(artifact.to_string_lossy().as_ref()),
+            )
+            .await
+            .expect("start");
+
+        let record = wait_terminal(&dir).await;
+        assert_eq!(record.status, "done");
+        assert_eq!(record.step, "install");
+        assert!(
+            record.detail.contains("已就地覆盖 gops"),
+            "{}",
+            record.detail
+        );
+        assert_eq!(std::fs::read(&target).expect("read"), b"NEW");
+        assert!(!dir.join("args.txt").exists(), "不该走 gops 执行器");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 标了 `tool-copy` 但制品架构与本机不符 → 落**可读失败**，旧二进制原封不动（不经 gops）。
+    #[tokio::test]
+    async fn a_tool_copy_component_with_a_mismatched_arch_fails_without_touching_the_binary() {
+        use std::collections::BTreeMap;
+
+        let dir = temp_dir("tool-arch-mismatch");
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin");
+        let target = write_exec(&bin_dir, "gx", "OLD");
+        // macOS arm64 宿主上的 x86_64 Linux 制品 —— 覆盖上去会让工具静默报废。
+        let artifact = dir.join("galaxy-flow.tar.gz");
+        std::fs::write(
+            &artifact,
+            tool_archive("galaxy-flow-0.15.1-x86_64-unknown-linux-musl/gx", b"NEW"),
+        )
+        .expect("artifact");
+
+        let gops = GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string());
+        let tools = ToolInstaller::new(
+            BTreeMap::from([(
+                "galaxy-flow".to_string(),
+                target.to_string_lossy().to_string(),
+            )]),
+            &dir,
+            reqwest::Client::new(),
+        )
+        .with_host_target(HostTarget::new("aarch64", "macos", true));
+        let driver = UpgradeDriver::new(gops, &dir).with_tools(tools);
+        driver
+            .start(
+                "w-tool-arch",
+                "0.0.1",
+                "0.15.1",
+                Some("galaxy-flow"),
+                None,
+                Some(artifact.to_string_lossy().as_ref()),
+            )
+            .await
+            .expect("start");
+
+        let record = wait_terminal(&dir).await;
+        assert_eq!(record.status, "failed");
+        assert!(record.detail.contains("架构校验失败"), "{}", record.detail);
+        assert_eq!(
+            std::fs::read(&target).expect("read"),
+            b"OLD",
+            "错架构制品绝不得覆盖旧二进制"
+        );
+        assert!(!dir.join("args.txt").exists(), "不该走 gops 执行器");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 放宽架构要求（`require_verified_arch=false`）：读不出架构的制品能装上，且成功说明标注「不可校验」。
+    #[tokio::test]
+    async fn a_relaxed_tool_copy_installs_an_unverifiable_artifact() {
+        use std::collections::BTreeMap;
+
+        let dir = temp_dir("tool-arch-relaxed");
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin");
+        let target = write_exec(&bin_dir, "gops", "OLD");
+        // 包内与文件名都不带三元组（也不是内容寻址名）。
+        let artifact = dir.join("pkg-unnamed");
+        std::fs::write(&artifact, tool_archive("pkg/gops", b"NEW")).expect("artifact");
+
+        let gops = GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string());
+        let tools = ToolInstaller::new(
+            BTreeMap::from([(
+                "galaxy-ops".to_string(),
+                target.to_string_lossy().to_string(),
+            )]),
+            &dir,
+            reqwest::Client::new(),
+        )
+        .with_host_target(HostTarget::new("aarch64", "macos", true))
+        .with_require_verified_arch(false);
+        let driver = UpgradeDriver::new(gops, &dir).with_tools(tools);
+        driver
+            .start(
+                "w-tool-relaxed",
+                "0.0.1",
+                "0.1.0",
+                Some("galaxy-ops"),
+                None,
+                Some(artifact.to_string_lossy().as_ref()),
+            )
+            .await
+            .expect("start");
+
+        let record = wait_terminal(&dir).await;
+        assert_eq!(record.status, "done");
+        assert!(record.detail.contains("架构不可校验"), "{}", record.detail);
+        assert_eq!(std::fs::read(&target).expect("read"), b"NEW");
+        assert!(!dir.join("args.txt").exists(), "不该走 gops 执行器");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 标了 `tool-copy` 但 `binary` 在 `PATH` 上找不到 → **发之前**就落可读失败（不静默回落 gops）。
+    #[tokio::test]
+    async fn a_tool_copy_component_without_a_located_binary_fails_before_install() {
+        use std::collections::BTreeMap;
+
+        let dir = temp_dir("tool-preflight");
+        let gops = GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string());
+        let tools = ToolInstaller::new(
+            BTreeMap::from([("galaxy-flow".to_string(), "/nonexistent/gx".to_string())]),
+            &dir,
+            reqwest::Client::new(),
+        );
+        let driver = UpgradeDriver::new(gops, &dir).with_tools(tools);
+        let err = driver
+            .start("w-tool", "0.0.1", "0.1.0", Some("galaxy-flow"), None, None)
+            .await
+            .expect_err("preflight must fail");
+        assert!(err.contains("PATH"), "{err}");
+        let record = state::read_upgrade_record(&dir).expect("record");
+        assert_eq!(record.status, "failed");
+        assert_eq!(record.step, "preflight");
+        assert!(!dir.join("args.txt").exists(), "不该发执行器");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 装了工具安装器，但**组件不在目录里** → 仍走 gops 执行器（工具目录不是一刀切）。
+    #[tokio::test]
+    async fn a_component_outside_the_tool_catalog_still_goes_to_gops() {
+        use std::collections::BTreeMap;
+
+        let dir = temp_dir("tool-route-fallback");
+        let tools = ToolInstaller::new(
+            BTreeMap::from([("galaxy-ops".to_string(), "/bin/true".to_string())]),
+            &dir,
+            reqwest::Client::new(),
+        );
+        let driver = UpgradeDriver::new(
+            GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string()),
+            &dir,
+        )
+        .with_tools(tools);
+        driver
+            .start(
+                "w-g",
+                "0.1.0",
+                "0.1.16",
+                Some("wist-gateway-stack"),
+                None,
+                None,
+            )
+            .await
+            .expect("start");
+
+        let record = wait_terminal(&dir).await;
+        assert_eq!(record.status, "done");
+        // 走了 gops：记录脚本落下 args.txt，且没有工具安装的痕迹。
+        assert!(dir.join("args.txt").exists(), "应走 gops 执行器");
+        assert!(!record.detail.contains("就地覆盖"), "{}", record.detail);
         let _ = std::fs::remove_dir_all(dir);
     }
 

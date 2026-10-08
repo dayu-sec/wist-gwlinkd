@@ -1,12 +1,13 @@
 //! `wist-gwlinkd` CLI：`run`（常驻，默认）/ `diagnose` / `service` / `version`。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime};
 
 use wist_control::{DateTime, ReportGatewayStatus};
-use wist_gwlinkd::center::{self, CenterClient, CenterError};
-use wist_gwlinkd::config::Config;
+use wist_gwlinkd::center::{self, CenterClient, CenterError, GatewayUpgradeTarget};
+use wist_gwlinkd::config::{Config, UpgradeInstall};
 use wist_gwlinkd::doctor::{self, Status};
 use wist_gwlinkd::executor::{DEFAULT_ON_FAILURE, DEFAULT_UPGRADER_PROGRAM, GopsExecutor};
 use wist_gwlinkd::identity;
@@ -17,6 +18,7 @@ use wist_gwlinkd::linkd_status::{
 use wist_gwlinkd::selfreport::SelfReportClient;
 use wist_gwlinkd::service;
 use wist_gwlinkd::state::{self, CredentialStatus, UpgradeCursor};
+use wist_gwlinkd::tool_install::ToolInstaller;
 use wist_gwlinkd::upgrade::{RECOVERY_VERIFY_TIMEOUT, UpgradeDriver, UpgradeReporter};
 
 /// 运行期状态上报周期（秒）。
@@ -124,7 +126,7 @@ async fn run(config: &Config) -> Result<(), String> {
         None => None,
     };
     let renew_lead = config.renew_lead_seconds.unwrap_or(3600);
-    let driver = UpgradeDriver::new(
+    let mut driver = UpgradeDriver::new(
         GopsExecutor::new(
             config
                 .upgrader_program
@@ -152,6 +154,37 @@ async fn run(config: &Config) -> Result<(), String> {
             .upgrade_verify_timeout_seconds
             .unwrap_or(RECOVERY_VERIFY_TIMEOUT.as_secs()),
     ));
+    // 无状态工具目录（`[[upgrade.component]] install = "tool-copy"`）：装配进程内安装器。
+    // 这类组件不经 gops 工程（也就绕开 `upgrade_project_dir` 前置），就地覆盖 `PATH` 上的二进制。
+    let tool_binaries: BTreeMap<String, String> = config
+        .upgrade
+        .component
+        .iter()
+        .filter(|entry| entry.install == UpgradeInstall::ToolCopy)
+        .map(|entry| {
+            if entry.binary.as_deref().unwrap_or("").trim().is_empty() {
+                eprintln!(
+                    "event=UpgradeComponentInvalid name={} install=tool-copy 缺 binary（将没法安装）",
+                    entry.name
+                );
+            }
+            (
+                entry.name.clone(),
+                entry.binary.clone().unwrap_or_default(),
+            )
+        })
+        .collect();
+    if !tool_binaries.is_empty() {
+        driver = driver.with_tools(
+            ToolInstaller::new(
+                tool_binaries,
+                config.state_dir.clone(),
+                client.artifact_http_client(),
+            )
+            // 缺省要求制品架构可校验且与本机一致（错架构会静默报废工具）。
+            .with_require_verified_arch(config.upgrade_tool_require_arch.unwrap_or(true)),
+        );
+    }
 
     let mut ticker = tokio::time::interval(Duration::from_secs(STATUS_INTERVAL_SECS));
     // 一轮里有多次（30s 超时）的网络调用；慢轮后别突发补 tick。
@@ -271,8 +304,18 @@ async fn run(config: &Config) -> Result<(), String> {
 
         // 拉升级目标（CR-002 C2）：有在飞升级则**互斥跳过**；否则「未驱过的计划」才驱动。
         if !state::upgrade_in_flight(&config.state_dir, SystemTime::now()) {
-            match client.get_upgrade_plan(&config.gateway_id).await {
-                Ok(plan) if plan.has_plan => {
+            // 向中心声明本机平台（target-triple）：中心据此挑平台匹配的制品下发地址
+            // （多平台组件不声明就会拿到错平台制品）。认不出平台的罕见主机退化为不声明。
+            let host_platform = wist_gwlinkd::target::HostTarget::detect().target_triple();
+            match client
+                .get_upgrade_plan(&config.gateway_id, host_platform.as_deref())
+                .await
+            {
+                Ok(target) if target.plan.has_plan => {
+                    let GatewayUpgradeTarget {
+                        plan,
+                        artifact_sha256,
+                    } = target;
                     let cursor = state::load_upgrade_cursor(&config.state_dir);
                     let already = plan.plan_id.is_some() && plan.plan_id == cursor.last_plan_id;
                     let to_version = plan.to_version.clone().unwrap_or_default();
@@ -284,8 +327,10 @@ async fn run(config: &Config) -> Result<(), String> {
                             cursor.last_to_version.clone()
                         };
                         println!(
-                            "event=UpgradeDriven plan_id={:?} to_version={to_version} component={:?}",
-                            plan.plan_id, plan.component
+                            "event=UpgradeDriven plan_id={:?} to_version={to_version} component={:?} sha256={}",
+                            plan.plan_id,
+                            plan.component,
+                            artifact_sha256.is_some()
                         );
                         let reporter = UpgradeReporter {
                             client: client.clone(),
@@ -294,7 +339,7 @@ async fn run(config: &Config) -> Result<(), String> {
                         };
                         // **不**用 `?`：驱动失败（执行器缺失/架构不符…）绝不能把链路常驻整个拖死。
                         match driver
-                            .start(
+                            .start_with_digest(
                                 plan.plan_id.as_deref().unwrap_or("plan"),
                                 &from_version,
                                 &to_version,
@@ -302,6 +347,8 @@ async fn run(config: &Config) -> Result<(), String> {
                                 Some(reporter),
                                 // 中心派生的制品地址（执行器取件用它）；无则回落 `to_version`。
                                 plan.artifact_url.as_deref(),
+                                // 中心带的期望摘要（契约未固定，宽容读取）；gops 路径忽略它。
+                                artifact_sha256.as_deref(),
                             )
                             .await
                         {
@@ -1003,6 +1050,8 @@ mod tests {
             upgrade_project_dir: None,
             upgrade_project_name: None,
             upgrade_retry_on_dead: None,
+            upgrade_tool_require_arch: None,
+            upgrade: Default::default(),
         }
     }
 

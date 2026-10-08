@@ -52,6 +52,48 @@ pub struct Config {
     /// - `false`：仅报告，交由**管理面重派**（更保守，但机器会停在中间态直到人工介入）。
     #[serde(default)]
     pub upgrade_retry_on_dead: Option<bool>,
+    /// 无状态工具（`tool-copy`）安装前是否**要求制品架构可校验且与本机一致**（缺省 `true`）。
+    ///
+    /// - `true`（缺省）：制品读不出 target-triple、或与本机架构 / 操作系统不符 → **拒装**
+    ///   （宁可失败，也不用错架构的二进制覆盖本机工具 —— 那会静默报废工具）；
+    /// - `false`：只放宽「读不出架构」这一种（记一笔事件后放行）；**已识别出的架构不符仍拒**。
+    #[serde(default)]
+    pub upgrade_tool_require_arch: Option<bool>,
+    /// `[upgrade]` 段：本机**组件目录**（其余扁平 `upgrade_*` 键保持原样）。
+    #[serde(default, rename = "upgrade")]
+    pub upgrade: UpgradeSection,
+}
+
+/// `[upgrade]` 段。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct UpgradeSection {
+    /// 本机组件目录（`[[upgrade.component]]`）：计划里的组件名 → 本机安装机制。
+    #[serde(default)]
+    pub component: Vec<UpgradeComponentConfig>,
+}
+
+/// 一个本机组件的安装口径。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct UpgradeComponentConfig {
+    /// 计划里的组件名（与中心发布的 release `component` 对齐）。
+    pub name: String,
+    /// 安装机制；缺省 `gops-project`（向后兼容：不在目录里的组件也走 gops）。
+    #[serde(default)]
+    pub install: UpgradeInstall,
+    /// 二进制名（`tool-copy` 用）：据此在 `PATH` 上定位**原位置**（如 `galaxy-ops` → `gops`）。
+    #[serde(default)]
+    pub binary: Option<String>,
+}
+
+/// 组件安装机制。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpgradeInstall {
+    /// 交给 `gops prj upgrade`（缺省）—— 需要 `upgrade_project_dir` 工程根。
+    #[default]
+    GopsProject,
+    /// **无状态工具**：解包制品后把二进制**复制覆盖**到它在 `PATH` 上的原位置（旧版备份），不经 gops。
+    ToolCopy,
 }
 
 impl Config {
@@ -94,6 +136,78 @@ mod tests {
         assert!(config.upgrade_project_dir.is_none());
         assert!(config.upgrade_project_name.is_none());
         assert!(config.upgrade_retry_on_dead.is_none());
+        assert!(config.upgrade_tool_require_arch.is_none());
+        assert!(config.upgrade.component.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn upgrade_component_catalog_parses_with_a_default_install() {
+        let dir = temp_dir("components");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\n\n\
+             [[upgrade.component]]\nname = \"galaxy-ops\"\ninstall = \"tool-copy\"\nbinary = \"gops\"\n\n\
+             [[upgrade.component]]\nname = \"galaxy-flow\"\ninstall = \"tool-copy\"\nbinary = \"gx\"\n\n\
+             [[upgrade.component]]\nname = \"wist-gateway-stack\"\n",
+        )
+        .expect("write");
+        let config = Config::load(&path).expect("load");
+        assert_eq!(config.upgrade.component.len(), 3);
+        assert_eq!(config.upgrade.component[0].name, "galaxy-ops");
+        assert_eq!(
+            config.upgrade.component[0].install,
+            UpgradeInstall::ToolCopy
+        );
+        assert_eq!(config.upgrade.component[0].binary.as_deref(), Some("gops"));
+        assert_eq!(config.upgrade.component[1].binary.as_deref(), Some("gx"));
+        // 不写 install → 缺省 gops-project（向后兼容）。
+        assert_eq!(
+            config.upgrade.component[2].install,
+            UpgradeInstall::GopsProject
+        );
+        assert!(config.upgrade.component[2].binary.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn install_defaults_to_gops_project_and_parses_kebab_case() {
+        assert_eq!(UpgradeInstall::default(), UpgradeInstall::GopsProject);
+
+        let dir = temp_dir("install-values");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\n\n\
+             [[upgrade.component]]\nname = \"a\"\ninstall = \"gops-project\"\n\n\
+             [[upgrade.component]]\nname = \"b\"\ninstall = \"tool-copy\"\nbinary = \"gx\"\n",
+        )
+        .expect("write");
+        let config = Config::load(&path).expect("load");
+        assert_eq!(
+            config.upgrade.component[0].install,
+            UpgradeInstall::GopsProject
+        );
+        assert_eq!(
+            config.upgrade.component[1].install,
+            UpgradeInstall::ToolCopy
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unknown_install_value_is_rejected() {
+        let dir = temp_dir("install-bogus");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\n\n\
+             [[upgrade.component]]\nname = \"a\"\ninstall = \"bogus\"\n",
+        )
+        .expect("write");
+        let err = Config::load(&path).expect_err("unknown install must be rejected");
+        assert!(err.contains("配置"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -150,6 +264,20 @@ mod tests {
         );
         assert_eq!(config.upgrade_project_name.as_deref(), Some("wist-gateway"));
         assert_eq!(config.upgrade_retry_on_dead, Some(false));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tool_arch_requirement_parses_when_present() {
+        let dir = temp_dir("tool-arch-knob");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\nupgrade_tool_require_arch = false\n",
+        )
+        .expect("write");
+        let config = Config::load(&path).expect("load");
+        assert_eq!(config.upgrade_tool_require_arch, Some(false));
         let _ = std::fs::remove_dir_all(dir);
     }
 

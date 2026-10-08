@@ -72,6 +72,18 @@ upgrade_health_timeout_seconds = 120               # 健康检查超时（给 go
 upgrade_project_dir = "/opt/wist/gateway-prj"      # gops 工程根（含 ops-prj.yml；gops 从 cwd 解析）
 upgrade_project_name = "wist-gateway"              # 只升该系统（缺省 = 全部已导入系统）
 upgrade_retry_on_dead = true                       # 判死后是否自动重驱同一计划（false = 只交管理面重派）
+upgrade_tool_require_arch = true                   # tool-copy：要求制品架构可校验且与本机一致（缺省 true）
+
+# 本机组件目录：计划里的组件名 → 本机安装机制（缺省 gops-project）。
+# `tool-copy` = **无状态工具**：解包制品后把二进制复制覆盖到它在 PATH 上的原位置（不经 gops 工程）。
+[[upgrade.component]]
+name = "galaxy-ops"
+install = "tool-copy"
+binary = "gops"
+[[upgrade.component]]
+name = "galaxy-flow"
+install = "tool-copy"
+binary = "gx"
 ```
 
 环境变量：`WIST_GWLINKD_CONFIG`（配置文件路径）、`WIST_GWLINKD_LINK_TOKEN`（首跑置备用的一次性接入 token）。
@@ -86,6 +98,28 @@ gops 调用契约（2.2.x）：`gops prj upgrade --to <版本|URL|路径> --on-f
 **常驻退出时会收走执行器**（`kill_on_drop` + Linux `PR_SET_PDEATHSIG`），
 不留孤儿执行器继续动现场。其余：同机**单实例**（`flock` 锁）、HTTP 带**超时**、`trust_bundle` 作为**自定义信任锚**、
 凭据**原子落盘**。
+
+**无状态工具**（`galaxy-ops` / `galaxy-flow`）不走 gops 工程：`[[upgrade.component]]` 里标 `install = "tool-copy"`
+后，驱动改为**进程内**取制品（带信任锚的客户端）→ gzip+tar 解包 → 把 `binary` **就地覆盖**到它在 `PATH` 上的**原位置**
+（旧版先备份到 `state_dir/tool-backups/`，失败可回滚）。这条路径**不起子进程**、也**不做成功佐证**（工具不影响网
+关容器/自述面）；`binary` 在 `PATH` 上找不到时**前置报可读失败**、绝不静默回落 gops。
+
+**摘要校验**（`tool-copy` 覆盖前必过）：期望 sha256 取自 —— 中心计划带的 `artifact_sha256`（有就用，形态不对即拒）
+＞制品名的内容寻址前缀（`pkg-<sha256 前 16 位>`，如 `pkg-955e0dc75215c3a6`）。实得摘要不符 → **拒装**（不覆盖）。
+
+**架构护栏**（`tool-copy` 覆盖前必过）：制品是**平台专用**的（`<name>-<version>-<target-triple>.tar.gz`），把
+x86_64 的 ELF 覆盖到 Darwin arm64 的 Mach-O 上**不会报错、只会让工具静默报废** —— 所以覆盖前先核工件三元组：
+
+- 架构 / 操作系统**与本机不符** → **拒装**（旧二进制原封不动）；
+- **读不出** target-triple（内容寻址名 `pkg-<hash>` 等）→ 缺省**拒装**，确需放行时设 `upgrade_tool_require_arch = false`
+  （只放宽「读不出」这一种；已识别出的架构不符**仍拒**）。
+
+判定**整段精确比**（不用 `contains`，故 `x86_64` 不会在 32 位 x86 宿主上被误放行）、与词表顺序无关，也不把组件名里
+本就有的架构词（`wist-arm-tool-…`）误当三元组；详见 [`src/target.rs`](src/target.rs)。
+
+**取件来源**必须是可取形态（`https://…` 或 `/abs/path`）：中心没派 `artifact_url`、只剩裸版本串时**可读失败**，
+不再当成 URL 去误取。`wist-gwlinkd diagnose` 的 `upgrade.tool` 一条会体检无状态工具组件（目录、`binary` 配置、
+`PATH` 命中与架构策略），联调时一眼看出「配置里有没有目录、会不会回退 gops」。
 
 ## 交付与升级
 

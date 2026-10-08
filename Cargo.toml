@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-gwlinkd"
-version = "0.6.0" #@gxl:set(version)
+version = "0.6.1" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 description = "Host-side resident keeping a wist gateway stack linked to WistCenter (register / heartbeat / upgrade)"
@@ -23,6 +23,13 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "que
 wist-control = { version = "0.9" }
 #wist-control = { version = "0.9", path = "../wist-control" }
 # gateway↔center 注册/凭据契约（客户端证书 mTLS）。
+
+# 底座 crate：取制品（中心派生的制品地址，带信任锚 / 客户端证书）+ 摘要口径。
+# 无状态工具（galaxy-ops/galaxy-flow）升级要自己取包 —— 与 agentd 同一层（只需「拿下来 / 核摘要」）。
+wist-artifact = { version = "0.1" }
+# 解包 tar.gz 制品（`tool_install` 用）。只有这一层需要，别升级到别处。
+flate2 = "1"
+tar = "0.4"
 
 # 客户端密钥对 + CSR（私钥永不出本机）；x509-parser 读自家证书序列号（轮换时提交）。
 rcgen = { version = "0.13", features = ["x509-parser"] }
