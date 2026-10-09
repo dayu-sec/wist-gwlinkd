@@ -20,9 +20,11 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use orion_error::prelude::*;
 use wist_artifact::digest::{parse_digest, sha256_hex_bytes};
 use wist_artifact::source::{FETCH_TIMEOUT, MAX_ARTIFACT_BYTES, read_source_with_client};
 
+use crate::error::{UpgradeReason, UpgradeResult};
 use crate::target::{self, ArchVerdict, HostTarget};
 
 /// 旧版二进制的备份子目录（相对状态目录）。
@@ -92,18 +94,19 @@ impl ToolInstaller {
     ///
     /// 返回 `(二进制名, 原位置)`。任何一步不成立 → `Err(可读原因)`（**别发** —— 发出去只会
     /// 以不可读的方式失败），驱动把它落成可读失败并回执。
-    pub fn preflight(&self, component: &str) -> Result<(String, PathBuf), String> {
-        let binary = self
-            .binaries
-            .get(component)
-            .ok_or_else(|| format!("组件 {component} 不在本机组件目录里"))?;
+    pub fn preflight(&self, component: &str) -> UpgradeResult<(String, PathBuf)> {
+        let binary = self.binaries.get(component).ok_or_else(|| {
+            UpgradeReason::Preflight.err(format!("组件 {component} 不在本机组件目录里"))
+        })?;
         if binary.trim().is_empty() {
-            return Err(format!(
+            return Err(UpgradeReason::Preflight.err(format!(
                 "组件 {component} 标了 install=tool-copy 却没配 binary：无法定位要覆盖的二进制"
-            ));
+            )));
         }
         let existing = which(binary).ok_or_else(|| {
-            format!("PATH 上找不到 {binary} 的原位置：无法就地覆盖安装（工具需已存在于 PATH）")
+            UpgradeReason::Preflight.err(format!(
+                "PATH 上找不到 {binary} 的原位置：无法就地覆盖安装（工具需已存在于 PATH）"
+            ))
         })?;
         Ok((binary.clone(), existing))
     }
@@ -111,7 +114,7 @@ impl ToolInstaller {
     /// 进程内安装（不额外声明期望摘要）：取制品 → 核摘要 → 核架构 → 解包 → 覆盖（旧版备份）。
     ///
     /// 期望摘要仍会从**内容寻址的制品名**（`pkg-<hex16>`）推出并校验；只是不额外声明。
-    pub async fn install(&self, component: &str, artifact: &str) -> Result<String, String> {
+    pub async fn install(&self, component: &str, artifact: &str) -> UpgradeResult<String> {
         self.install_with_digest(component, artifact, None).await
     }
 
@@ -126,22 +129,24 @@ impl ToolInstaller {
         component: &str,
         artifact: &str,
         expected_sha256: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> UpgradeResult<String> {
         let (binary, existing) = self.preflight(component)?;
 
         // 取件来源必须是可取形态：本机**绝对路径**或 `http(s)://` URL。中心没派制品地址时
         // 驱动会退化成裸版本串（`v0.16.1-alpha`），那会被当 URL 解析而失败 —— 提前报可读错。
         if !is_fetchable_source(artifact) {
-            return Err(format!(
+            return Err(UpgradeReason::Preflight.err(format!(
                 "组件 {component} 没有可取的制品地址（来源={artifact:?}）：tool-copy 依赖中心派发的 \
                  release 制品（https://… 或 /abs/path）；裸版本串不是 URL"
-            ));
+            )));
         }
 
         let bytes =
             read_source_with_client(&self.http, artifact, MAX_ARTIFACT_BYTES, FETCH_TIMEOUT)
                 .await
-                .map_err(|err| format!("取制品失败 {artifact}: {err}"))?;
+                .map_err(|err| {
+                    UpgradeReason::Artifact.err(format!("取制品失败 {artifact}: {err}"))
+                })?;
 
         // **摘要校验**：解包覆盖前先核 —— 不符的字节绝不能拿去覆盖本机工具。
         let sha_note = verify_expected_digest(&bytes, artifact, expected_sha256, &binary)?;
@@ -158,16 +163,18 @@ impl ToolInstaller {
                     }
                 }
                 ArchVerdict::Mismatch(reason) => {
-                    return Err(format!("架构校验失败，未覆盖 {binary}：{reason}"));
+                    return Err(
+                        UpgradeReason::Arch.err(format!("架构校验失败，未覆盖 {binary}：{reason}"))
+                    );
                 }
                 ArchVerdict::Unverifiable(reason) => {
                     if self.require_verified_arch {
-                        return Err(format!(
+                        return Err(UpgradeReason::Arch.err(format!(
                             "架构不可校验，未覆盖 {binary}：{reason}（确认制品与本机相符可在配置里设 \
                              upgrade_tool_require_arch = false 放行）"
-                        ));
+                        )));
                     }
-                    eprintln!("event=ToolArchUnverified component={component} {reason}");
+                    log::warn!("event=ToolArchUnverified component={component} {reason}");
                     arch_note = format!("（架构不可校验：{reason}）");
                 }
             }
@@ -187,7 +194,7 @@ impl ToolInstaller {
             result
         })
         .await
-        .map_err(|err| format!("安装任务异常: {err}"))??;
+        .map_err(|err| UpgradeReason::Executor.err(format!("安装任务异常: {err}")))??;
         Ok(format!("{detail}{sha_note}{arch_note}"))
     }
 }
@@ -215,7 +222,7 @@ fn verify_expected_digest(
     source: &str,
     explicit: Option<&str>,
     binary: &str,
-) -> Result<String, String> {
+) -> UpgradeResult<String> {
     let Some(expected) = resolve_expected_digest(source, explicit)? else {
         return Ok(String::new());
     };
@@ -225,10 +232,10 @@ fn verify_expected_digest(
         ExpectedDigest::Prefix(prefix) => actual.starts_with(prefix),
     };
     if !ok {
-        return Err(format!(
+        return Err(UpgradeReason::Artifact.err(format!(
             "制品摘要不符，未覆盖 {binary}：期望 {}，实得 {actual}",
             expected.describe()
-        ));
+        )));
     }
     Ok(format!("（sha256 {} 已核）", expected.describe()))
 }
@@ -237,11 +244,12 @@ fn verify_expected_digest(
 fn resolve_expected_digest(
     source: &str,
     explicit: Option<&str>,
-) -> Result<Option<ExpectedDigest>, String> {
+) -> UpgradeResult<Option<ExpectedDigest>> {
     if let Some(value) = explicit {
         // 中心给的该是完整摘要；形态不对就拒（别把笔误当「没给」静默放过）。
-        let hex =
-            parse_digest(value).map_err(|err| format!("期望摘要形态不对（{value}）：{err}"))?;
+        let hex = parse_digest(value).map_err(|err| {
+            UpgradeReason::Artifact.err(format!("期望摘要形态不对（{value}）：{err}"))
+        })?;
         return Ok(Some(ExpectedDigest::Full(hex)));
     }
     Ok(content_addressed_prefix(source).map(ExpectedDigest::Prefix))
@@ -268,11 +276,13 @@ fn replace_binary(
     binary: &str,
     existing: &Path,
     backup_dir: &Path,
-) -> Result<String, String> {
+) -> UpgradeResult<String> {
     // 解包到干净的暂存目录。
     let _ = std::fs::remove_dir_all(staging);
-    std::fs::create_dir_all(staging)
-        .map_err(|err| format!("建解包暂存目录失败 {}: {err}", staging.display()))?;
+    std::fs::create_dir_all(staging).source_err(
+        UpgradeReason::Io,
+        format!("建解包暂存目录失败 {}", staging.display()),
+    )?;
     unpack_into(bytes, staging)?;
     // 包里按**文件名的末段**找（`binary` 配名字或绝对路径都行 —— 以后者定位时不能整串拿去比）。
     let package_name = existing
@@ -282,26 +292,30 @@ fn replace_binary(
     let source = locate_binary(staging, package_name)?;
 
     // 覆盖前先备份旧版（`fs::copy` 保留权限位）；备份放状态目录，升级后可回滚。
-    std::fs::create_dir_all(backup_dir)
-        .map_err(|err| format!("建备份目录失败 {}: {err}", backup_dir.display()))?;
+    std::fs::create_dir_all(backup_dir).source_err(
+        UpgradeReason::Io,
+        format!("建备份目录失败 {}", backup_dir.display()),
+    )?;
     // 解析软链：覆盖的是**真身**，不是链接本身（否则会把链接换成普通文件）。
     let target = std::fs::canonicalize(existing).unwrap_or_else(|_| existing.to_path_buf());
     // 备份名用**末段**（`binary` 可能是绝对路径，直接入名会把 `join` 拉回绝对路径）。
     let backup = backup_dir.join(format!("{package_name}.{}", now_stamp()));
     std::fs::copy(&target, &backup).map_err(|err| {
-        format!(
+        UpgradeReason::Io.err(format!(
             "备份旧版失败 {} -> {}: {err}",
             target.display(),
             backup.display()
-        )
+        ))
     })?;
 
     // 原子替换：同目录写临时文件（同文件系统）→ rename 覆盖，读者要么看到旧、要么看到新。
-    let new_bytes = std::fs::read(&source)
-        .map_err(|err| format!("读制品里的二进制失败 {}: {err}", source.display()))?;
-    let dir = target
-        .parent()
-        .ok_or_else(|| format!("目标路径没有父目录：{}", target.display()))?;
+    let new_bytes = std::fs::read(&source).source_err(
+        UpgradeReason::Io,
+        format!("读制品里的二进制失败 {}", source.display()),
+    )?;
+    let dir = target.parent().ok_or_else(|| {
+        UpgradeReason::Io.err(format!("目标路径没有父目录：{}", target.display()))
+    })?;
     let tmp = dir.join(format!(".{package_name}.new.{}", std::process::id()));
     // 写临时文件 → 置可执行位 → 原子 rename；**任一步失败都收走临时文件**（别留 .gops.new.<pid> 残骸）。
     let staged = std::fs::write(&tmp, &new_bytes).and_then(|()| {
@@ -314,11 +328,11 @@ fn replace_binary(
     });
     if let Err(err) = staged {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!(
+        return Err(UpgradeReason::Io.err(format!(
             "原地替换失败 {}（临时文件 {}，目标目录不可写？）: {err}",
             target.display(),
             tmp.display()
-        ));
+        )));
     }
     Ok(format!(
         "已就地覆盖 {package_name}：{} ← {}（旧版备份 {}）",
@@ -332,12 +346,12 @@ fn replace_binary(
 ///
 /// 路径穿越条目的行为需明确：`tar` 的 `unpack` 对 `..` / 绝对路径这类会**逃出目标目录**的条目
 /// **静默跳过**（不报错，也不写入目标之外）—— 见 `unpack_does_not_write_outside_the_staging_dir`。
-fn unpack_into(bytes: &[u8], staging: &Path) -> Result<(), String> {
+fn unpack_into(bytes: &[u8], staging: &Path) -> UpgradeResult<()> {
     let decoder = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
     archive
         .unpack(staging)
-        .map_err(|err| format!("解包失败（期望 tar.gz 制品）：{err}"))
+        .map_err(|err| UpgradeReason::Artifact.err(format!("解包失败（期望 tar.gz 制品）：{err}")))
 }
 
 /// 来源是否为**可取**形态：本机绝对路径（以 `/` 开头）或 `http(s)://` URL。
@@ -348,7 +362,7 @@ fn is_fetchable_source(source: &str) -> bool {
 /// 在解包结果里**按名字**找二进制（广度优先，最多 [`MAX_SCAN_DEPTH`] 层）：覆盖裸二进制与
 /// `<name>-<version>-<triple>/<binary>` 两种布局。**只认普通文件**（符号链接作候选会被跳过，
 /// 免得恶意 / 异常包用它把源指到包外）。找不到 → 列出包内文件帮助排错。
-fn locate_binary(root: &Path, name: &str) -> Result<PathBuf, String> {
+fn locate_binary(root: &Path, name: &str) -> UpgradeResult<PathBuf> {
     let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
     let mut seen: Vec<String> = Vec::new();
     while let Some((dir, depth)) = queue.pop_front() {
@@ -376,14 +390,14 @@ fn locate_binary(root: &Path, name: &str) -> Result<PathBuf, String> {
             }
         }
     }
-    Err(format!(
+    Err(UpgradeReason::Artifact.err(format!(
         "制品里找不到二进制 {name}（包内文件：{}）",
         if seen.is_empty() {
             "（空）".to_string()
         } else {
             seen.join(", ")
         }
-    ))
+    )))
 }
 
 /// 相对 `root` 展示路径（不在其下就原样）。

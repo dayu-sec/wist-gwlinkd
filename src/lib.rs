@@ -14,15 +14,18 @@ pub mod agent_package;
 pub mod center;
 pub mod config;
 pub mod doctor;
+pub mod error;
 pub mod executor;
 pub mod identity;
 pub mod link_request;
 pub mod linkd_status;
+pub mod logging;
 pub mod selfreport;
 pub mod service;
 pub mod state;
 pub mod target;
 pub mod tool_install;
+pub mod unlink;
 pub mod upgrade;
 
 /// 当前版本（由 gx 同步 `Cargo.toml` / `version.txt`）。
@@ -30,3 +33,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 缺省配置路径（`WIST_GWLINKD_CONFIG` 可覆盖）。
 pub const DEFAULT_CONFIG_PATH: &str = "gwlinkd.toml";
+
+/// 跨 crate / 进程边界统一的错误载体与 reason 词汇（见模块注释）。
+pub use error::{
+    CenterError, CenterReason, CenterResult, ConfigError, ConfigReason, ConfigResult, GwlinkdError,
+    GwlinkdReason, GwlinkdResult, ServiceError, ServiceReason, ServiceResult, StateError,
+    StateReason, StateResult, UpgradeError, UpgradeReason, UpgradeResult, logged_op,
+};

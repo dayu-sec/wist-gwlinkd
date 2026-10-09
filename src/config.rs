@@ -2,6 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
+use orion_error::prelude::*;
+
+use crate::error::{ConfigReason, ConfigResult};
+
 /// 本机配置。
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
@@ -84,6 +88,10 @@ pub struct Config {
     /// `[upgrade]` 段：本机**组件目录**（其余扁平 `upgrade_*` 键保持原样）。
     #[serde(default, rename = "upgrade")]
     pub upgrade: UpgradeSection,
+    /// `[log]` 段：**本进程自己**的运行日志（级别 / 格式 / 落点）。缺省 `info` / `text` / stderr。
+    /// 与网关侧的 `[logs]`（被采集 agent 日志的落盘保留）无关。
+    #[serde(default)]
+    pub log: crate::logging::LogSection,
 }
 
 /// `[upgrade]` 段。
@@ -120,10 +128,25 @@ pub enum UpgradeInstall {
 
 impl Config {
     /// 从 TOML 文件读配置。
-    pub fn load(path: &Path) -> Result<Self, String> {
+    pub fn load(path: &Path) -> ConfigResult<Self> {
         let text = std::fs::read_to_string(path)
-            .map_err(|err| format!("读取配置失败 {}: {err}", path.display()))?;
-        toml::from_str(&text).map_err(|err| format!("解析配置失败 {}: {err}", path.display()))
+            .source_err(ConfigReason::Io, format!("读取配置失败 {}", path.display()))?;
+        // `orion-error` 未启用 `toml` bridge，`toml::de::Error` 走 `source_raw_err`
+        // （与 `wist-gateway` 的配置加载同一取舍）。
+        let mut config: Self = toml::from_str(&text).source_raw_err(
+            ConfigReason::ParseToml,
+            format!("解析配置失败 {}", path.display()),
+        )?;
+        // `[log] file` 的相对路径按**配置文件所在目录**解析（与 `wist-gateway` 同一口径），
+        // 而非进程 cwd —— systemd / launchd 可能以任意 cwd 拉起，相对 cwd 会落到意外位置。
+        if let Some(file) = config.log.file.take() {
+            config.log.file = Some(if file.is_absolute() {
+                file
+            } else {
+                path.parent().unwrap_or_else(|| Path::new(".")).join(file)
+            });
+        }
+        Ok(config)
     }
 }
 
@@ -140,9 +163,9 @@ pub fn upsert_link_settings(
     gateway_id: &str,
     link_token: &str,
     trust_bundle: Option<&Path>,
-) -> Result<(), String> {
+) -> ConfigResult<()> {
     let original = std::fs::read_to_string(path)
-        .map_err(|err| format!("读取配置失败 {}: {err}", path.display()))?;
+        .source_err(ConfigReason::Io, format!("读取配置失败 {}", path.display()))?;
     let mut text = original;
     text = upsert_scalar(
         &text,
@@ -206,6 +229,35 @@ fn upsert_scalar(text: &str, key: &str, literal: &str) -> String {
     out
 }
 
+/// 从配置里**去掉**顶层 `link_token`（一次性接入券）：被消费 / 解除接入后它就没用了，留着会让下次
+/// 首跑**绕过页面自动重连**。幂等：没有该键时不动文件、返回 `false`。保留其余行与注释。
+pub fn remove_link_token(path: &Path) -> ConfigResult<bool> {
+    let original = std::fs::read_to_string(path)
+        .source_err(ConfigReason::Io, format!("读取配置失败 {}", path.display()))?;
+    let lines: Vec<&str> = original.lines().collect();
+    let first_section = lines.iter().position(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with('[') && trimmed.ends_with(']')
+    });
+    let top_end = first_section.unwrap_or(lines.len());
+    let Some(index) = lines[..top_end]
+        .iter()
+        .position(|line| line_matches_key(line.trim_start(), "link_token"))
+    else {
+        return Ok(false);
+    };
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i == index {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    write_atomic(path, &out)?;
+    Ok(true)
+}
+
 /// 该行是否是顶层标量 `key = ……`（避免误命中 `key_extra = ……` / `==`）。
 fn line_matches_key(trimmed: &str, key: &str) -> bool {
     let Some(rest) = trimmed.strip_prefix(key) else {
@@ -222,14 +274,17 @@ fn toml_string(value: &str) -> String {
 }
 
 /// 原子写：先写临时文件再 rename，避免写一半损坏配置。
-fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
+fn write_atomic(path: &Path, content: &str) -> ConfigResult<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("创建目录失败 {}: {err}", parent.display()))?;
+        std::fs::create_dir_all(parent).source_err(
+            ConfigReason::Io,
+            format!("创建目录失败 {}", parent.display()),
+        )?;
     }
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, content).map_err(|err| format!("写入失败 {}: {err}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|err| format!("落盘失败 {}: {err}", path.display()))
+    std::fs::write(&tmp, content)
+        .source_err(ConfigReason::Io, format!("写入失败 {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).source_err(ConfigReason::Io, format!("落盘失败 {}", path.display()))
 }
 
 /// `wist-gwlinkd init-config` 写出去的默认配置文本（带注释的 `gwlinkd.toml` 骶架）。
@@ -280,6 +335,16 @@ gateway_id = "gw-local"
 
 # 可选：一次性接入券（写上 = 起进程即自联；被消费即废）
 # link_token = ""
+
+# 可选：本进程自己的运行日志（缺省 info / text / stderr；RUST_LOG 环境变量优先）
+# [log]
+# level  = "info"                        # 或 "wist_gwlinkd=debug,hyper=warn"
+# format = "json"                        # 缺省 text；只有要 JSON 行才需写
+# file   = "/var/log/wist-gwlinkd.log"   # 给了就写文件（相对路径按配置文件目录解析；自动建父目录）；缺省写 stderr
+# max_bytes       = 67108864             # 单文件上限（字节），写满轮转成 file.1/file.2/…（缺省 64 MiB）
+# keep_files      = 4                    # 保留的历史分卷个数（0 = 不留历史；缺省 4）
+# max_age_seconds = 604800               # 历史分卷保留时长（秒）；0 = 不按时间清（缺省 7 天）
+# 注意：轮转由 gwlinkd 进程自己做；**不要再给这个文件挂 logrotate**，两套轮转会互相打架。
 "#;
 
 #[cfg(test)]
@@ -319,6 +384,49 @@ mod tests {
         assert!(config.upgrade_retry_on_dead.is_none());
         assert!(config.upgrade_tool_require_arch.is_none());
         assert!(config.upgrade.component.is_empty());
+        assert!(config.log.level.is_none());
+        assert_eq!(config.log.format, crate::logging::LogFormat::Text);
+        assert!(config.log.file.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn log_section_parses_when_present() {
+        let dir = temp_dir("log");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\n\n[log]\nlevel = \"warn\"\nformat = \"json\"\nfile = \"/tmp/gwlinkd.log\"\n",
+        )
+        .expect("write");
+        let config = Config::load(&path).expect("load");
+        assert_eq!(config.log.level.as_deref(), Some("warn"));
+        assert_eq!(config.log.format, crate::logging::LogFormat::Json);
+        assert_eq!(
+            config.log.file.as_deref(),
+            Some(Path::new("/tmp/gwlinkd.log"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn log_file_relative_path_resolves_against_config_dir() {
+        let dir = temp_dir("log-rel");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\n\n[log]\nfile = \"logs/gwlinkd.log\"\n",
+        )
+        .expect("write");
+        let config = Config::load(&path).expect("load");
+        let file = config.log.file.expect("resolved");
+        assert!(file.is_absolute(), "should be absolutized: {file:?}");
+        assert!(file.ends_with("logs/gwlinkd.log"), "{file:?}");
+        assert!(
+            file.starts_with(&dir),
+            "{file:?} should be under {}",
+            dir.display()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -426,6 +534,75 @@ mod tests {
     }
 
     #[test]
+    fn remove_link_token_deletes_only_the_top_level_key() {
+        let dir = temp_dir("remove-token");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            "# 头部\ncontrol_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\nlink_token = \"link_abc\"\n",
+        )
+        .expect("write");
+        assert!(remove_link_token(&path).expect("remove"));
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(!text.contains("link_token"), "应去掉该键：{text}");
+        assert!(text.contains("# 头部"), "注释应保留：{text}");
+        assert!(
+            text.contains("gateway_id = \"gw-1\""),
+            "其余键应保留：{text}"
+        );
+        // 仍是合法配置（link_token 可选）。
+        assert!(Config::load(&path).expect("load").link_token.is_none());
+        // 幂等。
+        assert!(!remove_link_token(&path).expect("again"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_link_token_leaves_a_section_scoped_key_alone() {
+        let dir = temp_dir("remove-token-section");
+        let path = dir.join("gwlinkd.toml");
+        // 顶层没有 link_token，只有段内的同名行：不能误删。
+        let original = "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\n\n[extra]\nlink_token = \"keep-me\"\n";
+        std::fs::write(&path, original).expect("write");
+        assert!(!remove_link_token(&path).expect("remove"));
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            text.contains("link_token = \"keep-me\""),
+            "段内行不应动：{text}"
+        );
+        // 无可删 → 文件逐字节不变（不重写）。
+        assert_eq!(text, original, "无可删时不应改文件");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_link_token_handles_a_blank_value() {
+        let dir = temp_dir("remove-token-blank");
+        let path = dir.join("gwlinkd.toml");
+        // 空串也算「有这一行」，应被去掉（与 `unlink` 的 dry-run 判据一致）。
+        std::fs::write(
+            &path,
+            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\nlink_token = \"\"\n",
+        )
+        .expect("write");
+        assert!(remove_link_token(&path).expect("remove"));
+        assert!(
+            !std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("link_token")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_link_token_errors_on_an_unreadable_path() {
+        // 配置不可读 → 报错（绝不静默当「没有该键」）。
+        let err = remove_link_token(std::path::Path::new("/definitely/not/here/gwlinkd.toml"))
+            .expect_err("应报错");
+        assert!(err.to_string().contains("读取配置失败"), "{err}");
+    }
+
+    #[test]
     fn line_matches_key_only_matches_top_level_assignments() {
         assert!(line_matches_key("link_token = \"x\"", "link_token"));
         assert!(line_matches_key("link_token=\"x\"", "link_token"));
@@ -511,7 +688,7 @@ mod tests {
         )
         .expect("write");
         let err = Config::load(&path).expect_err("unknown install must be rejected");
-        assert!(err.contains("配置"), "{err}");
+        assert!(err.to_string().contains("配置"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

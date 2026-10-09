@@ -6,7 +6,10 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use orion_error::prelude::*;
+
 use crate::config::Config;
+use crate::error::{ConfigReason, ConfigResult};
 use crate::state::{self, CredentialStatus};
 
 /// 中心可达性探测超时（诊断是人手跑的，短超时即可）。
@@ -175,7 +178,7 @@ fn trust_check(config: &Config) -> Check {
         Err(detail) => Check::fail(
             "config.trust_bundle",
             "信任锚无效",
-            detail,
+            detail.to_string(),
             "换成合法的 PEM 证书文件",
         ),
     }
@@ -183,13 +186,16 @@ fn trust_check(config: &Config) -> Check {
 
 /// 读并校验一个 PEM 证书文件（存在为前提）：含 CERTIFICATE 块 + reqwest 可解析。
 /// 错误串带上路径，便于诊断直接展示。
-fn validate_pem_certificate(path: &Path) -> Result<(), String> {
-    let pem = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+fn validate_pem_certificate(path: &Path) -> ConfigResult<()> {
+    let pem = std::fs::read_to_string(path)
+        .source_err(ConfigReason::Io, format!("{}", path.display()))?;
     if !pem.contains("-----BEGIN CERTIFICATE-----") {
-        return Err(format!("{}: 不含 CERTIFICATE 块", path.display()));
+        return Err(
+            ConfigReason::Validation.err(format!("{}: 不含 CERTIFICATE 块", path.display()))
+        );
     }
     reqwest::Certificate::from_pem(pem.as_bytes())
-        .map_err(|err| format!("{}: {err}", path.display()))?;
+        .source_raw_err(ConfigReason::Validation, format!("{}", path.display()))?;
     Ok(())
 }
 
@@ -277,7 +283,7 @@ fn self_ca_check(config: &Config) -> Check {
         Err(detail) => Check::fail(
             "self.ca",
             "环回信任锚无效",
-            detail,
+            detail.to_string(),
             "换成合法的 PEM 证书文件",
         ),
     }
@@ -446,7 +452,7 @@ fn reachability_check(config: &Config) -> Check {
             return Check::fail(
                 "center.reachable",
                 "控制中心地址无法解析",
-                err,
+                err.to_string(),
                 "检查 control_center_endpoint",
             );
         }
@@ -483,25 +489,27 @@ fn reachability_check(config: &Config) -> Check {
 }
 
 /// 从 endpoint 解析 `(host, port)`：缺端口按 scheme 取默认（http=80 / https=443）。
-fn parse_host_port(endpoint: &str) -> Result<(String, u16), String> {
+fn parse_host_port(endpoint: &str) -> ConfigResult<(String, u16)> {
     let (default_port, rest) = if let Some(rest) = endpoint.strip_prefix("https://") {
         (443, rest)
     } else if let Some(rest) = endpoint.strip_prefix("http://") {
         (80, rest)
     } else {
-        return Err(format!("{endpoint} 缺少 http(s):// scheme"));
+        return Err(ConfigReason::Validation.err(format!("{endpoint} 缺少 http(s):// scheme")));
     };
     let authority = rest.split('/').next().unwrap_or("");
     if authority.is_empty() {
-        return Err(format!("{endpoint} 缺少主机名"));
+        return Err(ConfigReason::Validation.err(format!("{endpoint} 缺少主机名")));
     }
     // IPv6 字面量（[::1]:port）也要能吃下。
     if let Some(rest) = authority.strip_prefix('[') {
         let (host, tail) = rest
             .split_once(']')
-            .ok_or_else(|| format!("{authority} 方括号不配对"))?;
+            .ok_or_else(|| ConfigReason::Validation.err(format!("{authority} 方括号不配对")))?;
         let port = match tail.strip_prefix(':') {
-            Some(value) => value.parse().map_err(|_| format!("{authority} 端口非法"))?,
+            Some(value) => value
+                .parse()
+                .map_err(|_| ConfigReason::Validation.err(format!("{authority} 端口非法")))?,
             None => default_port,
         };
         return Ok((host.to_string(), port));
@@ -509,7 +517,8 @@ fn parse_host_port(endpoint: &str) -> Result<(String, u16), String> {
     match authority.rsplit_once(':') {
         Some((host, port)) => Ok((
             host.to_string(),
-            port.parse().map_err(|_| format!("{authority} 端口非法"))?,
+            port.parse()
+                .map_err(|_| ConfigReason::Validation.err(format!("{authority} 端口非法")))?,
         )),
         None => Ok((authority.to_string(), default_port)),
     }
@@ -562,6 +571,7 @@ mod tests {
             upgrade_retry_on_dead: None,
             upgrade_tool_require_arch: None,
             upgrade: Default::default(),
+            log: Default::default(),
         }
     }
 

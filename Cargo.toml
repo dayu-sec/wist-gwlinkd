@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-gwlinkd"
-version = "0.6.1" #@gxl:set(version)
+version = "0.7.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 description = "Host-side resident keeping a wist gateway stack linked to WistCenter (register / heartbeat / upgrade)"
@@ -14,13 +14,19 @@ readme = "README.md"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1"
+# 结构化错误治理：`StructError<R>` + `#[derive(OrionError)]` reason（见 `src/error.rs`）。
+# 默认 feature 已带 `log`（0.9 起 `OperationContext` 为纯数据、`AutoLogGuard` 负责 Drop 日志），与下面的 `env_logger` 走同一条 `log` facade。
+orion-error = { version = "0.9", features = ["derive", "serde_json"] }
+# 运行日志：`env_logger` 走 `log` facade，`RUST_LOG` 控级别，落 stderr（journald / launchd 收）。
+log = "0.4"
+env_logger = "0.11"
 ring = "0.17"
 tokio = { version = "1.48", features = ["full"] }
 libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 # 注：不写 `webpki-roots` —— 0.13 里 TLS 根由 `rustls`（系统根）决定，它只是可选依赖的隐式 feature
 # （reqwest 源码不引用），0.13.5 已去掉；留着会把本仓钉死在 0.13.1。
-wist-control = { version = "0.13" }
+wist-control = { version = "0.14" }
 #wist-control = { path = "../wist-control" }
 # gateway↔center 注册/凭据契约（客户端证书 mTLS）。
 

@@ -6,6 +6,10 @@
 //!
 //! 字段用 **snake_case**，与网关 `self_state.rs` 的输出一致（网关其余管理面 DTO 用 camelCase，属历史分歧）。
 
+use orion_error::prelude::*;
+
+use crate::error::{CenterReason, CenterResult};
+
 /// 网关自述状态（对应模型 `GatewaySelfState`）。
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct GatewaySelfState {
@@ -91,7 +95,7 @@ impl SelfReportClient {
     pub fn with_trust(
         endpoint: impl Into<String>,
         trust: Option<&std::path::Path>,
-    ) -> Result<Self, String> {
+    ) -> CenterResult<Self> {
         Ok(Self {
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
             http: crate::center::build_http_client(trust)?,
@@ -99,7 +103,7 @@ impl SelfReportClient {
     }
 
     /// 拉取准确自述状态：`GET /api/v1/gateway/self-state?gateway_id=`。
-    pub async fn fetch(&self, gateway_id: &str) -> Result<GatewaySelfState, String> {
+    pub async fn fetch(&self, gateway_id: &str) -> CenterResult<GatewaySelfState> {
         let url = format!("{}/api/v1/gateway/self-state", self.endpoint);
         let response = self
             .http
@@ -108,17 +112,18 @@ impl SelfReportClient {
             .header("accept", "application/json")
             .send()
             .await
-            .map_err(|err| format!("self-state 请求失败: {err}"))?;
+            .source_raw_err(CenterReason::Http, "self-state 请求失败")?;
         let status = response.status();
         let body = response
             .text()
             .await
-            .map_err(|err| format!("读取 self-state 响应体失败: {err}"))?;
+            .source_raw_err(CenterReason::Http, "读取 self-state 响应体失败")?;
         if !status.is_success() {
-            return Err(format!("self-state 失败（{status}）：{body}"));
+            return Err(CenterReason::Http.err(format!("self-state 失败（{status}）：{body}")));
         }
-        serde_json::from_str(&body)
-            .map_err(|err| format!("解析 self-state 响应失败: {err}；原文：{body}"))
+        serde_json::from_str(&body).map_err(|err| {
+            CenterReason::Decode.err(format!("解析 self-state 响应失败: {err}；原文：{body}"))
+        })
     }
 }
 

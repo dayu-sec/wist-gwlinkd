@@ -9,8 +9,11 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use orion_error::prelude::*;
 use ring::rand::{SecureRandom, SystemRandom};
 use wist_control::GatewayCredentialBundle;
+
+use crate::error::{StateError, StateReason, StateResult};
 
 /// 心跳超过该时长即判死（与 `wist-agentd` 同量级）。
 pub const UPGRADER_DEAD_AFTER: Duration = Duration::from_secs(60);
@@ -61,11 +64,11 @@ fn path_in(state_dir: &Path, name: &str) -> PathBuf {
 }
 
 /// 生成 `<prefix>_<64hex>`（镜像 `wist-center` / `wist-gateway` 的 `new_secret_token`）。
-pub fn new_secret_token(prefix: &str) -> Result<String, String> {
+pub fn new_secret_token(prefix: &str) -> StateResult<String> {
     let mut bytes = [0_u8; 32];
     SystemRandom::new()
         .fill(&mut bytes)
-        .map_err(|_| "failed to read system random source".to_string())?;
+        .map_err(|_| StateReason::Random.err("failed to read system random source"))?;
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(prefix.len() + 1 + bytes.len() * 2);
     out.push_str(prefix);
@@ -77,37 +80,51 @@ pub fn new_secret_token(prefix: &str) -> Result<String, String> {
     Ok(out)
 }
 
-fn ensure_dir(state_dir: &Path) -> Result<(), String> {
+fn ensure_dir(state_dir: &Path) -> StateResult<()> {
     std::fs::create_dir_all(state_dir)
-        .map_err(|err| format!("创建状态目录失败 {}: {err}", state_dir.display()))
+        .source_err(
+            StateReason::Io,
+            format!("创建状态目录失败 {}", state_dir.display()),
+        )
+        .map_err(StateError::from)
 }
 
 /// 原子写：**先写临时文件 → rename**（读者永不会看到半截内容）。
-fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
+fn write_atomic(path: &Path, content: &str) -> StateResult<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("创建目录失败 {}: {err}", parent.display()))?;
+        std::fs::create_dir_all(parent).source_err(
+            StateReason::Io,
+            format!("创建目录失败 {}", parent.display()),
+        )?;
     }
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, content).map_err(|err| format!("写入失败 {}: {err}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|err| format!("落盘失败 {}: {err}", path.display()))
+    std::fs::write(&tmp, content)
+        .source_err(StateReason::Io, format!("写入失败 {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .source_err(StateReason::Io, format!("落盘失败 {}", path.display()))
+        .map_err(StateError::from)
 }
 
 /// 写敏感文件：原子写 + 中间文件设 `0600`（崩溃不会留半截文件把凭据写坏）。
-fn write_secret(path: &Path, content: &str) -> Result<(), String> {
+fn write_secret(path: &Path, content: &str) -> StateResult<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("创建目录失败 {}: {err}", parent.display()))?;
+        std::fs::create_dir_all(parent).source_err(
+            StateReason::Io,
+            format!("创建目录失败 {}", parent.display()),
+        )?;
     }
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, content).map_err(|err| format!("写入失败 {}: {err}", tmp.display()))?;
+    std::fs::write(&tmp, content)
+        .source_err(StateReason::Io, format!("写入失败 {}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-            .map_err(|err| format!("设权限失败 {}: {err}", tmp.display()))?;
+            .source_err(StateReason::Io, format!("设权限失败 {}", tmp.display()))?;
     }
-    std::fs::rename(&tmp, path).map_err(|err| format!("落盘失败 {}: {err}", path.display()))
+    std::fs::rename(&tmp, path)
+        .source_err(StateReason::Io, format!("落盘失败 {}", path.display()))
+        .map_err(StateError::from)
 }
 
 /// 单实例锁：拿不到即说明本机已有常驻在跑。进程退出时由内核释放（无陈旧锁问题）。
@@ -116,7 +133,7 @@ pub struct LockGuard {
 }
 
 /// 获取单实例锁（`flock LOCK_EX|LOCK_NB`）。
-pub fn acquire_single_instance_lock(state_dir: &Path) -> Result<LockGuard, String> {
+pub fn acquire_single_instance_lock(state_dir: &Path) -> StateResult<LockGuard> {
     ensure_dir(state_dir)?;
     let path = path_in(state_dir, LOCK_FILE);
     let file = std::fs::OpenOptions::new()
@@ -124,14 +141,15 @@ pub fn acquire_single_instance_lock(state_dir: &Path) -> Result<LockGuard, Strin
         .create(true)
         .truncate(false)
         .open(&path)
-        .map_err(|err| format!("建锁文件失败 {}: {err}", path.display()))?;
+        .source_err(StateReason::Io, format!("建锁文件失败 {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
         // SAFETY: `flock` 只读 fd 的有效性；`file` 在本 guard 生命周期内存活。
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
-            return Err("已有网关常驻在跑（拿不到单实例锁），拒绝启动第二个".to_string());
+            return Err(StateReason::AlreadyRunning
+                .err("已有网关常驻在跑（拿不到单实例锁），拒绝启动第二个"));
         }
     }
     Ok(LockGuard { _file: file })
@@ -139,7 +157,7 @@ pub fn acquire_single_instance_lock(state_dir: &Path) -> Result<LockGuard, Strin
 
 /// 单实例锁是否**已被持有**（= 已有 gwlinkd 在跑）。只读探测：拿得到锁就立刻释放并返回 `false`。
 /// 锁文件不存在 → `false`（没在跑）。供 `service status` 判活。
-pub fn is_running(state_dir: &Path) -> Result<bool, String> {
+pub fn is_running(state_dir: &Path) -> StateResult<bool> {
     let path = path_in(state_dir, LOCK_FILE);
     if !path.exists() {
         return Ok(false);
@@ -147,7 +165,10 @@ pub fn is_running(state_dir: &Path) -> Result<bool, String> {
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(&path)
-        .map_err(|err| format!("打开锁文件失败 {}: {err}", path.display()))?;
+        .source_err(
+            StateReason::Io,
+            format!("打开锁文件失败 {}", path.display()),
+        )?;
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -168,7 +189,7 @@ pub fn is_running(state_dir: &Path) -> Result<bool, String> {
 // ───────────────────────── 身份 / 实例 / 凭据 / 链接配置 ─────────────────────────
 
 /// 读或生成网关身份 `ident_`（首跑自生成，落盘 `0600`；中心不存）。
-pub fn load_or_create_identity(state_dir: &Path) -> Result<String, String> {
+pub fn load_or_create_identity(state_dir: &Path) -> StateResult<String> {
     let path = path_in(state_dir, IDENTITY_FILE);
     if let Ok(text) = std::fs::read_to_string(&path) {
         let token = text.trim();
@@ -177,10 +198,10 @@ pub fn load_or_create_identity(state_dir: &Path) -> Result<String, String> {
         }
         // 非空但不成形（不是空的首写中断）→ 拒绝静默换身份（换身份会导致重复置备）。
         if !token.is_empty() {
-            return Err(format!(
+            return Err(StateReason::Corrupt.err(format!(
                 "身份文件损坏 {}（内容不以 ident_ 开头）：修复或删除后重跑",
                 path.display()
-            ));
+            )));
         }
     }
     let token = new_secret_token("ident")?;
@@ -190,7 +211,7 @@ pub fn load_or_create_identity(state_dir: &Path) -> Result<String, String> {
 }
 
 /// 读或生成本次运行的实例标识（注册用；重启保持稳定）。
-pub fn load_or_create_instance_id(state_dir: &Path, gateway_id: &str) -> Result<String, String> {
+pub fn load_or_create_instance_id(state_dir: &Path, gateway_id: &str) -> StateResult<String> {
     let path = path_in(state_dir, INSTANCE_FILE);
     if let Ok(text) = std::fs::read_to_string(&path) {
         let value = text.trim();
@@ -230,12 +251,12 @@ impl StoredCredential {
     }
 
     /// 证书序列号（小写 hex，无分隔符）：轮换时提交给中心（用旧证书证明身份）。
-    pub fn certificate_serial_hex(&self) -> Result<String, String> {
+    pub fn certificate_serial_hex(&self) -> StateResult<String> {
         use x509_parser::prelude::{FromDer, X509Certificate};
         let (_, pem) = x509_parser::pem::parse_x509_pem(self.bundle.certificate.as_bytes())
-            .map_err(|err| format!("解析客户端证书 PEM 失败: {err}"))?;
+            .map_err(|err| StateReason::Corrupt.err(format!("解析客户端证书 PEM 失败: {err}")))?;
         let (_, cert) = X509Certificate::from_der(&pem.contents)
-            .map_err(|err| format!("解析客户端证书 DER 失败: {err}"))?;
+            .map_err(|err| StateReason::Corrupt.err(format!("解析客户端证书 DER 失败: {err}")))?;
         Ok(hex_lower(cert.raw_serial()))
     }
 
@@ -260,9 +281,9 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 /// 保存长期身份（`register` / `renew` 后；原子写 + 0600）。
-pub fn save_credential(state_dir: &Path, credential: &StoredCredential) -> Result<(), String> {
+pub fn save_credential(state_dir: &Path, credential: &StoredCredential) -> StateResult<()> {
     let text =
-        serde_json::to_string_pretty(credential).map_err(|err| format!("序列化凭据失败: {err}"))?;
+        serde_json::to_string_pretty(credential).source_err(StateReason::Json, "序列化凭据失败")?;
     write_secret(&path_in(state_dir, CREDENTIAL_FILE), &text)
 }
 
@@ -302,7 +323,7 @@ pub fn load_credential(state_dir: &Path) -> Option<StoredCredential> {
 }
 
 /// 保存待消费的 RegistToken（首跑 register 前落盘；register 成功或已失效时清）。
-pub fn save_regist_token(state_dir: &Path, token: &str) -> Result<(), String> {
+pub fn save_regist_token(state_dir: &Path, token: &str) -> StateResult<()> {
     write_secret(&path_in(state_dir, REGIST_TOKEN_FILE), token)
 }
 
@@ -310,7 +331,7 @@ pub fn save_regist_token(state_dir: &Path, token: &str) -> Result<(), String> {
 pub const TRUST_BUNDLE_FILE: &str = "control-center.pem";
 
 /// 落盘中心信任锚（CA-S PEM）：接入物从页面来时可免预置。返回落盘路径。
-pub fn save_trust_bundle(state_dir: &Path, pem: &str) -> Result<std::path::PathBuf, String> {
+pub fn save_trust_bundle(state_dir: &Path, pem: &str) -> StateResult<std::path::PathBuf> {
     let path = path_in(state_dir, TRUST_BUNDLE_FILE);
     write_secret(&path, pem)?;
     Ok(path)
@@ -332,9 +353,9 @@ pub fn clear_regist_token(state_dir: &Path) {
 pub fn save_link_config(
     state_dir: &Path,
     config: &wist_control::GatewayInitialConfig,
-) -> Result<(), String> {
+) -> StateResult<()> {
     let text =
-        serde_json::to_string_pretty(config).map_err(|err| format!("序列化链接配置失败: {err}"))?;
+        serde_json::to_string_pretty(config).source_err(StateReason::Json, "序列化链接配置失败")?;
     write_secret(&path_in(state_dir, LINK_CONFIG_FILE), &text)
 }
 
@@ -354,9 +375,9 @@ pub fn read_upgrade_record(state_dir: &Path) -> Option<UpgradeRecord> {
 }
 
 /// 写升级记录（**原子**：诊断/判死都在读它，半截写会被当成「无升级」）。
-pub fn write_upgrade_record(state_dir: &Path, record: &UpgradeRecord) -> Result<(), String> {
+pub fn write_upgrade_record(state_dir: &Path, record: &UpgradeRecord) -> StateResult<()> {
     let text =
-        serde_json::to_string_pretty(record).map_err(|err| format!("序列化升级记录失败: {err}"))?;
+        serde_json::to_string_pretty(record).source_err(StateReason::Json, "序列化升级记录失败")?;
     write_atomic(&path_in(state_dir, UPGRADE_RECORD_FILE), &text)
 }
 
@@ -369,17 +390,18 @@ pub fn load_upgrade_cursor(state_dir: &Path) -> UpgradeCursor {
 }
 
 /// 写升级游标。
-pub fn save_upgrade_cursor(state_dir: &Path, cursor: &UpgradeCursor) -> Result<(), String> {
+pub fn save_upgrade_cursor(state_dir: &Path, cursor: &UpgradeCursor) -> StateResult<()> {
     let text =
-        serde_json::to_string_pretty(cursor).map_err(|err| format!("序列化升级游标失败: {err}"))?;
+        serde_json::to_string_pretty(cursor).source_err(StateReason::Json, "序列化升级游标失败")?;
     write_secret(&path_in(state_dir, UPGRADE_CURSOR_FILE), &text)
 }
 
 /// 打一次心跳（升级器进程周期调用）。
-pub fn touch_heartbeat(state_dir: &Path) -> Result<(), String> {
+pub fn touch_heartbeat(state_dir: &Path) -> StateResult<()> {
     ensure_dir(state_dir)?;
     std::fs::write(path_in(state_dir, UPGRADE_HEARTBEAT_FILE), b"")
-        .map_err(|err| format!("写心跳失败: {err}"))
+        .source_err(StateReason::Io, "写心跳失败")
+        .map_err(StateError::from)
 }
 
 /// 心跳是否新鲜（未越过死亡阈值）—— **判死判据的唯一实现**。

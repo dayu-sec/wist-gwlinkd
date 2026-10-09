@@ -12,6 +12,8 @@ use std::process::Stdio;
 
 use tokio::process::Command;
 
+use crate::error::{UpgradeReason, UpgradeResult};
+
 /// 缺省升级执行器程序名。
 pub const DEFAULT_UPGRADER_PROGRAM: &str = "gops";
 /// 缺省失败处置：**全回滚**（设计稿 §3.3 决策）。
@@ -45,7 +47,7 @@ pub trait UpgradeExecutor: Send + Sync {
     /// 发执行器**之前**的前置校验：`Err(可读原因)` = 别发（驱动把它落成可读失败并回执）。
     ///
     /// 缺省无前置；`gops` 需要**工程根**（`ops-prj.yml`），见 [`GopsExecutor`]。
-    fn preflight(&self) -> Result<(), String> {
+    fn preflight(&self) -> UpgradeResult<()> {
         Ok(())
     }
 
@@ -114,7 +116,7 @@ impl UpgradeExecutor for GopsExecutor {
         &self.program
     }
 
-    fn preflight(&self) -> Result<(), String> {
+    fn preflight(&self) -> UpgradeResult<()> {
         // 工程根是 **gops 的要求**，只对 gops 生效（站点脚本执行器不要求）。
         // gops 从 **cwd** 解析工程（`ops-prj.yml`），且 `gops prj upgrade` **没有**指定工程的旗标
         // （见 `gops prj upgrade --help`）—— 所以工程根必须显式配。不配就会跑到进程 cwd，
@@ -123,17 +125,16 @@ impl UpgradeExecutor for GopsExecutor {
             return Ok(());
         }
         let Some(dir) = self.project_dir.as_deref() else {
-            return Err(
+            return Err(UpgradeReason::Preflight.err(
                 "升级未配置工程根：upgrade_project_dir 未设置（gops 从 cwd 解析 ops-prj.yml，\
-                 不配就会以「executor exit status: 255」这种不可读的方式失败）"
-                    .to_string(),
-            );
+                 不配就会以「executor exit status: 255」这种不可读的方式失败）",
+            ));
         };
         if !dir.join("ops-prj.yml").is_file() {
-            return Err(format!(
+            return Err(UpgradeReason::Preflight.err(format!(
                 "升级工程根 {} 里没有 ops-prj.yml（gops prj 需要一个运维工程根：`gops prj new` + `gops prj import`）",
                 dir.display()
-            ));
+            )));
         }
         Ok(())
     }

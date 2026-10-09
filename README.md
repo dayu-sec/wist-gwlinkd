@@ -22,12 +22,28 @@
 wist-gwlinkd init-config [路径]  # 生成一份带注释的 gwlinkd.toml（路径缺省 = 当前配置路径）
 wist-gwlinkd run              # 常驻（默认子命令）
 wist-gwlinkd diagnose         # 本地诊断；有 FAIL 则退出码非 0
+wist-gwlinkd unlink           # 断开与 Center 的连接（删注册态 + 去 link_token；需先在停态）
+wist-gwlinkd unlink --forget-center  # 连中心信任锚（trust_bundle）也删；--dry-run 只算不落盘
 wist-gwlinkd service install --system   # 装成 OS 服务长期托管（开机自启/崩溃拉起）
 wist-gwlinkd service status  --system   # 看服务定义/二进制/配置/落点/在跑否
 wist-gwlinkd service print   --system   # 只渲染服务定义（systemd unit / launchd plist），不落盘
 wist-gwlinkd service uninstall --system # 停用并删定义
 wist-gwlinkd version
 ```
+
+### 断开与 Center 的连接（`unlink`）
+
+link（`onboard`）与 unlink **同属 gwlinkd** —— 同一份注册态、同一个 owner。`unlink` 删掉**注册态**
+（客户端证书 / 链接配置 / 待消费注册券 / 身份 / 实例 / 升级游标），并从 `gwlinkd.toml` 去掉一次性
+接入券 `link_token`（留着它下次启动会绕过页面自动重连），网关即回到**未接入**。
+
+- **需先停**常驻（运行中的 gwlinkd 会不停写回凭据）：先 `service stop` / 停进程，再 `unlink`；运行中调用**直接拒绝**。
+- 中心信任锚（`trust_bundle` 的 PEM）**默认保留**（是中心的公开证书，不是连接）；`--forget-center` 才一并删，
+  且删**已知的每一份**中心 CA（`trust_bundle` 指向的 + 页面写进 `state/control-center.pem` 的副本）。
+- `--dry-run` 只算不落盘（也不为「正在运行」买单）。
+- 删完**尽最大努力**把「已断开接入」环回告知网关（`linkd-status`，state=`WaitingLinkRequest`）：
+  「链接上级」页的接入状态卡随即显示「未接入」，**无需**重启网关（网关没起/没配 `gateway_self_endpoint` 时只记一行，不影响 unlink 成功）。
+- **不在 Center 侧注销**：同一 `gateway_id` **无法**再接入（本仓无「重置实例」，且这是**有意**的安全边界）。要再接入就在 Center **新建实例**、用它的**新 `gateway_id`**。
 
 ### 长期后台运行（正式运行必装）
 
@@ -39,12 +55,22 @@ sudo install -m 0755 wist-gwlinkd /usr/local/bin/
 sudo wist-gwlinkd service install --system --bin /usr/local/bin/wist-gwlinkd \
      --config /etc/wist-gwlinkd/gwlinkd.toml
 
+# 系统级、但**以非 root 的部署用户运行**（推荐）：仍是开机即起的系统服务，
+# 但进程属主 = 部署用户 —— 身份回写 / gops 升级都落在部署用户属主下（不会被 root 污染）。
+# 注意：`--config` 与 `state_dir` 必须该用户**可读写**（gwlinkd 会回写配置），典型放 `~/.wist-gwlinkd/`。
+sudo wist-gwlinkd service install --system --run-as deploy \
+     --bin /usr/local/bin/wist-gwlinkd --config /home/deploy/.wist-gwlinkd/gwlinkd.toml
+
 # macOS（LaunchDaemon: /Library/LaunchDaemons/com.dayu-sec.wist-gwlinkd.plist，KeepAlive）
 sudo wist-gwlinkd service install --system ...
 ```
 
 - `--system`（默认）= 系统级（开机即起；Linux `multi-user.target` / macOS `LaunchDaemons`）；
   `--user` = 登录后起（`~/.config/systemd/user` / `~/Library/LaunchAgents`）。
+- `--run-as <USER>`（配 `--run-as-group <GROUP>`，可选）：**系统级的非 root 运行身份** ——
+  systemd 写 `User=`/`Group=`、launchd 写 `UserName`/`GroupName`。用它的前提是 `--config`（`gwlinkd.toml`）
+  与 `state_dir` **该用户可读写**（gwlinkd 要回写接入券、落客户端证书）。**只对 `--system` 有效**
+  （`--user` 本就以本人运行；给了会报错）。不给 = 沿用 root。
 - 配置走 **绝对路径**（`--config`，落进 `WIST_GWLINKD_CONFIG`；默认 system `/etc/wist-gwlinkd/gwlinkd.toml`、
   user `~/.wist-gwlinkd/gwlinkd.toml`）—— 服务启动时工作目录不确定，不能用相对的 `gwlinkd.toml`。
 - 日志：Linux → journald（`journalctl -u wist-gwlinkd -f`）；macOS → `/var/log/wist-gwlinkd/gwlinkd.err`

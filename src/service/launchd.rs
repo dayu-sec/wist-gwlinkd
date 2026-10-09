@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use super::{CONFIG_ENV, LAUNCHD_LABEL, SYSTEM_LOG_DIR, ServiceScope, ServiceSpec, home_dir};
+use crate::error::ServiceResult;
 
 const SYSTEM_PLIST_DIR: &str = "/Library/LaunchDaemons";
 const USER_PLIST_DIR: &str = "Library/LaunchAgents";
@@ -22,7 +23,7 @@ pub const STDOUT_FILE: &str = "gwlinkd.out";
 pub const STDERR_FILE: &str = "gwlinkd.err";
 
 /// plist 落盘路径。
-pub fn plist_path(scope: ServiceScope) -> Result<PathBuf, String> {
+pub fn plist_path(scope: ServiceScope) -> ServiceResult<PathBuf> {
     match scope {
         ServiceScope::System => Ok(PathBuf::from(SYSTEM_PLIST_DIR).join(PLIST_FILE_NAME)),
         ServiceScope::User => Ok(home_dir()?.join(USER_PLIST_DIR).join(PLIST_FILE_NAME)),
@@ -30,7 +31,7 @@ pub fn plist_path(scope: ServiceScope) -> Result<PathBuf, String> {
 }
 
 /// launchd 标准输出/错误目录：系统级 `/var/log/wist-gwlinkd`，用户级 `~/Library/Logs/wist-gwlinkd`。
-pub fn log_dir(scope: ServiceScope) -> Result<PathBuf, String> {
+pub fn log_dir(scope: ServiceScope) -> ServiceResult<PathBuf> {
     match scope {
         ServiceScope::System => Ok(PathBuf::from(SYSTEM_LOG_DIR)),
         ServiceScope::User => Ok(home_dir()?.join(USER_LOG_DIR)),
@@ -53,6 +54,14 @@ pub fn plist_text(spec: &ServiceSpec, log_dir_override: Option<&Path>) -> String
     text.push_str("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n");
     text.push_str("<plist version=\"1.0\">\n<dict>\n");
     text.push_str(&kv_string("Label", LAUNCHD_LABEL));
+    // LaunchDaemon（system 作用域）可选**非 root 运行**：身份回写 / gops 升级在部署用户下完成。
+    // UserAgent（user 作用域）不加（那本就以本人运行）。
+    if let Some(user) = spec.run_as_identity() {
+        text.push_str(&kv_string("UserName", user));
+        if let Some(group) = spec.run_as_group.as_deref() {
+            text.push_str(&kv_string("GroupName", group));
+        }
+    }
     text.push_str("  <key>ProgramArguments</key>\n  <array>\n");
     text.push_str(&format!(
         "    <string>{}</string>\n",

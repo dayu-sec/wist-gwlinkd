@@ -6,54 +6,36 @@
 use std::path::Path;
 use std::time::Duration;
 
+use orion_error::prelude::*;
 use wist_control::{
     DateTime, GatewayCredentialBundle, GatewayEnrollmentResult, GatewayInitialConfig,
     GatewayUpgradePlan, RegisterGateway, RenewGatewayCredential, ReportGatewayStatus,
     ReportGatewayUpgradeResult,
 };
 
+use crate::error::{CenterError, CenterReason, CenterResult};
+
 /// 单次请求超时（避免中心/网关半死把常驻循环卡住）。
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 中心调用的错误：**区分「凭据被拒（401/403）」与其它** —— 前者要退避 + 提示重置备，
-/// 不能靠匹配错误串子串（响应体里也可能出现 "401"）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CenterError {
-    /// 401 / 403：凭据被拒。
-    Unauthorized(String),
-    /// 网络 / 5xx / 解析等其它错误。
-    Other(String),
-}
-
-impl CenterError {
-    /// 是否凭据被拒。
-    pub fn is_unauthorized(&self) -> bool {
-        matches!(self, Self::Unauthorized(_))
-    }
-}
-
-impl std::fmt::Display for CenterError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unauthorized(message) => write!(f, "凭据被拒：{message}"),
-            Self::Other(message) => write!(f, "{message}"),
-        }
-    }
-}
-
 /// 建 HTTP 客户端：带超时；给了 `trust_bundle`（PEM）则作为**自定义信任锚**（自签中心证书时必需）。
-pub fn build_http_client(trust_bundle: Option<&Path>) -> Result<reqwest::Client, String> {
+pub fn build_http_client(trust_bundle: Option<&Path>) -> CenterResult<reqwest::Client> {
     let mut builder = reqwest::Client::builder().timeout(HTTP_TIMEOUT);
     if let Some(path) = trust_bundle {
-        let pem = std::fs::read(path)
-            .map_err(|err| format!("读取信任锚失败 {}: {err}", path.display()))?;
-        let cert = reqwest::Certificate::from_pem(&pem)
-            .map_err(|err| format!("解析信任锚失败 {}: {err}", path.display()))?;
+        let pem = std::fs::read(path).source_err(
+            CenterReason::Io,
+            format!("读取信任锚失败 {}", path.display()),
+        )?;
+        let cert = reqwest::Certificate::from_pem(&pem).source_raw_err(
+            CenterReason::Http,
+            format!("解析信任锚失败 {}", path.display()),
+        )?;
         builder = builder.add_root_certificate(cert);
     }
     builder
         .build()
-        .map_err(|err| format!("建 HTTP 客户端失败: {err}"))
+        .source_raw_err(CenterReason::Http, "建 HTTP 客户端失败")
+        .map_err(CenterError::from)
 }
 
 /// 建 **mTLS** HTTP 客户端：信任锚同上，另挂网关客户端证书/私钥（`identity_pem` = 证书 + 私钥 PEM）。
@@ -63,21 +45,26 @@ pub fn build_http_client(trust_bundle: Option<&Path>) -> Result<reqwest::Client,
 pub fn build_mtls_http_client(
     trust_bundle: Option<&Path>,
     identity_pem: &str,
-) -> Result<reqwest::Client, String> {
+) -> CenterResult<reqwest::Client> {
     let mut builder = reqwest::Client::builder().timeout(HTTP_TIMEOUT);
     if let Some(path) = trust_bundle {
-        let pem = std::fs::read(path)
-            .map_err(|err| format!("读取信任锚失败 {}: {err}", path.display()))?;
-        let cert = reqwest::Certificate::from_pem(&pem)
-            .map_err(|err| format!("解析信任锚失败 {}: {err}", path.display()))?;
+        let pem = std::fs::read(path).source_err(
+            CenterReason::Io,
+            format!("读取信任锚失败 {}", path.display()),
+        )?;
+        let cert = reqwest::Certificate::from_pem(&pem).source_raw_err(
+            CenterReason::Http,
+            format!("解析信任锚失败 {}", path.display()),
+        )?;
         builder = builder.add_root_certificate(cert);
     }
     let identity = reqwest::Identity::from_pem(identity_pem.as_bytes())
-        .map_err(|err| format!("加载客户端证书/私钥失败: {err}"))?;
+        .source_raw_err(CenterReason::Http, "加载客户端证书/私钥失败")?;
     builder = builder.identity(identity);
     builder
         .build()
-        .map_err(|err| format!("建 mTLS HTTP 客户端失败: {err}"))
+        .source_raw_err(CenterReason::Http, "建 mTLS HTTP 客户端失败")
+        .map_err(CenterError::from)
 }
 
 /// link-upstream 的响应壳（中心侧 `InitialConfigReturned`）：配置 + 置备态一次性 RegistToken。
@@ -138,7 +125,7 @@ impl CenterClient {
         gateway_id: &str,
         bearer: &str,
         identity_token: Option<&str>,
-    ) -> Result<LinkUpstreamReturned, CenterError> {
+    ) -> CenterResult<LinkUpstreamReturned> {
         let url = format!("{}/api/v1/gateway/link-upstream", self.endpoint);
         let mut request = self
             .http
@@ -152,7 +139,7 @@ impl CenterClient {
         let response = request
             .send()
             .await
-            .map_err(|err| CenterError::Other(format!("link-upstream 请求失败: {err}")))?;
+            .source_raw_err(CenterReason::Http, "link-upstream 请求失败")?;
         decode(response, "link-upstream").await
     }
 
@@ -166,7 +153,7 @@ impl CenterClient {
         instance_id: &str,
         certificate_signing_request: &str,
         public_base_url: Option<&str>,
-    ) -> Result<GatewayEnrollmentResult, CenterError> {
+    ) -> CenterResult<GatewayEnrollmentResult> {
         let url = format!("{}/api/v1/gateway/register", self.endpoint);
         let payload = RegisterGateway {
             enrollment_token: enrollment_token.to_string(),
@@ -181,12 +168,12 @@ impl CenterClient {
             .json(&payload)
             .send()
             .await
-            .map_err(|err| CenterError::Other(format!("register 请求失败: {err}")))?;
+            .source_raw_err(CenterReason::Http, "register 请求失败")?;
         decode(response, "register").await
     }
 
     /// 周期上报：`POST /api/v1/gateway/status`（客户端证书 mTLS 鉴权，身份在客户端里）。
-    pub async fn report_status(&self, payload: &ReportGatewayStatus) -> Result<(), CenterError> {
+    pub async fn report_status(&self, payload: &ReportGatewayStatus) -> CenterResult<()> {
         let url = format!("{}/api/v1/gateway/status", self.endpoint);
         let response = self
             .http
@@ -194,7 +181,7 @@ impl CenterClient {
             .json(payload)
             .send()
             .await
-            .map_err(|err| CenterError::Other(format!("status 请求失败: {err}")))?;
+            .source_raw_err(CenterReason::Http, "status 请求失败")?;
         let _: serde_json::Value = decode(response, "status").await?;
         Ok(())
     }
@@ -205,7 +192,7 @@ impl CenterClient {
         gateway_id: &str,
         current_certificate_serial: &str,
         certificate_signing_request: &str,
-    ) -> Result<GatewayCredentialBundle, CenterError> {
+    ) -> CenterResult<GatewayCredentialBundle> {
         let url = format!("{}/api/v1/gateway/credentials:renew", self.endpoint);
         let payload = RenewGatewayCredential {
             gateway_id: gateway_id.to_string(),
@@ -219,7 +206,7 @@ impl CenterClient {
             .json(&payload)
             .send()
             .await
-            .map_err(|err| CenterError::Other(format!("renew 请求失败: {err}")))?;
+            .source_raw_err(CenterReason::Http, "renew 请求失败")?;
         decode(response, "renew").await
     }
 
@@ -232,7 +219,7 @@ impl CenterClient {
         &self,
         gateway_id: &str,
         platform: Option<&str>,
-    ) -> Result<GatewayUpgradePlan, CenterError> {
+    ) -> CenterResult<GatewayUpgradePlan> {
         let url = format!("{}/api/v1/gateway/upgrade-plan", self.endpoint);
         let mut query: Vec<(&str, &str)> = vec![("gateway_id", gateway_id)];
         if let Some(platform) = platform {
@@ -244,7 +231,7 @@ impl CenterClient {
             .query(&query)
             .send()
             .await
-            .map_err(|err| CenterError::Other(format!("upgrade-plan 请求失败: {err}")))?;
+            .source_raw_err(CenterReason::Http, "upgrade-plan 请求失败")?;
         decode(response, "upgrade-plan").await
     }
 
@@ -256,7 +243,7 @@ impl CenterClient {
         &self,
         gateway_id: &str,
         record: &crate::state::UpgradeRecord,
-    ) -> Result<(), CenterError> {
+    ) -> CenterResult<()> {
         let url = format!("{}/api/v1/gateway/upgrade-result", self.endpoint);
         let payload = ReportGatewayUpgradeResult {
             gateway_id: gateway_id.to_string(),
@@ -274,36 +261,55 @@ impl CenterClient {
             .json(&payload)
             .send()
             .await
-            .map_err(|err| CenterError::Other(format!("upgrade-result 请求失败: {err}")))?;
+            .source_raw_err(CenterReason::Http, "upgrade-result 请求失败")?;
         let _: serde_json::Value = decode(response, "upgrade-result").await?;
         Ok(())
     }
 }
 
-/// 解码响应：401/403 → [`CenterError::Unauthorized`]；其它非 2xx / 解析失败 → [`CenterError::Other`]。
+/// 解码响应：401/403 → [`CenterReason::Unauthorized`]；其它非 2xx → [`CenterReason::Http`]；
+/// 解析失败 → [`CenterReason::Decode`]。
 async fn decode<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
     what: &str,
-) -> Result<T, CenterError> {
+) -> CenterResult<T> {
     let status = response.status();
     let body = response
         .text()
         .await
-        .map_err(|err| CenterError::Other(format!("读取 {what} 响应体失败: {err}")))?;
+        .source_raw_err(CenterReason::Http, format!("读取 {what} 响应体失败"))?;
     if !status.is_success() {
-        let message = format!("{what} 失败（{status}）：{body}");
+        let message = format!("{what} 失败（{status}）：{}", body_head(&body));
         return Err(
             if status == reqwest::StatusCode::UNAUTHORIZED
                 || status == reqwest::StatusCode::FORBIDDEN
             {
-                CenterError::Unauthorized(message)
+                CenterReason::Unauthorized.err(message)
             } else {
-                CenterError::Other(message)
+                CenterReason::Http.err(message)
             },
         );
     }
-    serde_json::from_str(&body)
-        .map_err(|err| CenterError::Other(format!("解析 {what} 响应失败: {err}；原文：{body}")))
+    serde_json::from_str(&body).map_err(|err| {
+        CenterReason::Decode.err(format!(
+            "解析 {what} 响应失败: {err}；原文：{}",
+            body_head(&body)
+        ))
+    })
+}
+
+/// 响应体在错误 detail（进而进日志）里只留前 [`BODY_HEAD_CHARS`] 个字符。
+///
+/// 中心信任，但整段 body 会导致：本机日志被内部串刷屏 / 无界增长。按**字符**边界切，不切坏 UTF-8。
+const BODY_HEAD_CHARS: usize = 512;
+
+fn body_head(body: &str) -> String {
+    if body.chars().count() <= BODY_HEAD_CHARS {
+        return body.to_string();
+    }
+    let mut head: String = body.chars().take(BODY_HEAD_CHARS).collect();
+    head.push('…');
+    head
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 
 use crate::center::CenterClient;
+use crate::error::{UpgradeReason, UpgradeResult, chain_one_line, logged_op};
 use crate::executor::{ExecutorInvocation, Outcome, UpgradeExecutor};
 use crate::selfreport::SelfReportClient;
 use crate::state::{self, UpgradeRecord};
@@ -93,7 +94,7 @@ impl UpgradeDriver {
         component: Option<&str>,
         reporter: Option<UpgradeReporter>,
         artifact_url: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> UpgradeResult<()> {
         self.start_with_digest(
             work_id,
             from_version,
@@ -119,7 +120,7 @@ impl UpgradeDriver {
         reporter: Option<UpgradeReporter>,
         artifact_url: Option<&str>,
         expected_sha256: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> UpgradeResult<()> {
         if let (Some(tools), Some(component)) = (self.tools.as_ref(), component)
             && tools.handles(component)
         {
@@ -164,7 +165,7 @@ impl UpgradeDriver {
         component: Option<&str>,
         reporter: Option<UpgradeReporter>,
         artifact_url: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> UpgradeResult<()> {
         let mut record = UpgradeRecord {
             work_id: work_id.to_string(),
             from_version: from_version.to_string(),
@@ -181,9 +182,12 @@ impl UpgradeDriver {
         if let Err(reason) = self.executor.preflight() {
             record.step = "preflight".to_string();
             record.status = "failed".to_string();
-            record.detail = reason.clone();
+            record.detail = reason.to_string();
             if let Err(werr) = state::write_upgrade_record(&self.state_dir, &record) {
-                eprintln!("event=UpgradeRecordWriteFailed error={werr}");
+                log::warn!(
+                    "event=UpgradeRecordWriteFailed error={}",
+                    chain_one_line(&werr)
+                );
             }
             if let Some(reporter) = reporter {
                 report_record(&reporter, &record).await;
@@ -206,7 +210,7 @@ impl UpgradeDriver {
         let stderr = match &log {
             Some(file) => Stdio::from(
                 file.try_clone()
-                    .map_err(|err| format!("复制日志句柄失败: {err}"))?,
+                    .map_err(|err| UpgradeReason::Io.err(format!("复制日志句柄失败: {err}")))?,
             ),
             None => Stdio::null(),
         };
@@ -227,13 +231,16 @@ impl UpgradeDriver {
                 record.status = "failed".to_string();
                 record.detail = detail.clone();
                 if let Err(werr) = state::write_upgrade_record(&self.state_dir, &record) {
-                    eprintln!("event=UpgradeRecordWriteFailed error={werr}");
+                    log::warn!(
+                        "event=UpgradeRecordWriteFailed error={}",
+                        chain_one_line(&werr)
+                    );
                 }
                 // 回执：否则中心条目会停在 dispatched（起不来也是终态，得让中心知道）。
                 if let Some(reporter) = reporter {
                     report_record(&reporter, &record).await;
                 }
-                return Err(detail);
+                return Err(UpgradeReason::Executor.err(detail));
             }
         };
         let stdout = child.stdout.take();
@@ -252,7 +259,10 @@ impl UpgradeDriver {
                 loop {
                     ticker.tick().await;
                     if let Err(err) = state::touch_heartbeat(&heartbeat_state) {
-                        eprintln!("event=UpgradeHeartbeatFailed error={err}");
+                        log::warn!(
+                            "event=UpgradeHeartbeatFailed error={}",
+                            chain_one_line(&err)
+                        );
                     }
                 }
             }));
@@ -296,7 +306,10 @@ impl UpgradeDriver {
                 // 佐证期间把台账步进到 verify，诊断看起来才与事实一致。
                 record.step = "verify".to_string();
                 if let Err(err) = state::write_upgrade_record(&state_dir, &record) {
-                    eprintln!("event=UpgradeRecordWriteFailed error={err}");
+                    log::warn!(
+                        "event=UpgradeRecordWriteFailed error={}",
+                        chain_one_line(&err)
+                    );
                 }
                 if let Some(reporter) = reporter.as_ref() {
                     match reporter.self_client.as_ref() {
@@ -311,10 +324,11 @@ impl UpgradeDriver {
                                         outcome.ok = false;
                                         outcome.status = "unverified".to_string();
                                         outcome.step = "verify".to_string();
-                                        append_detail(&mut outcome.detail, reason.clone());
-                                        eprintln!(
-                                            "event=UpgradeUnverified work_id={} {reason}",
-                                            record.work_id
+                                        append_detail(&mut outcome.detail, reason.to_string());
+                                        log::warn!(
+                                            "event=UpgradeUnverified work_id={} {}",
+                                            record.work_id,
+                                            chain_one_line(&reason)
                                         );
                                     }
                                 }
@@ -336,7 +350,10 @@ impl UpgradeDriver {
             record.step = outcome.step;
             record.detail = outcome.detail;
             if let Err(err) = state::write_upgrade_record(&state_dir, &record) {
-                eprintln!("event=UpgradeRecordWriteFailed error={err}");
+                log::warn!(
+                    "event=UpgradeRecordWriteFailed error={}",
+                    chain_one_line(&err)
+                );
             }
             if let Some(reporter) = reporter {
                 // 回执**现读**最新凭据：升级可能跨越一次 renew（旧证书立即失效）。
@@ -360,8 +377,14 @@ impl UpgradeDriver {
         reporter: Option<UpgradeReporter>,
         artifact_url: Option<&str>,
         expected_sha256: Option<&str>,
-    ) -> Result<(), String> {
-        let tools = Arc::clone(self.tools.as_ref().expect("tool 路径必经 with_tools 装配"));
+    ) -> UpgradeResult<()> {
+        let Some(tools) = self.tools.as_ref() else {
+            // 内部接线错误：`tool` 升级路径必须经 `with_tools` 装配 `ToolInstaller`。
+            // 返回错误而非 panic —— 常驻进程里 panic 会整机停。
+            return Err(UpgradeReason::Preflight
+                .err("tool 安装路径要求装配 ToolInstaller（with_tools）—— 这是内部接线错误"));
+        };
+        let tools = Arc::clone(tools);
         let mut record = UpgradeRecord {
             work_id: work_id.to_string(),
             from_version: from_version.to_string(),
@@ -377,9 +400,12 @@ impl UpgradeDriver {
         if let Err(reason) = tools.preflight(component).map(|_| ()) {
             record.step = "preflight".to_string();
             record.status = "failed".to_string();
-            record.detail = reason.clone();
+            record.detail = reason.to_string();
             if let Err(werr) = state::write_upgrade_record(&self.state_dir, &record) {
-                eprintln!("event=UpgradeRecordWriteFailed error={werr}");
+                log::warn!(
+                    "event=UpgradeRecordWriteFailed error={}",
+                    chain_one_line(&werr)
+                );
             }
             if let Some(reporter) = reporter {
                 report_record(&reporter, &record).await;
@@ -400,7 +426,10 @@ impl UpgradeDriver {
                 loop {
                     ticker.tick().await;
                     if let Err(err) = state::touch_heartbeat(&heartbeat_state) {
-                        eprintln!("event=UpgradeHeartbeatFailed error={err}");
+                        log::warn!(
+                            "event=UpgradeHeartbeatFailed error={}",
+                            chain_one_line(&err)
+                        );
                     }
                 }
             }));
@@ -408,13 +437,20 @@ impl UpgradeDriver {
             // 进安装步就把台账步进到 install，诊断看起来才与事实一致。
             record.step = "install".to_string();
             if let Err(err) = state::write_upgrade_record(&state_dir, &record) {
-                eprintln!("event=UpgradeRecordWriteFailed error={err}");
+                log::warn!(
+                    "event=UpgradeRecordWriteFailed error={}",
+                    chain_one_line(&err)
+                );
             }
 
-            let outcome = match tools
-                .install_with_digest(&component, &artifact, expected_sha256.as_deref())
-                .await
-            {
+            let outcome = match logged_op(
+                module_path!(),
+                "tool install",
+                &[("component", component.clone())],
+                tools
+                    .install_with_digest(&component, &artifact, expected_sha256.as_deref())
+                    .await,
+            ) {
                 Ok(detail) => Outcome {
                     ok: true,
                     status: "done".to_string(),
@@ -422,12 +458,15 @@ impl UpgradeDriver {
                     detail,
                 },
                 Err(reason) => {
-                    eprintln!("event=ToolInstallFailed component={component} {reason}");
+                    log::warn!(
+                        "event=ToolInstallFailed component={component} {}",
+                        chain_one_line(&reason)
+                    );
                     Outcome {
                         ok: false,
                         status: "failed".to_string(),
                         step: "install".to_string(),
-                        detail: reason,
+                        detail: reason.to_string(),
                     }
                 }
             };
@@ -436,7 +475,10 @@ impl UpgradeDriver {
             record.step = outcome.step;
             record.detail = outcome.detail;
             if let Err(err) = state::write_upgrade_record(&state_dir, &record) {
-                eprintln!("event=UpgradeRecordWriteFailed error={err}");
+                log::warn!(
+                    "event=UpgradeRecordWriteFailed error={}",
+                    chain_one_line(&err)
+                );
             }
             if let Some(reporter) = reporter {
                 // 回执**现读**最新凭据（安装可能跨多次心跳，期间可能已 renew）。
@@ -455,10 +497,10 @@ async fn report_record(reporter: &UpgradeReporter, record: &UpgradeRecord) {
             .report_upgrade_result(&credential.bundle.gateway_id, record)
             .await
         {
-            Ok(()) => println!("event=UpgradeReported work_id={}", record.work_id),
-            Err(err) => eprintln!("event=UpgradeReportFailed error={err}"),
+            Ok(()) => log::info!("event=UpgradeReported work_id={}", record.work_id),
+            Err(err) => log::warn!("event=UpgradeReportFailed error={}", chain_one_line(&err)),
         },
-        None => eprintln!("event=UpgradeReportSkipped 无长期身份"),
+        None => log::warn!("event=UpgradeReportSkipped 无长期身份"),
     }
 }
 
@@ -525,7 +567,7 @@ async fn corroborate_recovery(
     self_client: &SelfReportClient,
     gateway_id: &str,
     timeout: Duration,
-) -> Result<String, String> {
+) -> UpgradeResult<String> {
     let deadline = Instant::now() + timeout;
     loop {
         // 单次探测不得超过剩余窗口：否则一次卡住的 fetch 会把窗口拖长到 HTTP_TIMEOUT(30s)。
@@ -538,14 +580,14 @@ async fn corroborate_recovery(
                 ));
             }
             Ok(Ok(state)) => format!("自述面健康度={}", state.health()),
-            Ok(Err(err)) => err,
+            Ok(Err(err)) => err.to_string(),
             Err(_) => "自述面探测超时".to_string(),
         };
         if Instant::now() >= deadline {
-            return Err(format!(
+            return Err(UpgradeReason::Recovery.err(format!(
                 "执行器报成但未能佐证（{}s 内）：{last}",
                 timeout.as_secs()
-            ));
+            )));
         }
         // 也别睡过 deadline。
         let sleep = RECOVERY_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()));

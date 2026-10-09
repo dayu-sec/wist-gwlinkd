@@ -6,6 +6,8 @@
 
 use rcgen::{CertificateParams, DnType, KeyPair};
 
+use crate::error::{CenterReason, CenterResult};
+
 /// 新生成的一套客户端密钥对与 CSR（PEM）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientKeypair {
@@ -17,17 +19,18 @@ pub struct ClientKeypair {
 
 /// 生成一套新的客户端密钥对与 CSR。`common_name` 仅作人类可读标签
 /// （权威身份是中心按 `gateway_id` 填的 URI SAN；主体以中心为准）。
-pub fn generate_client_keypair(common_name: &str) -> Result<ClientKeypair, String> {
-    let key = KeyPair::generate().map_err(|err| format!("生成客户端密钥失败: {err}"))?;
+pub fn generate_client_keypair(common_name: &str) -> CenterResult<ClientKeypair> {
+    let key = KeyPair::generate()
+        .map_err(|err| CenterReason::Local.err(format!("生成客户端密钥失败: {err}")))?;
     let mut params = CertificateParams::default();
     params
         .distinguished_name
         .push(DnType::CommonName, common_name.to_string());
     let csr_pem = params
         .serialize_request(&key)
-        .map_err(|err| format!("生成 CSR 失败: {err}"))?
+        .map_err(|err| CenterReason::Local.err(format!("生成 CSR 失败: {err}")))?
         .pem()
-        .map_err(|err| format!("CSR 编码 PEM 失败: {err}"))?;
+        .map_err(|err| CenterReason::Local.err(format!("CSR 编码 PEM 失败: {err}")))?;
     Ok(ClientKeypair {
         private_key_pem: key.serialize_pem(),
         csr_pem,

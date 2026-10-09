@@ -7,6 +7,10 @@
 //! 见设计 `wist-design/doc/design/edge/gateway-onboard-request.md`；网关侧对应 `api/link_request.rs`。
 //! 字段 snake_case（两侧同钉一份 fixture，任一侧改名即爆）。
 
+use orion_error::prelude::*;
+
+use crate::error::{CenterReason, CenterResult};
+
 /// 环回拉取到的接入请求（对应网关 `GatewayLinkRequest`，snake_case）。
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct GatewayLinkRequest {
@@ -46,7 +50,7 @@ impl LinkRequestClient {
     pub fn with_trust(
         endpoint: impl Into<String>,
         trust: Option<&std::path::Path>,
-    ) -> Result<Self, String> {
+    ) -> CenterResult<Self> {
         Ok(Self {
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
             http: crate::center::build_http_client(trust)?,
@@ -54,7 +58,7 @@ impl LinkRequestClient {
     }
 
     /// 拉取待办接入请求：`GET /api/v1/gateway/link-request?gateway_id=`。
-    pub async fn fetch(&self, gateway_id: &str) -> Result<GatewayLinkRequest, String> {
+    pub async fn fetch(&self, gateway_id: &str) -> CenterResult<GatewayLinkRequest> {
         let url = format!("{}/api/v1/gateway/link-request", self.endpoint);
         let response = self
             .http
@@ -63,17 +67,18 @@ impl LinkRequestClient {
             .header("accept", "application/json")
             .send()
             .await
-            .map_err(|err| format!("link-request 请求失败: {err}"))?;
+            .source_raw_err(CenterReason::Http, "link-request 请求失败")?;
         let status = response.status();
         let body = response
             .text()
             .await
-            .map_err(|err| format!("读取 link-request 响应体失败: {err}"))?;
+            .source_raw_err(CenterReason::Http, "读取 link-request 响应体失败")?;
         if !status.is_success() {
-            return Err(format!("link-request 失败（{status}）：{body}"));
+            return Err(CenterReason::Http.err(format!("link-request 失败（{status}）：{body}")));
         }
-        serde_json::from_str(&body)
-            .map_err(|err| format!("解析 link-request 响应失败: {err}；原文：{body}"))
+        serde_json::from_str(&body).map_err(|err| {
+            CenterReason::Decode.err(format!("解析 link-request 响应失败: {err}；原文：{body}"))
+        })
     }
 
     /// 回报接入结果：`POST /api/v1/gateway/link-result`。`status` = `Connected` | `Failed`。
@@ -82,7 +87,7 @@ impl LinkRequestClient {
         gateway_id: &str,
         status: &str,
         detail: &str,
-    ) -> Result<(), String> {
+    ) -> CenterResult<()> {
         let url = format!("{}/api/v1/gateway/link-result", self.endpoint);
         let response = self
             .http
@@ -94,11 +99,11 @@ impl LinkRequestClient {
             }))
             .send()
             .await
-            .map_err(|err| format!("link-result 请求失败: {err}"))?;
+            .source_raw_err(CenterReason::Http, "link-result 请求失败")?;
         let code = response.status();
         let body = response.text().await.unwrap_or_default();
         if !code.is_success() {
-            return Err(format!("link-result 失败（{code}）：{body}"));
+            return Err(CenterReason::Http.err(format!("link-result 失败（{code}）：{body}")));
         }
         Ok(())
     }
@@ -109,7 +114,7 @@ impl LinkRequestClient {
     pub async fn report_linkd_status(
         &self,
         status: &crate::linkd_status::GwlinkdStatus,
-    ) -> Result<(), String> {
+    ) -> CenterResult<()> {
         let url = format!("{}/api/v1/gateway/linkd-status", self.endpoint);
         let response = self
             .http
@@ -117,11 +122,11 @@ impl LinkRequestClient {
             .json(status)
             .send()
             .await
-            .map_err(|err| format!("linkd-status 请求失败: {err}"))?;
+            .source_raw_err(CenterReason::Http, "linkd-status 请求失败")?;
         let code = response.status();
         let body = response.text().await.unwrap_or_default();
         if !code.is_success() {
-            return Err(format!("linkd-status 失败（{code}）：{body}"));
+            return Err(CenterReason::Http.err(format!("linkd-status 失败（{code}）：{body}")));
         }
         Ok(())
     }

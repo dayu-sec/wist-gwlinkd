@@ -10,13 +10,14 @@
 use std::path::PathBuf;
 
 use super::{CONFIG_ENV, SERVICE_NAME, ServiceScope, ServiceSpec, home_dir};
+use crate::error::ServiceResult;
 
 const SYSTEM_UNIT_DIR: &str = "/etc/systemd/system";
 const USER_UNIT_DIR: &str = ".config/systemd/user";
 const UNIT_FILE_NAME: &str = "wist-gwlinkd.service";
 
 /// unit 文件落盘路径。
-pub fn unit_path(scope: ServiceScope) -> Result<PathBuf, String> {
+pub fn unit_path(scope: ServiceScope) -> ServiceResult<PathBuf> {
     match scope {
         ServiceScope::System => Ok(PathBuf::from(SYSTEM_UNIT_DIR).join(UNIT_FILE_NAME)),
         ServiceScope::User => Ok(home_dir()?.join(USER_UNIT_DIR).join(UNIT_FILE_NAME)),
@@ -40,6 +41,14 @@ pub fn unit_text(spec: &ServiceSpec) -> String {
     text.push_str("StartLimitBurst=10\n");
     text.push('\n');
     text.push_str("[Service]\n");
+    // system 作用域可选**非 root 运行**（`--run-as`）：身份材料回写、gops 升级都在部署用户下完成。
+    // user 作用域不加（那本就以本人运行；系统 also 不接受 User= 与自身冲突）。
+    if let Some(user) = spec.run_as_identity() {
+        text.push_str(&format!("User={}\n", systemd_arg(user)));
+        if let Some(group) = spec.run_as_group.as_deref() {
+            text.push_str(&format!("Group={}\n", systemd_arg(group)));
+        }
+    }
     text.push_str("Type=simple\n");
     text.push_str(&format!(
         "ExecStart={} run\n",

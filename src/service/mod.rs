@@ -17,6 +17,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use orion_error::prelude::*;
+
+use crate::error::{ServiceReason, ServiceResult};
+
 pub mod launchd;
 pub mod systemd;
 
@@ -93,7 +97,7 @@ pub struct ServiceLayout {
 
 impl ServiceLayout {
     /// 按平台/作用域解析标准安装位置。
-    pub fn resolve(platform: ServicePlatform, scope: ServiceScope) -> Result<Self, String> {
+    pub fn resolve(platform: ServicePlatform, scope: ServiceScope) -> ServiceResult<Self> {
         let (definition_path, log_dir) = match platform {
             ServicePlatform::Systemd => (systemd::unit_path(scope)?, None),
             ServicePlatform::Launchd => {
@@ -132,6 +136,14 @@ pub struct ServiceSpec {
     pub bin: PathBuf,
     /// **绝对**配置路径（`gwlinkd.toml`；服务启动时工作目录不确定）。
     pub config_path: PathBuf,
+    /// `system` 作用域下**以该用户身份运行**（systemd `User=` / launchd `UserName`）。
+    /// `None` = 沿用默认（system 作用域 = root）。
+    /// 为什么要它：gwlinkd 会回写 `gwlinkd.toml`（接入券）、在 `state_dir` 落身份/凭据，
+    /// 且 `upgrader` 会在 `upgrade_project_dir` 里跑 `gops prj upgrade` —— 这些都应是**部署用户**
+    /// 的属主，不能是 root。`user` 作用域无此字段（那本就以本人运行）。
+    pub run_as: Option<String>,
+    /// 与 [`Self::run_as`] 配套的组（systemd `Group=` / launchd `GroupName`）；`None` = 用户主组。
+    pub run_as_group: Option<String>,
 }
 
 impl ServiceSpec {
@@ -140,6 +152,23 @@ impl ServiceSpec {
             scope,
             bin,
             config_path,
+            run_as: None,
+            run_as_group: None,
+        }
+    }
+
+    /// 设置 `system` 作用域的运行身份（`--run-as` / `--run-as-group`）。
+    pub fn with_run_as(mut self, run_as: Option<String>, run_as_group: Option<String>) -> Self {
+        self.run_as = run_as;
+        self.run_as_group = run_as_group;
+        self
+    }
+
+    /// 运行身份是否完整可用（systemd `User=` 才认；user 作用域忽略该字段）。
+    pub fn run_as_identity(&self) -> Option<&str> {
+        match self.scope {
+            ServiceScope::System => self.run_as.as_deref(),
+            ServiceScope::User => None,
         }
     }
 
@@ -174,15 +203,15 @@ pub fn render(layout: &ServiceLayout, spec: &ServiceSpec) -> String {
 }
 
 /// `$HOME` 目录（user 作用域的所有路径都挂在它下面）。
-pub fn home_dir() -> Result<PathBuf, String> {
+pub fn home_dir() -> ServiceResult<PathBuf> {
     std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| "HOME 未设置；请显式给 --config / --bin".to_string())
+        .ok_or_else(|| ServiceReason::MissingEnv.err("HOME 未设置；请显式给 --config / --bin"))
 }
 
 /// 作用域的默认配置目录：system → `/etc/wist-gwlinkd`；user → `$HOME/.wist-gwlinkd`。
-pub fn default_config_dir(scope: ServiceScope) -> Result<PathBuf, String> {
+pub fn default_config_dir(scope: ServiceScope) -> ServiceResult<PathBuf> {
     match scope {
         ServiceScope::System => Ok(PathBuf::from(SYSTEM_CONFIG_DIR)),
         ServiceScope::User => Ok(home_dir()?.join(USER_CONFIG_DIR_NAME)),
@@ -190,14 +219,16 @@ pub fn default_config_dir(scope: ServiceScope) -> Result<PathBuf, String> {
 }
 
 /// 作用域默认配置**文件**路径（`<config_dir>/gwlinkd.toml`）。
-pub fn default_config_path(scope: ServiceScope) -> Result<PathBuf, String> {
+pub fn default_config_path(scope: ServiceScope) -> ServiceResult<PathBuf> {
     Ok(default_config_dir(scope)?.join(CONFIG_FILE_NAME))
 }
 
 /// 当前可执行文件的规范化绝对路径，作为 `--bin` 的默认值。
-pub fn default_bin() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe()
-        .map_err(|err| format!("解析当前可执行文件失败（service install）: {err}"))?;
+pub fn default_bin() -> ServiceResult<PathBuf> {
+    let exe = std::env::current_exe().source_err(
+        ServiceReason::Io,
+        "解析当前可执行文件失败（service install）",
+    )?;
     Ok(fs::canonicalize(&exe).unwrap_or(exe))
 }
 
@@ -216,31 +247,40 @@ pub fn install(
     layout: &ServiceLayout,
     spec: &ServiceSpec,
     force: bool,
-) -> Result<InstallReport, String> {
+) -> ServiceResult<InstallReport> {
     reject_unrepresentable_path(spec)?;
 
     let definition_path = layout.definition_path.clone();
     let existed = definition_path.exists();
     if existed && !force {
-        return Err(format!(
+        return Err(ServiceReason::InvalidArgs.err(format!(
             "服务定义已存在：{}（要覆盖请加 --force）",
             definition_path.display()
-        ));
+        )));
     }
 
-    let parent = definition_path
-        .parent()
-        .ok_or_else(|| format!("{} 没有父目录", definition_path.display()))?;
-    fs::create_dir_all(parent).map_err(|err| format!("建目录 {} 失败: {err}", parent.display()))?;
+    let parent = definition_path.parent().ok_or_else(|| {
+        ServiceReason::InvalidArgs.err(format!("{} 没有父目录", definition_path.display()))
+    })?;
+    fs::create_dir_all(parent).source_err(
+        ServiceReason::Io,
+        format!("建目录 {} 失败", parent.display()),
+    )?;
 
     // 原子写：先写临时文件再 rename，避免留下半截的服务定义。
     let text = render(layout, spec);
-    write_atomic(&definition_path, text.as_bytes())
-        .map_err(|err| format!("写服务定义 {} 失败: {err}", definition_path.display()))?;
+    write_atomic(&definition_path, text.as_bytes()).map_err(|err| {
+        ServiceReason::Io.err(format!(
+            "写服务定义 {} 失败: {err}",
+            definition_path.display()
+        ))
+    })?;
 
     if let Some(log_dir) = layout.log_dir.as_ref() {
-        fs::create_dir_all(log_dir)
-            .map_err(|err| format!("建日志目录 {} 失败: {err}", log_dir.display()))?;
+        fs::create_dir_all(log_dir).source_err(
+            ServiceReason::Io,
+            format!("建日志目录 {} 失败", log_dir.display()),
+        )?;
     }
 
     Ok(InstallReport {
@@ -253,25 +293,26 @@ pub fn install(
 }
 
 /// 删除服务定义（不做任何服务管理器调用），返回是否真的删掉了文件。
-pub fn remove(layout: &ServiceLayout) -> Result<bool, String> {
+pub fn remove(layout: &ServiceLayout) -> ServiceResult<bool> {
     match fs::remove_file(&layout.definition_path) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(format!(
+        Err(err) => Err(ServiceReason::Io.err(format!(
             "删除服务定义 {} 失败: {err}",
             layout.definition_path.display()
-        )),
+        ))),
     }
 }
 
 /// 服务定义是**行/XML 结构**：含换行的路径无法安全表达（会被当成下一条指令），直接拒绝。
-fn reject_unrepresentable_path(spec: &ServiceSpec) -> Result<(), String> {
+fn reject_unrepresentable_path(spec: &ServiceSpec) -> ServiceResult<()> {
     for (label, value) in [
         ("binary", spec.bin.display().to_string()),
         ("config path", spec.config_path.display().to_string()),
     ] {
         if value.contains('\n') || value.contains('\r') {
-            return Err(format!("{label} 含换行，无法写进服务定义：{value:?}"));
+            return Err(ServiceReason::InvalidArgs
+                .err(format!("{label} 含换行，无法写进服务定义：{value:?}")));
         }
     }
     Ok(())
@@ -448,12 +489,12 @@ pub struct ServiceStatus {
 }
 
 /// 采集服务状态。
-pub fn status(layout: &ServiceLayout, spec: &ServiceSpec) -> Result<ServiceStatus, String> {
+pub fn status(layout: &ServiceLayout, spec: &ServiceSpec) -> ServiceResult<ServiceStatus> {
     let config_present = spec.config_path.is_file();
     let (config, config_error) = if config_present {
         match crate::config::Config::load(&spec.config_path) {
             Ok(config) => (Some(config), None),
-            Err(err) => (None, Some(err)),
+            Err(err) => (None, Some(err.to_string())),
         }
     } else {
         (None, None)
@@ -462,7 +503,8 @@ pub fn status(layout: &ServiceLayout, spec: &ServiceSpec) -> Result<ServiceStatu
     let running = state_dir
         .as_deref()
         .map(crate::state::is_running)
-        .transpose()?;
+        .transpose()
+        .map_err(|err| ServiceReason::Io.err(err.to_string()))?;
 
     Ok(ServiceStatus {
         platform: layout.platform,
@@ -481,7 +523,7 @@ pub fn status(layout: &ServiceLayout, spec: &ServiceSpec) -> Result<ServiceStatu
 }
 
 /// 日志查看提示（systemd 走 journald，launchd 走落盘文件）。
-pub fn log_hint(layout: &ServiceLayout) -> Result<String, String> {
+pub fn log_hint(layout: &ServiceLayout) -> ServiceResult<String> {
     match layout.platform {
         ServicePlatform::Systemd => {
             let scope = match layout.scope {
@@ -494,7 +536,7 @@ pub fn log_hint(layout: &ServiceLayout) -> Result<String, String> {
             let log_dir = layout
                 .log_dir
                 .clone()
-                .ok_or_else(|| "launchd 缺日志目录".to_string())?;
+                .ok_or_else(|| ServiceReason::MissingEnv.err("launchd 缺日志目录"))?;
             Ok(format!(
                 "tail -f {}",
                 log_dir.join(launchd::STDERR_FILE).display()
@@ -504,11 +546,14 @@ pub fn log_hint(layout: &ServiceLayout) -> Result<String, String> {
 }
 
 /// 执行一条服务管理器命令，返回是否成功（含 stdout / stderr 供 CLI 回显）。
-pub fn run(command: &ServiceCommand) -> Result<ServiceCommandOutcome, String> {
+pub fn run(command: &ServiceCommand) -> ServiceResult<ServiceCommandOutcome> {
     let output = std::process::Command::new(&command.program)
         .args(&command.args)
         .output()
-        .map_err(|err| format!("执行 `{}` 失败: {err}", command.display_line()))?;
+        .source_err(
+            ServiceReason::Command,
+            format!("执行 `{}` 失败", command.display_line()),
+        )?;
 
     Ok(ServiceCommandOutcome {
         command: command.clone(),
@@ -519,7 +564,7 @@ pub fn run(command: &ServiceCommand) -> Result<ServiceCommandOutcome, String> {
 }
 
 /// 按 `command.retries` 重试执行：成功立刻返回，失败才等待后重试，返回**最后一次**结果。
-pub fn run_with_retries(command: &ServiceCommand) -> Result<ServiceCommandOutcome, String> {
+pub fn run_with_retries(command: &ServiceCommand) -> ServiceResult<ServiceCommandOutcome> {
     let mut attempt = 0;
     loop {
         let outcome = run(command)?;
@@ -604,6 +649,51 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("WantedBy=multi-user.target"), "{text}");
+    }
+
+    #[test]
+    fn systemd_render_sets_run_as_user_and_group_for_system_scope() {
+        let layout = ServiceLayout::for_paths(
+            ServicePlatform::Systemd,
+            ServiceScope::System,
+            PathBuf::from("/etc/systemd/system/wist-gwlinkd.service"),
+            None,
+        );
+        let spec = spec(ServiceScope::System)
+            .with_run_as(Some("deploy".to_string()), Some("deploy".to_string()));
+        let text = render(&layout, &spec);
+        assert!(text.contains("User=deploy"), "{text}");
+        assert!(text.contains("Group=deploy"), "{text}");
+        // 仍是一个 system 级 unit（而非 user 级）。
+        assert!(text.contains("WantedBy=multi-user.target"), "{text}");
+    }
+
+    #[test]
+    fn systemd_render_omits_run_as_for_user_scope() {
+        // user 作用域本就以本人运行，不接受 User=（会与 user manager 冲突）。
+        let layout = ServiceLayout::for_paths(
+            ServicePlatform::Systemd,
+            ServiceScope::User,
+            PathBuf::from("/home/deploy/.config/systemd/user/wist-gwlinkd.service"),
+            None,
+        );
+        let spec = spec(ServiceScope::User).with_run_as(Some("deploy".to_string()), None);
+        let text = render(&layout, &spec);
+        assert!(!text.contains("User="), "{text}");
+    }
+
+    #[test]
+    fn launchd_render_sets_user_name_for_system_scope() {
+        let layout = ServiceLayout::for_paths(
+            ServicePlatform::Launchd,
+            ServiceScope::System,
+            PathBuf::from("/Library/LaunchDaemons/com.dayu-sec.wist-gwlinkd.plist"),
+            Some(PathBuf::from("/var/log/wist-gwlinkd")),
+        );
+        let spec = spec(ServiceScope::System).with_run_as(Some("deploy".to_string()), None);
+        let text = render(&layout, &spec);
+        assert!(text.contains("<key>UserName</key>"), "{text}");
+        assert!(text.contains("<string>deploy</string>"), "{text}");
     }
 
     #[test]

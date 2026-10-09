@@ -1,15 +1,20 @@
-//! `wist-gwlinkd` CLI：`run`（常驻，默认）/ `diagnose` / `service` / `version`。
+//! `wist-gwlinkd` CLI：`run`（常驻，默认）/ `unlink` / `diagnose` / `service` / `version`。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime};
 
+use orion_error::prelude::*;
 use wist_control::{DateTime, ReportGatewayStatus};
 use wist_gwlinkd::agent_package::{AgentPackageClient, AgentPackageItem};
-use wist_gwlinkd::center::{self, CenterClient, CenterError};
+use wist_gwlinkd::center::{self, CenterClient};
 use wist_gwlinkd::config::{Config, UpgradeInstall, upsert_link_settings};
 use wist_gwlinkd::doctor::{self, Status};
+use wist_gwlinkd::error::{
+    CenterError, CenterReason, CenterResult, GwlinkdError, GwlinkdReason, GwlinkdResult,
+    OpLoggable, chain_one_line, logged_op,
+};
 use wist_gwlinkd::executor::{DEFAULT_ON_FAILURE, DEFAULT_UPGRADER_PROGRAM, GopsExecutor};
 use wist_gwlinkd::identity;
 use wist_gwlinkd::link_request::LinkRequestClient;
@@ -20,6 +25,7 @@ use wist_gwlinkd::selfreport::SelfReportClient;
 use wist_gwlinkd::service;
 use wist_gwlinkd::state::{self, CredentialStatus, UpgradeCursor, UpgradeRecord};
 use wist_gwlinkd::tool_install::ToolInstaller;
+use wist_gwlinkd::unlink::{self, UnlinkReport};
 use wist_gwlinkd::upgrade::{RECOVERY_VERIFY_TIMEOUT, UpgradeDriver, UpgradeReporter};
 
 /// 运行期状态上报周期（秒）。
@@ -35,8 +41,20 @@ fn config_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(wist_gwlinkd::DEFAULT_CONFIG_PATH))
 }
 
+/// 尽力按配置文件里的 `[log]` 段初始化日志；配置读不了就回落缺省（stderr / info）。
+///
+/// 用于不强制读配置的子命令（`service`）—— 有配置就尊重它的落点 / 级别，没有也不报错。
+fn init_logging_from_config_or_default() {
+    match Config::load(&config_path()) {
+        Ok(config) => wist_gwlinkd::logging::init(&config.log),
+        Err(_) => wist_gwlinkd::logging::init(&Default::default()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    // 日志在**读到配置之后**才初始化（`[log]` 段决定级别 / 格式 / 落点）；配置读不了时
+    // 日志还没起来，就直写 stderr —— 不要让启动失败静默。
     let command = std::env::args().nth(1).unwrap_or_else(|| "run".to_string());
     match command.as_str() {
         "version" | "-V" | "--version" => {
@@ -44,39 +62,50 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "diagnose" => match Config::load(&config_path()) {
-            Ok(config) => run_diagnose(&config),
+            Ok(config) => {
+                wist_gwlinkd::logging::init(&config.log);
+                run_diagnose(&config)
+            }
             Err(err) => {
-                eprintln!("[FAIL] 配置不可读：{err}");
+                eprintln!("[FAIL] 配置不可读：{}", err.display_chain());
                 ExitCode::FAILURE
             }
         },
-        "service" => run_service(&std::env::args().skip(2).collect::<Vec<_>>()),
+        "service" => {
+            init_logging_from_config_or_default();
+            run_service(&std::env::args().skip(2).collect::<Vec<_>>())
+        }
+        "unlink" => run_unlink(&std::env::args().skip(2).collect::<Vec<_>>()).await,
         "init-config" => match init_config_command(std::env::args().nth(2)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
-                eprintln!("[FAIL] {err}");
+                eprintln!("[FAIL] {}", err.display_chain());
                 ExitCode::FAILURE
             }
         },
         "run" => {
             let path = config_path();
             match Config::load(&path) {
-                Ok(config) => match run(&config, &path).await {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(err) => {
-                        eprintln!("[FAIL] {err}");
-                        ExitCode::FAILURE
+                Ok(config) => {
+                    wist_gwlinkd::logging::init(&config.log);
+                    match run(&config, &path).await {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(err) => {
+                            log::error!("event=RunFailed error={}", chain_one_line(&err));
+                            eprintln!("[FAIL] {}", err.display_chain());
+                            ExitCode::FAILURE
+                        }
                     }
-                },
+                }
                 Err(err) => {
-                    eprintln!("[FAIL] 配置不可读：{err}");
+                    eprintln!("[FAIL] 配置不可读：{}", err.display_chain());
                     ExitCode::FAILURE
                 }
             }
         }
         other => {
             eprintln!(
-                "unknown command: {other}（可用：run | diagnose | service | init-config | version）"
+                "unknown command: {other}（可用：run | unlink | diagnose | service | init-config | version）"
             );
             ExitCode::from(2)
         }
@@ -87,18 +116,22 @@ async fn main() -> ExitCode {
 ///
 /// 与 `wist-gateway init-config` 同一套路：由程序生成，避免手抄。**不含密钥**；接入券
 /// `link_token` 由「链接上级」页 / gwlinkd 自联时写回。已存在同名文件时**覆盖**（会在输出里注明）。
-fn init_config_command(out_arg: Option<String>) -> Result<(), String> {
+fn init_config_command(out_arg: Option<String>) -> GwlinkdResult<()> {
     let out_path = out_arg.map(PathBuf::from).unwrap_or_else(config_path);
     if let Some(parent) = out_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("创建目录失败 {}: {err}", parent.display()))?;
+        std::fs::create_dir_all(parent).source_err(
+            GwlinkdReason::Config,
+            format!("创建目录失败 {}", parent.display()),
+        )?;
     }
     let existed = out_path.exists();
-    std::fs::write(&out_path, wist_gwlinkd::config::default_config_text())
-        .map_err(|err| format!("写入失败 {}: {err}", out_path.display()))?;
+    std::fs::write(&out_path, wist_gwlinkd::config::default_config_text()).source_err(
+        GwlinkdReason::Config,
+        format!("写入失败 {}", out_path.display()),
+    )?;
     if existed {
         println!("已覆盖原有配置：{}", out_path.display());
     } else {
@@ -112,11 +145,13 @@ fn init_config_command(out_arg: Option<String>) -> Result<(), String> {
 }
 
 /// 常驻：单实例 → 首跑置备（若未注册）→ 周期【续期 / 拉升级目标 / 拉自述面 / 上报状态】。
-async fn run(config: &Config, path: &Path) -> Result<(), String> {
+async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
     // 单实例：同机只允许一个常驻（否则双重上报 + 双重驱动升级）。持有到进程退出。
-    let _lock = state::acquire_single_instance_lock(&config.state_dir)?;
+    let _lock = state::acquire_single_instance_lock(&config.state_dir)
+        .map_err(|err| GwlinkdReason::AlreadyRunning.err(err))?;
 
-    let identity = state::load_or_create_identity(&config.state_dir)?;
+    let identity = state::load_or_create_identity(&config.state_dir)
+        .map_err(|err| GwlinkdReason::Identity.err(err))?;
 
     match state::credential_status(&config.state_dir) {
         CredentialStatus::Present(_) => {
@@ -131,20 +166,20 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
         }
         CredentialStatus::Corrupt(detail) => {
             // 损坏 ≠ 缺失：不能静默重置备（会覆盖掉唯一一份长期身份）。
-            return Err(format!(
+            return Err(GwlinkdReason::Identity.err(format!(
                 "长期身份损坏：{detail}；修复或删除 state/credential.json 后重跑（若中心已初始化该实例，需先在中心重置）"
-            ));
+            )));
         }
     }
     // 首跑那步可能**改写了配置文件**（写入 gateway_id / center endpoint / 券）——在这里**重读**一次：
     // 否则后续周期（上报 / 续期 / 升级）仍用**旧 gateway_id**，中心按客户端证书认人 → `certificate_mismatch`。
-    let reloaded = Config::load(path)?;
+    let reloaded = Config::load(path).conv_err()?;
     let config: &Config = &reloaded;
     let trust_bundle = config.trust_bundle.clone();
     let trust: Option<&Path> = if trust_bundle.exists() {
         Some(trust_bundle.as_path())
     } else {
-        eprintln!(
+        log::warn!(
             "event=TrustBundleMissing path={}（回落公共根）",
             trust_bundle.display()
         );
@@ -152,32 +187,33 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
     };
 
     let mut credential = state::load_credential(&config.state_dir)
-        .ok_or_else(|| "注册后仍无长期身份".to_string())?;
+        .ok_or_else(|| GwlinkdReason::Identity.err("注册后仍无长期身份"))?;
     // 注册后所有网关面调用都走 **mTLS**（客户端证书认人）；续期后重建。
     let mut client = mtls_client(config, trust, &credential)?;
-    let instance_id = state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)?;
+    let instance_id = state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)
+        .map_err(|err| GwlinkdReason::Identity.err(err))?;
 
     let self_client = match config.gateway_self_endpoint.as_deref() {
-        Some(base) => Some(SelfReportClient::with_trust(
-            base,
-            config.gateway_self_ca.as_deref(),
-        )?),
+        Some(base) => Some(
+            SelfReportClient::with_trust(base, config.gateway_self_ca.as_deref())
+                .map_err(|err| GwlinkdReason::system_error().err(err))?,
+        ),
         None => None,
     };
     // gwlinkd 心跳：推自身状态给网关（页面拉不到 gwlinkd —— 它纯出站）。同环回面 + 同一信任锚。
     let linkd_client = match config.gateway_self_endpoint.as_deref() {
-        Some(base) => Some(LinkRequestClient::with_trust(
-            base,
-            config.gateway_self_ca.as_deref(),
-        )?),
+        Some(base) => Some(
+            LinkRequestClient::with_trust(base, config.gateway_self_ca.as_deref())
+                .map_err(|err| GwlinkdReason::system_error().err(err))?,
+        ),
         None => None,
     };
     // 「Agent 包下发」（发布 ②）：同环回面 + 同一信任锚，把中心派下的 agentd 包写进网关包管理。
     let agent_package_client = match config.gateway_self_endpoint.as_deref() {
-        Some(base) => Some(AgentPackageClient::with_trust(
-            base,
-            config.gateway_self_ca.as_deref(),
-        )?),
+        Some(base) => Some(
+            AgentPackageClient::with_trust(base, config.gateway_self_ca.as_deref())
+                .map_err(|err| GwlinkdReason::system_error().err(err))?,
+        ),
         None => None,
     };
     let renew_lead = config.renew_lead_seconds.unwrap_or(3600);
@@ -218,7 +254,7 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
         .filter(|entry| entry.install == UpgradeInstall::ToolCopy)
         .map(|entry| {
             if entry.binary.as_deref().unwrap_or("").trim().is_empty() {
-                eprintln!(
+                log::warn!(
                     "event=UpgradeComponentInvalid name={} install=tool-copy 缺 binary（将没法安装）",
                     entry.name
                 );
@@ -265,14 +301,14 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
     {
         if config.upgrade_retry_on_dead.unwrap_or(true) {
             // 清游标 → 同一计划可被下面的循环重新驱动。并发安全：gops 自带工程交付锁串行化两次调用。
-            eprintln!("event=DeadUpgradeDetected 清游标以便重驱同一计划");
+            log::warn!("event=DeadUpgradeDetected 清游标以便重驱同一计划");
             if let Err(err) =
                 state::save_upgrade_cursor(&config.state_dir, &UpgradeCursor::default())
             {
-                eprintln!("event=CursorClearFailed error={err}");
+                log::error!("event=CursorClearFailed error={}", chain_one_line(&err));
             }
         } else {
-            eprintln!(
+            log::warn!(
                 "event=DeadUpgradeDetected 未自动重试（upgrade_retry_on_dead=false）：请到管理面重派升级"
             );
         }
@@ -284,19 +320,25 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
         // 上一轮轮换若有收尾未完成（内存/磁盘/客户端未对齐），先自愈重试。
         if credential_dirty && let Err(err) = state::save_credential(&config.state_dir, &credential)
         {
-            eprintln!("event=CredentialSaveRetryFailed error={err}");
+            log::warn!(
+                "event=CredentialSaveRetryFailed error={}",
+                chain_one_line(&err)
+            );
         } else if credential_dirty {
             credential_dirty = false;
-            println!("event=CredentialSaved gateway_id={}", config.gateway_id);
+            log::info!("event=CredentialSaved gateway_id={}", config.gateway_id);
         }
         if client_stale {
             match mtls_client(config, trust, &credential) {
                 Ok(rebuilt) => {
                     client = rebuilt;
                     client_stale = false;
-                    println!("event=MtlsClientRebuilt gateway_id={}", config.gateway_id);
+                    log::info!("event=MtlsClientRebuilt gateway_id={}", config.gateway_id);
                 }
-                Err(err) => eprintln!("event=MtlsClientRebuildRetryFailed error={err}"),
+                Err(err) => log::warn!(
+                    "event=MtlsClientRebuildRetryFailed error={}",
+                    chain_one_line(&err)
+                ),
             }
         }
 
@@ -309,15 +351,22 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
                     next_renew_at = Instant::now() + renew_backoff;
                     linkd_state = STATE_DEGRADED.to_string();
                     linkd_last_error = Some(format!("续期密钥生成失败：{err}"));
-                    eprintln!("event=RenewFailed backoff={renew_backoff:?} error={err}");
+                    log::warn!(
+                        "event=RenewFailed backoff={renew_backoff:?} error={}",
+                        chain_one_line(&err)
+                    );
                     continue;
                 }
             };
             let current_serial = credential.certificate_serial_hex().unwrap_or_default();
-            match client
-                .renew_credential(&config.gateway_id, &current_serial, &keypair.csr_pem)
-                .await
-            {
+            match logged_op(
+                module_path!(),
+                "center renew credential",
+                &[("gateway_id", config.gateway_id.clone())],
+                client
+                    .renew_credential(&config.gateway_id, &current_serial, &keypair.csr_pem)
+                    .await,
+            ) {
                 Ok(renewed) => {
                     let new_credential = state::StoredCredential {
                         bundle: renewed,
@@ -333,26 +382,35 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
                         }
                         Err(err) => {
                             client_stale = true;
-                            eprintln!("event=MtlsClientRebuildFailed error={err}");
+                            log::error!(
+                                "event=MtlsClientRebuildFailed error={}",
+                                chain_one_line(&err)
+                            );
                         }
                     }
                     match state::save_credential(&config.state_dir, &credential) {
                         Ok(()) => credential_dirty = false,
                         Err(err) => {
                             credential_dirty = true;
-                            eprintln!("event=CredentialSaveFailed error={err}");
+                            log::error!(
+                                "event=CredentialSaveFailed error={}",
+                                chain_one_line(&err)
+                            );
                         }
                     }
                     renew_backoff = Duration::ZERO;
                     next_renew_at = Instant::now();
-                    println!("event=CredentialRenewed gateway_id={}", config.gateway_id);
+                    log::info!("event=CredentialRenewed gateway_id={}", config.gateway_id);
                 }
                 Err(err) => {
                     renew_backoff = back_off(renew_backoff);
                     next_renew_at = Instant::now() + renew_backoff;
                     linkd_state = STATE_DEGRADED.to_string();
                     linkd_last_error = Some(format!("凭据续期失败：{err}"));
-                    eprintln!("event=RenewFailed backoff={renew_backoff:?} error={err}");
+                    log::warn!(
+                        "event=RenewFailed backoff={renew_backoff:?} error={}",
+                        chain_one_line(&err)
+                    );
                 }
             }
         }
@@ -382,7 +440,7 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
                         } else {
                             cursor.last_to_version.clone()
                         };
-                        println!(
+                        log::info!(
                             "event=UpgradeDriven plan_id={:?} action={action} to_version={to_version} component={:?} sha256={}",
                             plan.plan_id,
                             plan.component,
@@ -394,7 +452,7 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
                                 Some(pusher) => {
                                     drive_agent_package_push(config, &client, pusher, &plan).await
                                 }
-                                None => eprintln!(
+                                None => log::warn!(
                                     "event=AgentPackagePushSkipped reason=no_gateway_self_endpoint plan_id={:?}",
                                     plan.plan_id
                                 ),
@@ -406,20 +464,27 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
                                 self_client: self_client.clone(),
                             };
                             // **不**用 `?`：驱动失败（执行器缺失/架构不符…）绝不能把链路常驻整个拖死。
-                            match driver
-                                .start_with_digest(
-                                    plan.plan_id.as_deref().unwrap_or("plan"),
-                                    &from_version,
-                                    &to_version,
-                                    plan.component.as_deref(),
-                                    Some(reporter),
-                                    // 中心派生的制品地址（执行器取件用它）；无则回落 `to_version`。
-                                    plan.artifact_url.as_deref(),
-                                    // 中心带的期望摘要；gops 路径忽略它，无状态工具路径用它。
-                                    plan.artifact_sha256.as_deref(),
-                                )
-                                .await
-                            {
+                            match logged_op(
+                                module_path!(),
+                                "upgrade drive",
+                                &[
+                                    ("work_id", plan.plan_id.clone().unwrap_or_default()),
+                                    ("to_version", to_version.clone()),
+                                ],
+                                driver
+                                    .start_with_digest(
+                                        plan.plan_id.as_deref().unwrap_or("plan"),
+                                        &from_version,
+                                        &to_version,
+                                        plan.component.as_deref(),
+                                        Some(reporter),
+                                        // 中心派生的制品地址（执行器取件用它）；无则回落 `to_version`。
+                                        plan.artifact_url.as_deref(),
+                                        // 中心带的期望摘要；gops 路径忽略它，无状态工具路径用它。
+                                        plan.artifact_sha256.as_deref(),
+                                    )
+                                    .await,
+                            ) {
                                 Ok(()) => {
                                     // 先落游标再继续：跨重启幂等据此判定。
                                     if let Err(err) = state::save_upgrade_cursor(
@@ -429,16 +494,22 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
                                             last_to_version: to_version,
                                         },
                                     ) {
-                                        eprintln!("event=CursorSaveFailed error={err}");
+                                        log::warn!(
+                                            "event=CursorSaveFailed error={}",
+                                            chain_one_line(&err)
+                                        );
                                     }
                                 }
-                                Err(err) => eprintln!("event=UpgradeDriveFailed error={err}"),
+                                Err(err) => log::error!(
+                                    "event=UpgradeDriveFailed error={}",
+                                    chain_one_line(&err)
+                                ),
                             }
                         }
                     }
                 }
                 Ok(_) => {}
-                Err(err) => eprintln!("event=UpgradePlanFailed error={err}"),
+                Err(err) => log::warn!("event=UpgradePlanFailed error={}", chain_one_line(&err)),
             }
         }
 
@@ -447,7 +518,7 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
             Some(self_client) => match self_client.fetch(&config.gateway_id).await {
                 Ok(self_state) => Some(self_state),
                 Err(err) => {
-                    eprintln!("event=SelfStateFailed error={err}");
+                    log::warn!("event=SelfStateFailed error={}", chain_one_line(&err));
                     None
                 }
             },
@@ -525,7 +596,7 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
                     linkd_state = STATE_LINKED.to_string();
                     linkd_last_error = None;
                     linkd_last_report_at = Some(linkd_status::now_rfc3339());
-                    println!("event=StatusReported gateway_id={}", config.gateway_id);
+                    log::info!("event=StatusReported gateway_id={}", config.gateway_id);
                 }
                 Err(err) if err.is_unauthorized() => {
                     // 客户端证书被拒：**退避**（不每 30s 猛击），并明确要中心重置该实例。
@@ -533,15 +604,16 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
                     next_status_at = Instant::now() + status_backoff;
                     linkd_state = STATE_DEGRADED.to_string();
                     linkd_last_error = Some(format!("中心拒绝了客户端证书：{err}"));
-                    eprintln!(
-                        "event=CredentialRejected gateway_id={} backoff={status_backoff:?}（客户端证书已失效；需管理员在中心重置该实例后重新置备）error={err}",
-                        config.gateway_id
+                    log::error!(
+                        "event=CredentialRejected gateway_id={} backoff={status_backoff:?}（客户端证书已失效；需管理员在中心重置该实例后重新置备）error={}",
+                        config.gateway_id,
+                        chain_one_line(&err)
                     );
                 }
                 Err(err) => {
                     linkd_state = STATE_DEGRADED.to_string();
                     linkd_last_error = Some(format!("状态上报失败：{err}"));
-                    eprintln!("event=StatusReportFailed error={err}");
+                    log::error!("event=StatusReportFailed error={}", chain_one_line(&err));
                 }
             }
         }
@@ -564,7 +636,7 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
                 reported_at: DateTime::now(),
             };
             if let Err(err) = linkd_client.report_linkd_status(&status).await {
-                eprintln!("event=LinkdStatusPushFailed error={err}");
+                log::warn!("event=LinkdStatusPushFailed error={}", chain_one_line(&err));
             }
         }
     }
@@ -591,17 +663,20 @@ async fn drive_agent_package_push(
                     .map(|(platform, _, _)| platform.as_str())
                     .collect::<Vec<_>>()
                     .join(",");
-                println!(
+                log::info!(
                     "event=AgentPackagePushed plan_id={plan_id} platforms={platforms} to_version={to_version}"
                 );
                 ("done", String::new())
             }
             Err(err) => {
-                eprintln!("event=AgentPackagePushFailed plan_id={plan_id} error={err}");
-                ("failed", err)
+                log::error!(
+                    "event=AgentPackagePushFailed plan_id={plan_id} error={}",
+                    chain_one_line(&err)
+                );
+                ("failed", err.to_string())
             }
         },
-        Err(message) => ("failed", message),
+        Err(message) => ("failed", message.to_string()),
     };
     // 回执中心：回填发布计划条目（状态折算在中心侧；`done → succeeded`）。
     let record = UpgradeRecord {
@@ -616,7 +691,10 @@ async fn drive_agent_package_push(
         .report_upgrade_result(&config.gateway_id, &record)
         .await
     {
-        eprintln!("event=AgentPackageResultReportFailed plan_id={plan_id} error={err}");
+        log::warn!(
+            "event=AgentPackageResultReportFailed plan_id={plan_id} error={}",
+            chain_one_line(&err)
+        );
     }
     if let Err(err) = state::save_upgrade_cursor(
         &config.state_dir,
@@ -625,7 +703,7 @@ async fn drive_agent_package_push(
             last_to_version: to_version,
         },
     ) {
-        eprintln!("event=CursorSaveFailed error={err}");
+        log::warn!("event=CursorSaveFailed error={}", chain_one_line(&err));
     }
 }
 
@@ -634,7 +712,7 @@ async fn drive_agent_package_push(
 /// 三样缺一不可，缺则报出可读原因。
 fn target_artifacts(
     plan: &wist_control::GatewayUpgradePlan,
-) -> Result<Vec<(String, String, String)>, String> {
+) -> GwlinkdResult<Vec<(String, String, String)>> {
     if !plan.artifacts.is_empty() {
         return Ok(plan
             .artifacts
@@ -651,14 +729,14 @@ fn target_artifacts(
     let artifact_url = plan
         .artifact_url
         .clone()
-        .ok_or_else(|| "中心未派生制品地址（该版本未发布？）".to_string())?;
+        .ok_or_else(|| GwlinkdReason::AgentPackage.err("中心未派生制品地址（该版本未发布？）"))?;
     let artifact_sha256 = plan
         .artifact_sha256
         .clone()
-        .ok_or_else(|| "中心未带制品摘要（artifact_sha256）".to_string())?;
+        .ok_or_else(|| GwlinkdReason::AgentPackage.err("中心未带制品摘要（artifact_sha256）"))?;
     let platform = wist_gwlinkd::target::HostTarget::detect()
         .target_triple()
-        .ok_or_else(|| "认不出本机平台（target-triple）".to_string())?;
+        .ok_or_else(|| GwlinkdReason::AgentPackage.err("认不出本机平台（target-triple）"))?;
     Ok(vec![(platform, artifact_url, artifact_sha256)])
 }
 
@@ -675,18 +753,23 @@ async fn deliver_agent_package(
     client: &CenterClient,
     pusher: &AgentPackageClient,
     targets: &[(String, String, String)],
-) -> Result<(), String> {
+) -> GwlinkdResult<()> {
     let drop_dir = config
         .agent_package_drop_dir
         .as_deref()
         .filter(|dir| !dir.as_os_str().is_empty())
-        .ok_or_else(|| "未配置 agent_package_drop_dir（② 投放目录）".to_string())?;
+        .ok_or_else(|| {
+            GwlinkdReason::AgentPackage.err("未配置 agent_package_drop_dir（② 投放目录）")
+        })?;
     let container_dir = config
         .agent_package_container_dir
         .as_deref()
         .map(str::trim)
         .filter(|dir| !dir.is_empty())
-        .ok_or_else(|| "未配置 agent_package_container_dir（网关容器路径前缀）".to_string())?;
+        .ok_or_else(|| {
+            GwlinkdReason::AgentPackage
+                .err("未配置 agent_package_container_dir（网关容器路径前缀）")
+        })?;
 
     let outcome = async {
         // 逐平台：取包 → 校验 → 落盘 → 记下（本机路径，容器可见）。
@@ -701,17 +784,22 @@ async fn deliver_agent_package(
                 wist_artifact::source::FETCH_TIMEOUT,
             )
             .await
-            .map_err(|err| format!("取包失败 {platform} {artifact_url}: {err}"))?;
+            .map_err(|err| {
+                GwlinkdReason::AgentPackage
+                    .err(format!("取包失败 {platform} {artifact_url}: {err}"))
+            })?;
 
             // 摘要校验：不符即拒，绝不把错内容交付网关。
             let expected = wist_artifact::digest::parse_digest(artifact_sha256).map_err(|err| {
-                format!("中心给的摘要形态不对（{platform} {artifact_sha256}）：{err}")
+                GwlinkdReason::AgentPackage.err(format!(
+                    "中心给的摘要形态不对（{platform} {artifact_sha256}）：{err}"
+                ))
             })?;
             let actual = wist_artifact::digest::sha256_hex_bytes(&bytes);
             if actual != expected {
-                return Err(format!(
+                return Err(GwlinkdReason::AgentPackage.err(format!(
                     "制品摘要不符（{platform}）：期望 {expected}，实得 {actual}"
-                ));
+                )));
             }
 
             // 安全文件名（防 `..` / 控制字符把落点带出投放目录）+ **平台限定**（同版本多平台可能同名制品）。
@@ -720,17 +808,23 @@ async fn deliver_agent_package(
             let drop_path = drop_dir.join(&filename);
             let write_dir = drop_dir.to_path_buf();
             let write_target = drop_path.clone();
-            tokio::task::spawn_blocking(move || -> Result<(), String> {
-                std::fs::create_dir_all(&write_dir)
-                    .map_err(|err| format!("建投放目录失败 {}: {err}", write_dir.display()))?;
+            tokio::task::spawn_blocking(move || -> GwlinkdResult<()> {
+                std::fs::create_dir_all(&write_dir).source_err(
+                    GwlinkdReason::AgentPackage,
+                    format!("建投放目录失败 {}", write_dir.display()),
+                )?;
                 let partial = partial_path(&write_target);
-                std::fs::write(&partial, &bytes)
-                    .map_err(|err| format!("写投放文件失败 {}: {err}", partial.display()))?;
-                std::fs::rename(&partial, &write_target)
-                    .map_err(|err| format!("落盘投放文件失败 {}: {err}", write_target.display()))
+                std::fs::write(&partial, &bytes).source_err(
+                    GwlinkdReason::AgentPackage,
+                    format!("写投放文件失败 {}", partial.display()),
+                )?;
+                std::fs::rename(&partial, &write_target).source_err(
+                    GwlinkdReason::AgentPackage,
+                    format!("落盘投放文件失败 {}", write_target.display()),
+                )
             })
             .await
-            .map_err(|err| format!("投放任务异常: {err}"))??;
+            .map_err(|err| GwlinkdReason::AgentPackage.err(format!("投放任务异常: {err}")))??;
 
             let container_path = format!("{}/{}", container_dir.trim_end_matches('/'), filename);
             delivered.push((
@@ -754,7 +848,7 @@ async fn deliver_agent_package(
             )
             .collect();
         pusher.push(&items).await?;
-        Ok::<(), String>(())
+        Ok::<(), GwlinkdError>(())
     }
     .await;
 
@@ -782,16 +876,25 @@ async fn prune_old_drops(drop_dir: &Path, keep: Option<usize>) {
     let dir = drop_dir.to_path_buf();
     match tokio::task::spawn_blocking(move || prune_drop_dir(&dir, keep)).await {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => eprintln!("event=AgentPackageDropPruneFailed error={err}"),
-        Err(err) => eprintln!("event=AgentPackageDropPruneFailed error={err}"),
+        Ok(Err(err)) => log::warn!(
+            "event=AgentPackageDropPruneFailed error={}",
+            chain_one_line(&err)
+        ),
+        Err(err) => log::warn!(
+            "event=AgentPackageDropPruneFailed error={}",
+            chain_one_line(&err)
+        ),
     }
 }
 
 /// 按 mtime 保留**最新** `keep` 个普通文件，删其余（子目录不动）。单一文件删除失败只告警。
-fn prune_drop_dir(dir: &Path, keep: usize) -> Result<(), String> {
+fn prune_drop_dir(dir: &Path, keep: usize) -> GwlinkdResult<()> {
     let mut entries: Vec<(SystemTime, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(dir)
-        .map_err(|err| format!("读投放目录失败 {}: {err}", dir.display()))?
+        .source_err(
+            GwlinkdReason::AgentPackage,
+            format!("读投放目录失败 {}", dir.display()),
+        )?
         .flatten()
     {
         let path = entry.path();
@@ -811,9 +914,10 @@ fn prune_drop_dir(dir: &Path, keep: usize) -> Result<(), String> {
     let drop_count = entries.len() - keep;
     for (_, path) in entries.into_iter().take(drop_count) {
         if let Err(err) = std::fs::remove_file(&path) {
-            eprintln!(
-                "event=AgentPackageDropPruneSkip path={} error={err}",
-                path.display()
+            log::warn!(
+                "event=AgentPackageDropPruneSkip path={} error={}",
+                path.display(),
+                chain_one_line(&err)
             );
         }
     }
@@ -823,7 +927,7 @@ fn prune_drop_dir(dir: &Path, keep: usize) -> Result<(), String> {
 /// 从制品地址取一个**安全的单段文件名**：去 query、取末段；拒空 / `.` / `..` / 含路径分隔或控制字符。
 ///
 /// 该名字拼进投放目录后的**本机路径**会被交给网关取包，绝不能让 `..` 或分隔符把落点带出目录。
-fn safe_artifact_filename(source: &str) -> Result<String, String> {
+fn safe_artifact_filename(source: &str) -> GwlinkdResult<String> {
     let name = source
         .split('?')
         .next()
@@ -832,10 +936,12 @@ fn safe_artifact_filename(source: &str) -> Result<String, String> {
         .next()
         .unwrap_or_default();
     if name.is_empty() || name == "." || name == ".." {
-        return Err(format!("从制品地址取不出安全文件名：{source}"));
+        return Err(
+            GwlinkdReason::AgentPackage.err(format!("从制品地址取不出安全文件名：{source}"))
+        );
     }
     if name.chars().any(|ch| ch == '\\' || ch.is_control()) {
-        return Err(format!("制品文件名含非法字符：{name}"));
+        return Err(GwlinkdReason::AgentPackage.err(format!("制品文件名含非法字符：{name}")));
     }
     Ok(name.to_string())
 }
@@ -847,19 +953,19 @@ fn safe_artifact_filename(source: &str) -> Result<String, String> {
 /// 整批被拒（fail-closed，但原因难定位）。前缀平台即可保证「一平台一份」。
 ///
 /// 网关取包只按**内容**认版本/架构、按报文里的 `platform` 认平台（不看文件名），故改名安全。
-fn platform_drop_filename(platform: &str, artifact_url: &str) -> Result<String, String> {
+fn platform_drop_filename(platform: &str, artifact_url: &str) -> GwlinkdResult<String> {
     let platform = safe_path_segment(platform, "制品平台")?;
     let name = safe_artifact_filename(artifact_url)?;
     Ok(format!("{platform}__{name}"))
 }
 
 /// 校验一个可拼进本机路径的**安全单段**：非空、非 `.` / `..`、不含路径分隔符或控制字符。
-fn safe_path_segment(value: &str, what: &str) -> Result<String, String> {
+fn safe_path_segment(value: &str, what: &str) -> GwlinkdResult<String> {
     if value.is_empty() || value == "." || value == ".." {
-        return Err(format!("{what}为空或不安全：{value:?}"));
+        return Err(GwlinkdReason::AgentPackage.err(format!("{what}为空或不安全：{value:?}")));
     }
     if value.contains('/') || value.chars().any(|ch| ch == '\\' || ch.is_control()) {
-        return Err(format!("{what}含非法字符：{value}"));
+        return Err(GwlinkdReason::AgentPackage.err(format!("{what}含非法字符：{value}")));
     }
     Ok(value.to_string())
 }
@@ -899,7 +1005,7 @@ fn link_token_from_env() -> Option<String> {
     }
     match std::env::var("WIST_GWLINKD_BOOTSTRAP_TOKEN") {
         Ok(token) => {
-            eprintln!(
+            log::warn!(
                 "warning: WIST_GWLINKD_BOOTSTRAP_TOKEN 已更名为 WIST_GWLINKD_LINK_TOKEN，请更新（旧名下一版移除）"
             );
             Some(token)
@@ -914,7 +1020,7 @@ async fn first_run(
     config: &Config,
     trust: Option<&Path>,
     identity: &str,
-) -> Result<(), String> {
+) -> GwlinkdResult<()> {
     // 接入券来源（按序）：配置 `link_token`（gwlinkd.toml）→ 环境变量（兼容 dev / 旧路径）。
     // 有券即**直接接入**（不再经网关页面）。「券进配置」= 写好 gwlinkd.toml、起进程就自联上。
     let link_token = link_token_from_config(config).or_else(link_token_from_env);
@@ -945,7 +1051,7 @@ async fn onboard_from_gateway(
     trust: Option<&Path>,
     identity: &str,
     client: &LinkRequestClient,
-) -> Result<bool, String> {
+) -> GwlinkdResult<bool> {
     let request = client.fetch(&config.gateway_id).await?;
     if !request.has_request {
         return Ok(false);
@@ -966,22 +1072,24 @@ async fn onboard_from_gateway(
         &request.gateway_id,
         &request.link_token,
         trust_path.as_deref(),
-    )?;
-    println!(
+    )
+    .conv_err()?;
+    log::info!(
         "event=LinkRequestPersisted path={} center={}",
         path.display(),
         request.center_endpoint
     );
     // 以改写后的配置为准（endpoint / gateway_id / trust 都从文件读回）。
-    let updated = Config::load(path)?;
+    let updated = Config::load(path).conv_err()?;
     let effective_trust = trust_path.as_deref().or(trust);
     let link_client = CenterClient::with_client(
         updated.control_center_endpoint.clone(),
         center::build_http_client(effective_trust)?,
     );
-    println!(
+    log::info!(
         "event=LinkRequestPicked gateway_id={} center={}",
-        updated.gateway_id, updated.control_center_endpoint
+        updated.gateway_id,
+        updated.control_center_endpoint
     );
     match onboard(&link_client, &updated, identity, Some(&request.link_token)).await {
         Ok(()) => {
@@ -992,7 +1100,7 @@ async fn onboard_from_gateway(
         }
         Err(err) => {
             let _ = client
-                .report_result(&updated.gateway_id, "Failed", &err)
+                .report_result(&updated.gateway_id, "Failed", &err.to_string())
                 .await;
             Err(err)
         }
@@ -1009,8 +1117,8 @@ async fn wait_for_gateway_request(
     trust: Option<&Path>,
     identity: &str,
     client: &LinkRequestClient,
-) -> Result<(), String> {
-    println!(
+) -> GwlinkdResult<()> {
+    log::info!(
         "event=WaitingLinkRequest gateway_id={}（等待页面「链接上级」提交接入请求）",
         config.gateway_id
     );
@@ -1018,12 +1126,12 @@ async fn wait_for_gateway_request(
         match retry_leftover_registration(config, trust, identity).await {
             Ok(true) => return Ok(()),
             Ok(false) => {}
-            Err(err) => eprintln!("event=RegisterRetryFailed error={err}"),
+            Err(err) => log::warn!("event=RegisterRetryFailed error={}", chain_one_line(&err)),
         }
         match onboard_from_gateway(path, config, trust, identity, client).await {
             Ok(true) => return Ok(()),
             Ok(false) => {}
-            Err(err) => eprintln!("event=LinkRequestFailed error={err}"),
+            Err(err) => log::warn!("event=LinkRequestFailed error={}", chain_one_line(&err)),
         }
         // 心率：接入前也推一条「在跑、等待接入」——免得页面把「还没接」当成「gwlinkd 没跑」。
         let waiting = GwlinkdStatus {
@@ -1039,7 +1147,7 @@ async fn wait_for_gateway_request(
             reported_at: DateTime::now(),
         };
         if let Err(err) = client.report_linkd_status(&waiting).await {
-            eprintln!("event=LinkdStatusPushFailed error={err}");
+            log::warn!("event=LinkdStatusPushFailed error={}", chain_one_line(&err));
         }
         tokio::time::sleep(Duration::from_secs(STATUS_INTERVAL_SECS)).await;
     }
@@ -1051,7 +1159,7 @@ async fn retry_leftover_registration(
     config: &Config,
     trust: Option<&Path>,
     identity: &str,
-) -> Result<bool, String> {
+) -> GwlinkdResult<bool> {
     if state::load_regist_token(&config.state_dir).is_none() {
         return Ok(false);
     }
@@ -1081,14 +1189,14 @@ async fn onboard(
     config: &Config,
     identity: &str,
     link: Option<&str>,
-) -> Result<(), String> {
+) -> GwlinkdResult<()> {
     let instance_id = state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)?;
     // 网关**对外域名**：注册时尽力从自述面取（取不到就 None，不阻断注册）。
     let public_base_url = fetch_gateway_public_base_url(config).await;
 
     // 复用上次未消费的 RegistToken（link-upstream 已成功、register 未成的遗留）：直接重试注册。
     if let Some(regist_token) = state::load_regist_token(&config.state_dir) {
-        println!("event=RegisterRetry gateway_id={}", config.gateway_id);
+        log::info!("event=RegisterRetry gateway_id={}", config.gateway_id);
         match register_once(
             client,
             config,
@@ -1104,32 +1212,53 @@ async fn onboard(
             }
             Err(err) if err.is_unauthorized() => {
                 // token 已失效/已被消费：丢弃，走完整首跑（需接入券）。
-                eprintln!("event=RegistTokenStale 清掉遗留 token，重走首跑");
+                log::warn!("event=RegistTokenStale 清掉遗留 token，重走首跑");
                 state::clear_regist_token(&config.state_dir);
             }
             // 网络类错误：保留 token，下次再试。
-            Err(err) => return Err(err.to_string()),
+            Err(err) => return Err(err.into()),
         }
     }
 
     let link = link.ok_or_else(|| {
-        "首跑需要接入券：在 gwlinkd.toml 配 `link_token`（或设 WIST_GWLINKD_LINK_TOKEN）\
-         —— 中心 admin 创建实例时签发的接入 token；\
-         若本机曾有身份，请检查 state/credential.json 是否损坏"
-            .to_string()
+        GwlinkdReason::Enrollment.err(
+            "首跑需要接入券：在 gwlinkd.toml 配 `link_token`（或设 WIST_GWLINKD_LINK_TOKEN）\
+             —— 中心 admin 创建实例时签发的接入 token；\
+             若本机曾有身份，请检查 state/credential.json 是否损坏",
+        )
     })?;
 
-    println!("event=LinkUpstream gateway_id={}", config.gateway_id);
-    let returned = client
-        .link_upstream(&config.gateway_id, link, Some(identity))
-        .await
-        .map_err(|err| err.to_string())?;
+    log::info!("event=LinkUpstream gateway_id={}", config.gateway_id);
+    let returned = logged_op(
+        module_path!(),
+        "center link-upstream",
+        &[("gateway_id", config.gateway_id.clone())],
+        client
+            .link_upstream(&config.gateway_id, link, Some(identity))
+            .await,
+    )
+    .map_err(|err| {
+            // 401 `certificate_required`：link-upstream 对**已初始化**的 gateway_id 只认 mTLS（不再置备），
+            // 而本地已无客户端证书（典型：刚 unlink）—— 这不是「券不对」，是「这台已不能再置备」。
+            // **不给「重置」的口子**（有意）：唯一可行是换**新 gateway_id**。别把裸 code 抛给运维。
+            let detail = if err.is_unauthorized() && err.detail_contains("certificate_required") {
+                format!(
+                    "中心认为该 gateway_id 已初始化（link-upstream 走 mTLS、不再置备），但本地无客户端证书 \
+                     —— 无法自动恢复。同一 gateway_id 不能重接（本仓无「重置实例」，且是有意的安全边界）：\
+                     请在中心**新建一个实例**、用它的**新 gateway_id** 再接入。原始错误：{err}"
+                )
+            } else {
+                err.to_string()
+            };
+            GwlinkdReason::Enrollment.err(detail)
+        })?;
     // 链接配置（信任锚 / 协议版本 / 注册 token 引用）落盘留痕 —— 不再丢弃。
     state::save_link_config(&config.state_dir, &returned.config)?;
     let regist_token = returned.regist_token.ok_or_else(|| {
-        "中心认为该网关**已初始化**，但本地无客户端证书 —— 无法自动恢复（CR-003 尚缺「身份重置」路径）。\
-         请在中心重置该实例后重跑，或把既有的客户端证书/私钥写入 state/credential.json"
-            .to_string()
+        GwlinkdReason::Enrollment.err(
+            "中心认为该网关**已初始化**，但本地无客户端证书 —— 无法自动恢复（CR-003 尚缺「身份重置」路径）。\
+             请在中心重置该实例后重跑，或把既有的客户端证书/私钥写入 state/credential.json",
+        )
     })?;
     // **先落盘再注册**：接入券已消费，注册失败也要能靠这个 token 重试。
     state::save_regist_token(&config.state_dir, &regist_token)?;
@@ -1141,8 +1270,7 @@ async fn onboard(
         &instance_id,
         public_base_url.as_deref(),
     )
-    .await
-    .map_err(|err| err.to_string())?;
+    .await?;
     state::clear_regist_token(&config.state_dir);
     Ok(())
 }
@@ -1168,20 +1296,29 @@ async fn register_once(
     instance_id: &str,
     public_base_url: Option<&str>,
 ) -> Result<(), CenterError> {
-    let keypair =
-        identity::generate_client_keypair(&config.gateway_id).map_err(CenterError::Other)?;
-    println!("event=Register gateway_id={}", config.gateway_id);
-    let result = client
-        .register(regist_token, instance_id, &keypair.csr_pem, public_base_url)
-        .await?;
+    let keypair = identity::generate_client_keypair(&config.gateway_id).map_err(|err| {
+        CenterReason::Local.err(format!("生成客户端密钥对失败: {}", err.op_display_chain()))
+    })?;
+    log::info!("event=Register gateway_id={}", config.gateway_id);
+    let result = logged_op(
+        module_path!(),
+        "center register",
+        &[("gateway_id", config.gateway_id.clone())],
+        client
+            .register(regist_token, instance_id, &keypair.csr_pem, public_base_url)
+            .await,
+    )?;
     let credential = state::StoredCredential {
         bundle: result.credential_bundle,
         private_key_pem: keypair.private_key_pem,
     };
-    state::save_credential(&config.state_dir, &credential).map_err(CenterError::Other)?;
-    println!(
+    state::save_credential(&config.state_dir, &credential).map_err(|err| {
+        CenterReason::Local.err(format!("落长期身份失败: {}", err.op_display_chain()))
+    })?;
+    log::info!(
         "event=Registered gateway_id={} credential_id={}",
-        result.gateway_id, result.credential_id
+        result.gateway_id,
+        result.credential_id
     );
     Ok(())
 }
@@ -1191,7 +1328,7 @@ fn mtls_client(
     config: &Config,
     trust: Option<&Path>,
     credential: &state::StoredCredential,
-) -> Result<CenterClient, String> {
+) -> CenterResult<CenterClient> {
     let http = center::build_mtls_http_client(trust, &credential.identity_pem())?;
     Ok(CenterClient::with_client(
         config.control_center_endpoint.clone(),
@@ -1218,31 +1355,179 @@ fn run_diagnose(config: &Config) -> ExitCode {
     }
 }
 
+// ─────────────────────────── unlink（断开与 Center 的连接） ───────────────────
+
+/// `unlink`：断开本机网关与 Center 的连接（见 [`wist_gwlinkd::unlink`]）。
+///
+/// 需先停掉 gwlinkd（本命令不与运行中的常驻并存）；`--forget-center` 连中心信任锚也删；
+/// `--dry-run` 只算不落盘。删完**尽最大努力**把「已断开接入」这一拍告知网关（环回 linkd-status），
+/// 让页面立刻别再显示「已接入」。
+async fn run_unlink(args: &[String]) -> ExitCode {
+    let mut forget_center = false;
+    let mut dry_run = false;
+    for arg in args {
+        match arg.as_str() {
+            "--forget-center" => forget_center = true,
+            "--dry-run" => dry_run = true,
+            "-h" | "--help" => {
+                print_unlink_usage();
+                return ExitCode::SUCCESS;
+            }
+            other => {
+                eprintln!("未知参数：{other}（可用：--forget-center / --dry-run）");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let path = config_path();
+    let config = match Config::load(&path) {
+        Ok(config) => {
+            // 已读到配置：日志按它的 `[log]` 段初始化（与 `run` 同口径）。
+            wist_gwlinkd::logging::init(&config.log);
+            config
+        }
+        Err(err) => {
+            eprintln!("[FAIL] 配置不可读：{}", err.display_chain());
+            return ExitCode::FAILURE;
+        }
+    };
+    match unlink::unlink(&path, &config, forget_center, dry_run) {
+        Ok(report) => {
+            report_unlink(&report);
+            if !dry_run {
+                announce_unlinked_to_gateway(&config).await;
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("[FAIL] {}", err.op_display_chain());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// 把「已断开接入」推给网关（环回 linkd-status），让「链接上级」页的**接入状态卡**立刻
+/// 从「已接入（降级）」变成「未接入」—— 不再等 90s 失联窗口，也不靠页面自己猜。
+///
+/// **尽力而为**：没配 `gateway_self_endpoint`、网关没起、或推失败，都只记一行，**不影响 unlink 成功**
+/// （本机已断开的事实已经落盘）。报文状态用 `WaitingLinkRequest`（与重启后 gwlinkd 的自然状态一致：
+/// 无客户端证书、等页面重新提交接入物），且**不带** `credential_expires_at`（凭据已删）。
+async fn announce_unlinked_to_gateway(config: &Config) {
+    let Some(base) = config.gateway_self_endpoint.as_deref() else {
+        return;
+    };
+    let client = match LinkRequestClient::with_trust(base, config.gateway_self_ca.as_deref()) {
+        Ok(client) => client,
+        Err(err) => {
+            log::warn!("event=UnlinkAnnounceSkipped error={}", chain_one_line(&err));
+            return;
+        }
+    };
+    let status = GwlinkdStatus {
+        gateway_id: config.gateway_id.clone(),
+        instance_id: String::new(),
+        version: wist_gwlinkd::VERSION.to_string(),
+        center_endpoint: config.control_center_endpoint.clone(),
+        state: STATE_WAITING_LINK_REQUEST.to_string(),
+        credential_expires_at: None,
+        last_center_report_at: None,
+        last_error: None,
+        reported_at: DateTime::now(),
+    };
+    match client.report_linkd_status(&status).await {
+        Ok(()) => println!("已告知网关：本机已断开接入（页面将显示「未接入」）。"),
+        Err(err) => log::warn!("event=UnlinkAnnounceFailed error={}", chain_one_line(&err)),
+    }
+}
+
+fn print_unlink_usage() {
+    println!(
+        "用法：wist-gwlinkd unlink [--forget-center] [--dry-run]\n\
+         断开本机网关与 Center 的连接：删注册态（客户端证书 / 链接配置 / 注册券 / 身份 / 实例 / 升级游标），\n\
+         并去掉 gwlinkd.toml 里的 link_token；--forget-center 连中心信任锚（trust_bundle）也删；\n\
+         --dry-run 只看将做什么，不落盘。\n\
+         需先停掉 gwlinkd（本命令不与运行中的常驻并存）。\n\
+         配置路径：WIST_GWLINKD_CONFIG（缺省 {}）。",
+        wist_gwlinkd::DEFAULT_CONFIG_PATH
+    );
+}
+
+fn report_unlink(report: &UnlinkReport) {
+    let head = if report.dry_run {
+        "【DRY_RUN】将断开"
+    } else {
+        "已断开"
+    };
+    let done = if report.dry_run { "将删" } else { "已删" };
+    println!(
+        "{head}本机网关与 Center 的连接（state={}）：",
+        report.state_dir.display()
+    );
+    if report.removed_state_files.is_empty() {
+        println!("  注册态        本就没有");
+    } else {
+        println!(
+            "  注册态        {done} {} 项：{}",
+            report.removed_state_files.len(),
+            report.removed_state_files.join(", ")
+        );
+    }
+    println!(
+        "  link_token    {}",
+        match (report.link_token_removed, report.dry_run) {
+            (true, true) => "将从配置去掉",
+            (true, false) => "已从配置去掉",
+            (false, _) => "本就为空",
+        }
+    );
+    if !report.removed_anchors.is_empty() {
+        let paths = report
+            .removed_anchors
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("、");
+        println!("  信任锚        {done} {paths}");
+    } else if report.trust_bundle.exists() {
+        println!("  信任锚        保留 {}", report.trust_bundle.display());
+    } else {
+        println!(
+            "  信任锚        本就没有（{}）",
+            report.trust_bundle.display()
+        );
+    }
+    if report.dry_run {
+        println!("（DRY_RUN：以上改动都没有落盘）");
+    }
+}
+
 // ─────────────────────────── service（OS 服务管理器托管） ───────────────────────
 
 fn run_service(args: &[String]) -> ExitCode {
     let Some(action) = args.first().map(String::as_str) else {
         eprintln!(
-            "用法：wist-gwlinkd service <print|install|uninstall|status> [--system|--user] [--bin PATH] [--config PATH] [--force] [--no-activate]"
+            "用法：wist-gwlinkd service <print|install|uninstall|status> [--system|--user] [--bin PATH] [--config PATH] [--run-as USER] [--run-as-group GROUP] [--force] [--no-activate]"
         );
         return ExitCode::from(2);
     };
     match service_command(action, &args[1..]) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("[FAIL] {err}");
+            eprintln!("[FAIL] {}", err.op_display_chain());
             ExitCode::FAILURE
         }
     }
 }
 
-fn service_command(action: &str, rest: &[String]) -> Result<(), String> {
+fn service_command(action: &str, rest: &[String]) -> GwlinkdResult<()> {
     let platform = service::ServicePlatform::current()
-        .ok_or_else(|| "当前平台非 Linux/macOS，不支持 service 托管".to_string())?;
+        .ok_or_else(|| GwlinkdReason::Service.err("当前平台非 Linux/macOS，不支持 service 托管"))?;
 
     let mut scope: Option<service::ServiceScope> = None;
     let mut bin: Option<PathBuf> = None;
     let mut config: Option<PathBuf> = None;
+    let mut run_as: Option<String> = None;
+    let mut run_as_group: Option<String> = None;
     let mut force = false;
     let mut activate = true;
     let mut i = 0;
@@ -1255,6 +1540,14 @@ fn service_command(action: &str, rest: &[String]) -> Result<(), String> {
             "--user" => {
                 scope = Some(service::ServiceScope::User);
                 i += 1;
+            }
+            "--run-as" => {
+                run_as = Some(need_arg(rest, i + 1, "--run-as")?);
+                i += 2;
+            }
+            "--run-as-group" => {
+                run_as_group = Some(need_arg(rest, i + 1, "--run-as-group")?);
+                i += 2;
             }
             "--force" => {
                 force = true;
@@ -1272,12 +1565,20 @@ fn service_command(action: &str, rest: &[String]) -> Result<(), String> {
                 config = Some(PathBuf::from(need_arg(rest, i + 1, "--config")?));
                 i += 2;
             }
-            other => return Err(format!("未知参数：{other}")),
+            other => return Err(GwlinkdReason::InvalidArgs.err(format!("未知参数：{other}"))),
         }
     }
 
     // 默认 system（正式运行即系统级常驻）；要用户级就显式 --user。
     let scope = scope.unwrap_or(service::ServiceScope::System);
+    // --run-as 只在 system 作用域有意义：systemd `User=` / launchd `UserName` 让系统服务**以非 root 运行**。
+    if run_as.is_some() && scope != service::ServiceScope::System {
+        return Err(GwlinkdReason::InvalidArgs
+            .err("--run-as 只对 --system 作用域有效（--user 本就以本人运行）"));
+    }
+    if run_as_group.is_some() && run_as.is_none() {
+        return Err(GwlinkdReason::InvalidArgs.err("--run-as-group 需要同时给 --run-as"));
+    }
     let bin = match bin {
         Some(bin) => bin,
         None => service::default_bin()?,
@@ -1287,7 +1588,7 @@ fn service_command(action: &str, rest: &[String]) -> Result<(), String> {
         None => service::default_config_path(scope)?,
     };
     let layout = service::ServiceLayout::resolve(platform, scope)?;
-    let spec = service::ServiceSpec::new(scope, bin, config);
+    let spec = service::ServiceSpec::new(scope, bin, config).with_run_as(run_as, run_as_group);
 
     match action {
         "print" => {
@@ -1359,19 +1660,19 @@ fn service_command(action: &str, rest: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        other => Err(format!(
+        other => Err(GwlinkdReason::InvalidArgs.err(format!(
             "未知 service 动作：{other}（可用：print | install | uninstall | status）"
-        )),
+        ))),
     }
 }
 
-fn need_arg(args: &[String], index: usize, flag: &str) -> Result<String, String> {
+fn need_arg(args: &[String], index: usize, flag: &str) -> GwlinkdResult<String> {
     args.get(index)
         .cloned()
-        .ok_or_else(|| format!("{flag} 需要一个值"))
+        .ok_or_else(|| GwlinkdReason::InvalidArgs.err(format!("{flag} 需要一个值")))
 }
 
-fn run_service_commands(commands: Vec<service::ServiceCommand>) -> Result<(), String> {
+fn run_service_commands(commands: Vec<service::ServiceCommand>) -> GwlinkdResult<()> {
     let mut failures = Vec::new();
     for command in commands {
         // 服务管理器拆除是异步的（尤其 launchd），瞬时失败靠有界重试吃掉。
@@ -1389,7 +1690,7 @@ fn run_service_commands(commands: Vec<service::ServiceCommand>) -> Result<(), St
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(failures.join("\n"))
+        Err(GwlinkdReason::Service.err(failures.join("\n")))
     }
 }
 
@@ -1457,6 +1758,7 @@ mod tests {
             upgrade_retry_on_dead: None,
             upgrade_tool_require_arch: None,
             upgrade: Default::default(),
+            log: Default::default(),
         }
     }
 
@@ -1777,6 +2079,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn onboard_explains_when_link_upstream_requires_a_certificate() {
+        // 已初始化的 gateway_id：link-upstream 改走 mTLS，本地无证书 → 401 `certificate_required`。
+        // 必须报成**可处置**的话（重置实例 / 换新 gateway_id），而不是把裸 code 抛给运维。
+        let dir = temp_dir("onboard-cert-required");
+        let stub = Arc::new(Mutex::new(Stub {
+            link: Some((
+                401,
+                "gateway identity rejected: certificate_required".to_string(),
+            )),
+            ..Default::default()
+        }));
+        let url = serve_center(Arc::clone(&stub)).await;
+        let client = CenterClient::new(url);
+        let config = test_config(&dir, client.endpoint().to_string());
+
+        let err = onboard(&client, &config, "ident-1", Some("link-1"))
+            .await
+            .expect_err("应报错");
+        assert!(err.to_string().contains("新建一个实例"), "{err}");
+        assert!(err.to_string().contains("新 gateway_id"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn onboard_errors_when_center_says_initialized_but_no_local_credential() {
         let dir = temp_dir("onboard-initialized");
         let stub = Arc::new(Mutex::new(Stub {
@@ -1790,7 +2116,7 @@ mod tests {
         let err = onboard(&client, &config, "ident-1", Some("link-1"))
             .await
             .expect_err("应报错");
-        assert!(err.contains("身份重置"), "{err}");
+        assert!(err.to_string().contains("身份重置"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1805,7 +2131,7 @@ mod tests {
         let err = onboard(&client, &config, "ident-1", None)
             .await
             .expect_err("应报错");
-        assert!(err.contains("WIST_GWLINKD_LINK_TOKEN"), "{err}");
+        assert!(err.to_string().contains("WIST_GWLINKD_LINK_TOKEN"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1859,7 +2185,8 @@ mod tests {
         for platform in [&platform, &other_platform] {
             let dropped = drop_dir.join(format!("{platform}__wist-agentd-0.1.9-{platform}.tar.gz"));
             assert_eq!(
-                std::fs::read(&dropped).unwrap_or_else(|err| panic!("{}: {err}", dropped.display())),
+                std::fs::read(&dropped)
+                    .unwrap_or_else(|err| panic!("{}: {err}", dropped.display())),
                 payload,
                 "取到的字节落到投放目录（{platform}）"
             );
@@ -1975,15 +2302,17 @@ mod tests {
                     "sha256:single".to_string(),
                 )]
             ),
-            None => assert!(
-                target_artifacts(&single).is_err(),
-                "认不出本机平台应报错"
-            ),
+            None => assert!(target_artifacts(&single).is_err(), "认不出本机平台应报错"),
         }
 
         // 单值缺地址 → 报可读原因（清单也空）。
         let missing = push_plan(None, Some("sha256:x"));
-        assert!(target_artifacts(&missing).unwrap_err().contains("未派生制品地址"));
+        assert!(
+            target_artifacts(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("未派生制品地址")
+        );
     }
 
     /// **同名制品**（同版本多平台的来源原名相同）不得互相覆盖：投放文件名前缀平台 → 一平台一份，
@@ -2017,7 +2346,8 @@ mod tests {
         for platform in ["aarch64-apple-darwin", "x86_64-unknown-linux-musl"] {
             let dropped = drop_dir.join(format!("{platform}__wist-agentd-0.2.1.tar.gz"));
             assert_eq!(
-                std::fs::read(&dropped).unwrap_or_else(|err| panic!("{}: {err}", dropped.display())),
+                std::fs::read(&dropped)
+                    .unwrap_or_else(|err| panic!("{}: {err}", dropped.display())),
                 payload,
                 "同名制品不得互相覆盖（{platform}）"
             );
@@ -2037,11 +2367,7 @@ mod tests {
             "{request}"
         );
         let reports = stub.lock().unwrap().reports.clone();
-        assert!(
-            reports[0].contains("\"status\":\"done\""),
-            "{}",
-            reports[0]
-        );
+        assert!(reports[0].contains("\"status\":\"done\""), "{}", reports[0]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2070,6 +2396,44 @@ mod tests {
             }
         });
         (format!("http://{addr}"), rx)
+    }
+
+    /// `unlink` 后会把「已断开接入」这一拍推给网关（state=`WaitingLinkRequest`，**不带**凭据），
+    /// 让页面立刻别再显示「已接入」。
+    #[tokio::test]
+    async fn announce_unlinked_reports_waiting_state_without_credential() {
+        let dir = temp_dir("announce-unlink");
+        let (gateway, captured) = one_shot_gateway("200 OK", "{}").await;
+        let mut config = test_config(&dir, "https://c".into());
+        config.gateway_self_endpoint = Some(gateway);
+
+        announce_unlinked_to_gateway(&config).await;
+
+        let request = captured.await.expect("request captured");
+        assert!(
+            request
+                .to_lowercase()
+                .starts_with("post /api/v1/gateway/linkd-status"),
+            "{request}"
+        );
+        assert!(
+            request.contains("\"state\":\"WaitingLinkRequest\""),
+            "{request}"
+        );
+        assert!(
+            !request.contains("credential_expires_at"),
+            "凭据已删，不该带 credential_expires_at：{request}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 没配 `gateway_self_endpoint` 时，告知是**静默跳过**（不 panic、不阻塞）。
+    #[tokio::test]
+    async fn announce_unlinked_is_a_noop_without_a_self_endpoint() {
+        let dir = temp_dir("announce-skip");
+        let config = test_config(&dir, "https://c".into());
+        announce_unlinked_to_gateway(&config).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// 极简制品桩：任意 GET 都回这段字节（`application/octet-stream`），可反复取。
@@ -2142,8 +2506,10 @@ mod tests {
 
         // 各平台落到自己的文件、写的是**自己那份**字节。
         assert_eq!(
-            std::fs::read(drop_dir.join(format!("{platform}__wist-agentd-0.2.1-{platform}.tar.gz")))
-                .expect("host dropped"),
+            std::fs::read(
+                drop_dir.join(format!("{platform}__wist-agentd-0.2.1-{platform}.tar.gz"))
+            )
+            .expect("host dropped"),
             bytes_host,
             "本机平台文件内容"
         );
@@ -2231,7 +2597,11 @@ mod tests {
         // 回报 failed，detail 带「摘要不符」。
         let reports = stub.lock().unwrap().reports.clone();
         assert_eq!(reports.len(), 1);
-        assert!(reports[0].contains("\"status\":\"failed\""), "{}", reports[0]);
+        assert!(
+            reports[0].contains("\"status\":\"failed\""),
+            "{}",
+            reports[0]
+        );
         assert!(reports[0].contains("摘要不符"), "{}", reports[0]);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2267,8 +2637,10 @@ mod tests {
 
         // 回落用**本机平台**，落到带平台前缀的文件。
         assert_eq!(
-            std::fs::read(drop_dir.join(format!("{platform}__wist-agentd-0.1.9-{platform}.tar.gz")))
-                .expect("dropped"),
+            std::fs::read(
+                drop_dir.join(format!("{platform}__wist-agentd-0.1.9-{platform}.tar.gz"))
+            )
+            .expect("dropped"),
             payload
         );
         let request = rx.await.expect("gateway captured");
@@ -2426,7 +2798,10 @@ mod tests {
             !drop_dir.join("old-1.bin").exists() && !drop_dir.join("old-2.bin").exists(),
             "陈旧两份被清（失败也清）"
         );
-        assert!(drop_dir.join("old-3.bin").exists(), "较新陈旧一份保留（keep=2）");
+        assert!(
+            drop_dir.join("old-3.bin").exists(),
+            "较新陈旧一份保留（keep=2）"
+        );
         assert!(
             drop_dir
                 .join(format!("{platform}__wist-agentd-0.2.1-{platform}.tar.gz"))
@@ -2436,7 +2811,11 @@ mod tests {
         // 回报 failed，detail 带「摘要不符」。
         let reports = stub.lock().unwrap().reports.clone();
         assert_eq!(reports.len(), 1);
-        assert!(reports[0].contains("\"status\":\"failed\""), "{}", reports[0]);
+        assert!(
+            reports[0].contains("\"status\":\"failed\""),
+            "{}",
+            reports[0]
+        );
         assert!(reports[0].contains("摘要不符"), "{}", reports[0]);
         let _ = std::fs::remove_dir_all(dir);
     }

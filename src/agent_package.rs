@@ -8,6 +8,10 @@
 //! 分层（谁取包、谁托管）见设计 `wist-design/doc/design/edge/center-content-delivery.md`；
 //! 特性见 `.../agent-package-push-to-gateways.md`；网关侧对应 `wist-gateway/src/api/agent_package.rs`。
 
+use orion_error::prelude::*;
+
+use crate::error::{CenterReason, CenterResult};
+
 /// 环回写入器（形如 `https://127.0.0.1:3000`，与 self / link-request 面同一 endpoint + 信任锚）。
 #[derive(Debug, Clone)]
 pub struct AgentPackageClient {
@@ -58,7 +62,7 @@ impl AgentPackageClient {
     pub fn with_trust(
         endpoint: impl Into<String>,
         trust: Option<&std::path::Path>,
-    ) -> Result<Self, String> {
+    ) -> CenterResult<Self> {
         Ok(Self {
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
             http: crate::center::build_http_client(trust)?,
@@ -71,7 +75,7 @@ impl AgentPackageClient {
     /// 在拉取阶段逐个写入，见设计 `edge/agent-package-push-to-gateways.md` §10）。`package_url` = 本机路径
     /// （容器可见）；`origin` = 中心镜像地址（**留痕**）；`package_sha256` = 中心给的期望摘要。
     /// 非 2xx → `Err`（含响应体，便于诊断）。
-    pub async fn push(&self, items: &[AgentPackageItem<'_>]) -> Result<(), String> {
+    pub async fn push(&self, items: &[AgentPackageItem<'_>]) -> CenterResult<()> {
         let url = format!("{}/api/v1/gateway/agent-package", self.endpoint);
         let payload = PushRequest {
             artifacts: items
@@ -92,11 +96,11 @@ impl AgentPackageClient {
             .json(&payload)
             .send()
             .await
-            .map_err(|err| format!("agent-package 请求失败: {err}"))?;
+            .source_raw_err(CenterReason::Http, "agent-package 请求失败")?;
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(format!("agent-package 失败（{status}）：{body}"));
+            return Err(CenterReason::Http.err(format!("agent-package 失败（{status}）：{body}")));
         }
         Ok(())
     }
@@ -171,7 +175,9 @@ mod tests {
             "多平台：两个制品都要带：{request}"
         );
         assert!(
-            request.contains("\"package_url\":\"/packages/wist-agentd-0.1.9-aarch64-apple-darwin.tar.gz\""),
+            request.contains(
+                "\"package_url\":\"/packages/wist-agentd-0.1.9-aarch64-apple-darwin.tar.gz\""
+            ),
             "{request}"
         );
         assert!(

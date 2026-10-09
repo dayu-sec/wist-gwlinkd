@@ -3,10 +3,57 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.7.0-alpha] - 2026-10-10
+
+### 新增
+
+- **`unlink` 子命令：断开本机网关与 Center 的连接**。与 link/`onboard` 同属 gwlinkd（同一份注册态、
+  同一个 owner），由它集中管理：删注册态（客户端证书 / 链接配置 / 待消费注册券 / 身份 / 实例 / 升级游标），
+  并从 `gwlinkd.toml` 去掉一次性接入券 `link_token`（留着它会绕过页面自动重连），网关即回到未接入。
+  中心信任锚（`trust_bundle` 的 PEM）**默认保留**（是中心的公开证书，不是连接；页面接入把 CA 写进
+  `state/` 也无需搬动 —— 只删注册态那几个文件，不整目录清空），`--forget-center` 才一并删，
+  且删**已知的每一份**中心 CA（`trust_bundle` 指向的 + 页面写进 `state/control-center.pem` 的副本，去重）；
+  `--dry-run` 只算不落盘。运行中（持有单实例锁）**拒绝执行**，要求先停。删完**尽最大努力**把
+  「已断开接入」环回告知网关（`linkd-status`，state=`WaitingLinkRequest`、不带凭据），让「链接上级」页
+  的接入状态卡**立刻**显示「未接入」（否则要等心跳失联 ~90s，且会被上一回的终态待办误报成「已接入」）。
+  开发态 `dev/unlink-center.sh` 退化为「停进程 + 调本命令」。
+- **`service install --run-as <USER>`：系统级服务以非 root 运行**。`--system` 作用域新增可选运行身份
+  （`--run-as` / `--run-as-group`）：systemd 写 `User=`/`Group=`、launchd 写 `UserName`/`GroupName`。
+  从而既有**开机即起**的系统服务语义，进程属主又是**部署用户** —— gwlinkd 回写 `gwlinkd.toml`（接入券）、
+  落身份/凭据、跑 `gops prj upgrade`（`upgrade_project_dir`）都不再以 root 落盘。只对 `--system` 有效
+  （`--user` 本就以本人运行；给了报错）；用它的前提是 `--config` 与 `state_dir` 该用户**可读写**。
 
 ### 变更
 
+- **运行日志支持配置 `[log]` 段**：级别 / 格式 / 落点从 config 读 —— `level`（过滤器指令，如
+  `wist_gwlinkd=debug,hyper=warn`）、`format`（`text` | `json`）、`file`（给了就写文件、自动建父目录；
+  否则 stderr）。优先级 **`RUST_LOG` > `[log] level` > 缺省 `info`**（保留环境变量临时加详情的习惯）。
+  文件**写满自轮转**：`max_bytes`（单文件上限，缺省 64 MiB）、`keep_files`（保留分卷数，缺省 4）、
+  `max_age_seconds`（分卷保留时长，缺省 7 天）—— 日志文件不再无界增长。日志在**读到配置之后**才
+  初始化；配置本身读不了时退写 stderr。`init-config` 模板同步。
+- **`[log] file` 相对路径按配置文件目录解析**（与 `wist-gateway` 同一口径）：原先按进程 cwd，
+  systemd / launchd 以任意 cwd 拉起时会落到意外位置。`try_init` 失败不再静默（打印告警），
+  并注明日志由进程自轮转、**不要**再挂 logrotate。
+- **错误日志补全根因（P0–P3 复核）**：事件日志（`event=…`）与跨域 lift 原先用 `Display`
+  （`{err}` / `.to_string()`），会丢掉 `orion-error` 的 `Caused by` 链（原始 io / HTTP 原因）——
+  出错时日志里看不到根因。现统一走 `error::chain_one_line()`（单行化 `display_chain()`）与
+  `op_display_chain()`；`upgrade.rs` / `tool_install.rs` 里残余的 `eprintln!("event=…")` 收归 `log`
+  facade（`[log] file` 不再漏收）；`unlink` / `service` 也按 `[log]` 段初始化；`center` 错误 detail 里的
+  响应体截断到 512 字符；`upgrade` 里一处在常驻路径上的 `expect`（会 panic）改为返回结构化错误。
+  新增守护测试：lift 不丢 source chain、`chain_one_line` 单行且含根因、分卷 age-prune。
+- **对齐生态版本**：`wist-control` `0.13 → 0.14`（连带 `wist-shared` `0.1 → 0.2`）。纯版本 pin，无行为变更。
+- **升级 `orion-error` 0.8 → 0.9（Auto-Log Guard）**：0.9 把「操作上下文数据」与「Drop 日志 guard」
+  拆成两个类型 —— `OperationContext` 变为纯数据（可 `Clone`、无 `Drop`），自动日志改由非 `Clone` 的
+  `AutoLogGuard` 在 Drop 时**恰好一次**写出（修
+  [orion-error#64](https://github.com/galaxio-labs/orion-error/issues/64)：guard 被 clone / 附到错误
+  导致失败日志重复或延迟）。`error::logged_op` 随之改用官方写法：`with_auto_log()` 武装 guard，
+  成功 `mark_success()` 记 `suc!`、失败 Drop 记 `fail!`（连带 `cause=` 完整因果链，一行看全），
+  并以**借用**方式（`&guard`）把纯数据附到错误供边界 `display_chain()` —— 不再把带副作用的对象
+  clone / move 进错误，失败日志既不重复也不延迟。
+- **再接入失败的报错改成可处置的话**：当 `link-upstream` 因该 `gateway_id` 在中心**已初始化**而返回
+  401 `certificate_required` 时（典型：刚 unlink、本地无客户端证书），报错明确「同一 `gateway_id`
+  **不能**再接入（本仓无「重置实例」，且这是**有意**的安全边界），请在中心**新建实例**换用新
+  `gateway_id`」—— 不再把裸 code 抛给运维。
 - **发布 ②「Agent 包下发」改为「gwlinkd 取包 + 交付网关」**：收到 `action=push-agent-package` 计划时，
   gwlinkd 不再只把**地址**环回给网关，而是先用**自己的中心客户端**（CA-S / 客户端证书，`artifact_http_client`）
   拉 `artifact_url`、校验 `artifact_sha256`，把字节落到**宿主投放目录**，再把**本机路径**交付网关托管 ——
@@ -20,6 +67,16 @@
 - **发布 ② 支持多平台**：计划带的 `artifacts`（该版本**全平台**）优先 —— gwlinkd 逐平台取包 / 校验 / 落盘，
   再**一次** POST 交付全平台（网关侧整批一次提交，任一不合格整体拒绝落库）；`artifacts` 为空才回落单值 `artifact_url` + 本机平台
   （旧中心 / ① 兼容）。契约 `GatewayUpgradePlan.artifacts`（`wist-control 0.13.0`）。
+- **错误处理统一到 `orion-error`**：配置装载、本地状态、中心调用、升级执行、服务托管、包交付与接入流程
+  从字符串错误收敛为**结构化错误**（按域 reason + 稳定 identity），失败时的诊断 / 回执保留**完整因果链**
+  （`display_chain`），便于排障与稳定归类。对外行为不变。
+- **运行日志接入 `log` / `env_logger`**：运行期 `event=…` 诊断从 `println!` / `eprintln!` 改走 `log`
+  （`info` / `warn` / `error`），级别由 `RUST_LOG` 控制（缺省 `info`），落 **stderr**（由 systemd / journald
+  收集）—— `env_logger` 与 `orion-error` 走同一条 `log` facade。
+- **失败上下文诊断日志（`orion-error` 模式）**：关键低频操作（中心 link-upstream / register / renew、
+  升级驱动、工具安装）包在 `OperationContext` 里 —— 成功记 `suc!`、失败记 `fail!`（带 action + 结构化字段
+  + **完整因果链**），并把上下文附到错误上（边界 `display_chain()` 一并可见）。出错时**一条 `error!`** 即可
+  看到「在做什么 + 关键字段 + 根因链」。每 30s 的 `status` / `upgrade-plan` 不包（避免刷屏）。
 
 ## [0.6.1-alpha] - 2026-10-08
 
