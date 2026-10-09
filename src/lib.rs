@@ -10,6 +10,7 @@
 //!
 //! 背景与决策见 CR-003（`wist-design/doc/design/foundation/cross-repo-issues.md`）。
 
+pub mod agent_package;
 pub mod center;
 pub mod config;
 pub mod doctor;

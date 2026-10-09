@@ -12,20 +12,6 @@ use wist_control::{
     ReportGatewayUpgradeResult,
 };
 
-/// 升级目标 + **宽容读取**的可选附加件。
-///
-/// `artifact_sha256` 目前不在 `wist-control` 0.9 的 [`GatewayUpgradePlan`] 里。用
-/// `#[serde(flatten)]` 宽容读取：中心带上（并校验）就用，不带（或契约未升）就为 `None`，不报错
-/// —— 不用等契约升级就能先用上摘要校验。
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct GatewayUpgradeTarget {
-    #[serde(flatten)]
-    pub plan: GatewayUpgradePlan,
-    /// 中心派发计划可带的**期望制品摘要**（sha256，裸 hex / `sha256:` 前缀）。
-    #[serde(default)]
-    pub artifact_sha256: Option<String>,
-}
-
 /// 单次请求超时（避免中心/网关半死把常驻循环卡住）。
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -246,7 +232,7 @@ impl CenterClient {
         &self,
         gateway_id: &str,
         platform: Option<&str>,
-    ) -> Result<GatewayUpgradeTarget, CenterError> {
+    ) -> Result<GatewayUpgradePlan, CenterError> {
         let url = format!("{}/api/v1/gateway/upgrade-plan", self.endpoint);
         let mut query: Vec<(&str, &str)> = vec![("gateway_id", gateway_id)];
         if let Some(platform) = platform {
@@ -399,24 +385,26 @@ mod tests {
                 .await;
         let client = CenterClient::new(endpoint);
         let plan = client.get_upgrade_plan("gw-1", None).await.expect("plan");
-        assert!(!plan.plan.has_plan);
-        assert_eq!(plan.plan.gateway_id, "gw-1");
+        assert!(!plan.has_plan);
+        assert_eq!(plan.gateway_id, "gw-1");
+        assert!(plan.action.is_none());
         assert!(plan.artifact_sha256.is_none());
     }
 
-    /// 中心带上 `artifact_sha256`（契约尚未固定）→ 宽容读出来；不带则 `None`。
+    /// 升级目标读出**动作**与**摘要**（发布 ②：agent 包下发）；缺省则 `None`。
     #[tokio::test]
-    async fn upgrade_plan_tolerantly_reads_an_optional_artifact_sha256() {
+    async fn upgrade_plan_reads_the_action_and_digest() {
         let endpoint = one_shot_server(
             "200 OK",
-            r#"{"gateway_id":"gw-1","has_plan":true,"plan_id":"plan-1","component":"galaxy-ops","to_version":"v0.18.2","artifact_url":"https://c/pkg-955e0dc75215c3a6","artifact_sha256":"sha256:deadbeef"}"#,
+            r#"{"gateway_id":"gw-1","has_plan":true,"plan_id":"plan-1","component":"wist-agentd","to_version":"0.1.9","artifact_url":"https://c/wist-agentd-0.1.9-aarch64-apple-darwin.tar.gz","action":"push-agent-package","artifact_sha256":"sha256:deadbeef"}"#,
         )
         .await;
         let client = CenterClient::new(endpoint);
-        let target = client.get_upgrade_plan("gw-1", None).await.expect("plan");
-        assert!(target.plan.has_plan);
-        assert_eq!(target.plan.component.as_deref(), Some("galaxy-ops"));
-        assert_eq!(target.artifact_sha256.as_deref(), Some("sha256:deadbeef"));
+        let plan = client.get_upgrade_plan("gw-1", None).await.expect("plan");
+        assert!(plan.has_plan);
+        assert_eq!(plan.component.as_deref(), Some("wist-agentd"));
+        assert_eq!(plan.action.as_deref(), Some("push-agent-package"));
+        assert_eq!(plan.artifact_sha256.as_deref(), Some("sha256:deadbeef"));
     }
 
     #[tokio::test]

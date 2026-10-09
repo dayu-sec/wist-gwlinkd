@@ -3,6 +3,24 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 变更
+
+- **发布 ②「Agent 包下发」改为「gwlinkd 取包 + 交付网关」**：收到 `action=push-agent-package` 计划时，
+  gwlinkd 不再只把**地址**环回给网关，而是先用**自己的中心客户端**（CA-S / 客户端证书，`artifact_http_client`）
+  拉 `artifact_url`、校验 `artifact_sha256`，把字节落到**宿主投放目录**，再把**本机路径**交付网关托管 ——
+  网关不出网、不需要中心信任（修此前的 502：网关不信任中心私有 CA）。新增配置 `agent_package_drop_dir`
+  （宿主侧目录，与网关容器挂载 `PACKAGE_DIR:/packages:ro` 一致）与 `agent_package_container_dir`
+  （该目录在容器里的路径，如 `/packages`）；缺配置则 ② fail-closed。交付载荷带 `origin`（中心地址，留痕）；
+  交付后按 `agent_package_drop_keep`（缺省 12，`0` = 不清理）保留投放目录里最新若干份 —— **无论成败都清**
+  （失败也清，免得反复失败把目录撑爆），且**保留数不低于本批份数**（`keep` 偏小也不会误清刚落的文件）。
+  见设计 `edge/center-content-delivery.md`（分层：中心内容 gwlinkd 取、网关只托管）与
+  `edge/agent-package-push-to-gateways.md`（特性）。
+- **发布 ② 支持多平台**：计划带的 `artifacts`（该版本**全平台**）优先 —— gwlinkd 逐平台取包 / 校验 / 落盘，
+  再**一次** POST 交付全平台（网关侧整批一次提交，任一不合格整体拒绝落库）；`artifacts` 为空才回落单值 `artifact_url` + 本机平台
+  （旧中心 / ① 兼容）。契约 `GatewayUpgradePlan.artifacts`（`wist-control 0.13.0`）。
+
 ## [0.6.1-alpha] - 2026-10-08
 
 ### 变更

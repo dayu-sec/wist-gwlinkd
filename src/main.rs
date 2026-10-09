@@ -6,7 +6,8 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime};
 
 use wist_control::{DateTime, ReportGatewayStatus};
-use wist_gwlinkd::center::{self, CenterClient, CenterError, GatewayUpgradeTarget};
+use wist_gwlinkd::agent_package::{AgentPackageClient, AgentPackageItem};
+use wist_gwlinkd::center::{self, CenterClient, CenterError};
 use wist_gwlinkd::config::{Config, UpgradeInstall, upsert_link_settings};
 use wist_gwlinkd::doctor::{self, Status};
 use wist_gwlinkd::executor::{DEFAULT_ON_FAILURE, DEFAULT_UPGRADER_PROGRAM, GopsExecutor};
@@ -17,7 +18,7 @@ use wist_gwlinkd::linkd_status::{
 };
 use wist_gwlinkd::selfreport::SelfReportClient;
 use wist_gwlinkd::service;
-use wist_gwlinkd::state::{self, CredentialStatus, UpgradeCursor};
+use wist_gwlinkd::state::{self, CredentialStatus, UpgradeCursor, UpgradeRecord};
 use wist_gwlinkd::tool_install::ToolInstaller;
 use wist_gwlinkd::upgrade::{RECOVERY_VERIFY_TIMEOUT, UpgradeDriver, UpgradeReporter};
 
@@ -166,6 +167,14 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
     // gwlinkd 心跳：推自身状态给网关（页面拉不到 gwlinkd —— 它纯出站）。同环回面 + 同一信任锚。
     let linkd_client = match config.gateway_self_endpoint.as_deref() {
         Some(base) => Some(LinkRequestClient::with_trust(
+            base,
+            config.gateway_self_ca.as_deref(),
+        )?),
+        None => None,
+    };
+    // 「Agent 包下发」（发布 ②）：同环回面 + 同一信任锚，把中心派下的 agentd 包写进网关包管理。
+    let agent_package_client = match config.gateway_self_endpoint.as_deref() {
+        Some(base) => Some(AgentPackageClient::with_trust(
             base,
             config.gateway_self_ca.as_deref(),
         )?),
@@ -357,14 +366,15 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
                 .get_upgrade_plan(&config.gateway_id, host_platform.as_deref())
                 .await
             {
-                Ok(target) if target.plan.has_plan => {
-                    let GatewayUpgradeTarget {
-                        plan,
-                        artifact_sha256,
-                    } = target;
+                Ok(plan) if plan.has_plan => {
                     let cursor = state::load_upgrade_cursor(&config.state_dir);
                     let already = plan.plan_id.is_some() && plan.plan_id == cursor.last_plan_id;
                     let to_version = plan.to_version.clone().unwrap_or_default();
+                    // 动作缺省 = `upgrade`（老中心不带 `action`）。
+                    let action = plan
+                        .action
+                        .as_deref()
+                        .unwrap_or(wist_control::ACTION_UPGRADE);
                     if !already && !to_version.is_empty() {
                         // 从版本取游标记的「上次目标」；不知道就 unknown（**不再拿 gwlinkd 自身版本硬比** —— 版本空间不同）。
                         let from_version = if cursor.last_to_version.is_empty() {
@@ -373,44 +383,57 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
                             cursor.last_to_version.clone()
                         };
                         println!(
-                            "event=UpgradeDriven plan_id={:?} to_version={to_version} component={:?} sha256={}",
+                            "event=UpgradeDriven plan_id={:?} action={action} to_version={to_version} component={:?} sha256={}",
                             plan.plan_id,
                             plan.component,
-                            artifact_sha256.is_some()
+                            plan.artifact_sha256.is_some()
                         );
-                        let reporter = UpgradeReporter {
-                            client: client.clone(),
-                            state_dir: config.state_dir.clone(),
-                            self_client: self_client.clone(),
-                        };
-                        // **不**用 `?`：驱动失败（执行器缺失/架构不符…）绝不能把链路常驻整个拖死。
-                        match driver
-                            .start_with_digest(
-                                plan.plan_id.as_deref().unwrap_or("plan"),
-                                &from_version,
-                                &to_version,
-                                plan.component.as_deref(),
-                                Some(reporter),
-                                // 中心派生的制品地址（执行器取件用它）；无则回落 `to_version`。
-                                plan.artifact_url.as_deref(),
-                                // 中心带的期望摘要（契约未固定，宽容读取）；gops 路径忽略它。
-                                artifact_sha256.as_deref(),
-                            )
-                            .await
-                        {
-                            Ok(()) => {
-                                // 先落游标再继续：跨重启幂等据此判定。
-                                if let Err(err) = state::save_upgrade_cursor(
-                                    &config.state_dir,
-                                    &UpgradeCursor {
-                                        last_plan_id: plan.plan_id.clone(),
-                                        last_to_version: to_version,
-                                    },
-                                ) {
-                                    eprintln!("event=CursorSaveFailed error={err}");
+                        if action == wist_control::ACTION_PUSH_AGENT_PACKAGE {
+                            // ②「Agent 包下发」：环回把包写进网关包管理 —— **不重建网关**，升不升由网关决定。
+                            match &agent_package_client {
+                                Some(pusher) => {
+                                    drive_agent_package_push(config, &client, pusher, &plan).await
                                 }
+                                None => eprintln!(
+                                    "event=AgentPackagePushSkipped reason=no_gateway_self_endpoint plan_id={:?}",
+                                    plan.plan_id
+                                ),
                             }
-                            Err(err) => eprintln!("event=UpgradeDriveFailed error={err}"),
+                        } else {
+                            let reporter = UpgradeReporter {
+                                client: client.clone(),
+                                state_dir: config.state_dir.clone(),
+                                self_client: self_client.clone(),
+                            };
+                            // **不**用 `?`：驱动失败（执行器缺失/架构不符…）绝不能把链路常驻整个拖死。
+                            match driver
+                                .start_with_digest(
+                                    plan.plan_id.as_deref().unwrap_or("plan"),
+                                    &from_version,
+                                    &to_version,
+                                    plan.component.as_deref(),
+                                    Some(reporter),
+                                    // 中心派生的制品地址（执行器取件用它）；无则回落 `to_version`。
+                                    plan.artifact_url.as_deref(),
+                                    // 中心带的期望摘要；gops 路径忽略它，无状态工具路径用它。
+                                    plan.artifact_sha256.as_deref(),
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    // 先落游标再继续：跨重启幂等据此判定。
+                                    if let Err(err) = state::save_upgrade_cursor(
+                                        &config.state_dir,
+                                        &UpgradeCursor {
+                                            last_plan_id: plan.plan_id.clone(),
+                                            last_to_version: to_version,
+                                        },
+                                    ) {
+                                        eprintln!("event=CursorSaveFailed error={err}");
+                                    }
+                                }
+                                Err(err) => eprintln!("event=UpgradeDriveFailed error={err}"),
+                            }
                         }
                     }
                 }
@@ -545,6 +568,308 @@ async fn run(config: &Config, path: &Path) -> Result<(), String> {
             }
         }
     }
+}
+
+/// 驱动一次「Agent 包下发」（发布 ②）：把中心派下的 agentd 包**环回**推进同机网关的包管理，再回报中心。
+///
+/// 与 ① 不同：**不重建网关** —— 只把包交给网关，升不升由网关决定。与 ① 同款「一份计划只驱一次」：
+/// 不论成败都落游标（成败经回执让中心计划条目可见）；需要重来由管理面重派计划。
+/// 见设计 `edge/agent-package-push-to-gateways.md`。
+async fn drive_agent_package_push(
+    config: &Config,
+    client: &CenterClient,
+    pusher: &AgentPackageClient,
+    plan: &wist_control::GatewayUpgradePlan,
+) {
+    let plan_id = plan.plan_id.clone().unwrap_or_else(|| "plan".to_string());
+    let to_version = plan.to_version.clone().unwrap_or_default();
+    let (status, detail) = match target_artifacts(plan) {
+        Ok(targets) => match deliver_agent_package(config, client, pusher, &targets).await {
+            Ok(()) => {
+                let platforms = targets
+                    .iter()
+                    .map(|(platform, _, _)| platform.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!(
+                    "event=AgentPackagePushed plan_id={plan_id} platforms={platforms} to_version={to_version}"
+                );
+                ("done", String::new())
+            }
+            Err(err) => {
+                eprintln!("event=AgentPackagePushFailed plan_id={plan_id} error={err}");
+                ("failed", err)
+            }
+        },
+        Err(message) => ("failed", message),
+    };
+    // 回执中心：回填发布计划条目（状态折算在中心侧；`done → succeeded`）。
+    let record = UpgradeRecord {
+        work_id: plan_id.clone(),
+        from_version: "unknown".to_string(),
+        to_version: to_version.clone(),
+        step: "fetch".to_string(),
+        status: status.to_string(),
+        detail,
+    };
+    if let Err(err) = client
+        .report_upgrade_result(&config.gateway_id, &record)
+        .await
+    {
+        eprintln!("event=AgentPackageResultReportFailed plan_id={plan_id} error={err}");
+    }
+    if let Err(err) = state::save_upgrade_cursor(
+        &config.state_dir,
+        &UpgradeCursor {
+            last_plan_id: Some(plan_id),
+            last_to_version: to_version,
+        },
+    ) {
+        eprintln!("event=CursorSaveFailed error={err}");
+    }
+}
+
+/// 目标平台集合（发布 ②）：优先契约的 `artifacts`（**多平台**，中心给该版本全部平台）；
+/// 为空时回落到单值 `artifact_url` + 摘要 + **本机平台**（旧中心 / ① 语义，兼容）。
+/// 三样缺一不可，缺则报出可读原因。
+fn target_artifacts(
+    plan: &wist_control::GatewayUpgradePlan,
+) -> Result<Vec<(String, String, String)>, String> {
+    if !plan.artifacts.is_empty() {
+        return Ok(plan
+            .artifacts
+            .iter()
+            .map(|artifact| {
+                (
+                    artifact.platform.clone(),
+                    artifact.artifact_url.clone(),
+                    artifact.artifact_sha256.clone(),
+                )
+            })
+            .collect());
+    }
+    let artifact_url = plan
+        .artifact_url
+        .clone()
+        .ok_or_else(|| "中心未派生制品地址（该版本未发布？）".to_string())?;
+    let artifact_sha256 = plan
+        .artifact_sha256
+        .clone()
+        .ok_or_else(|| "中心未带制品摘要（artifact_sha256）".to_string())?;
+    let platform = wist_gwlinkd::target::HostTarget::detect()
+        .target_triple()
+        .ok_or_else(|| "认不出本机平台（target-triple）".to_string())?;
+    Ok(vec![(platform, artifact_url, artifact_sha256)])
+}
+
+/// 取包（gwlinkd 持中心信任）→ 落到投放目录 → **一次**环回交付网关托管（多平台）。
+///
+/// **取包由 gwlinkd 完成**：用 [`CenterClient::artifact_http_client`]（带 CA-S / 客户端证书，
+/// 「自签中心也能拉」）逐个平台拉 `artifact_url` → 校验 `artifact_sha256` → 落成投放目录里的本机文件；
+/// 再把**全部平台**一次 POST 给网关（网关侧整批一次提交，任一不合格整体拒绝落库）。分层见 `edge/center-content-delivery.md`。
+///
+/// **清理（无论成败）**：最后按数量清旧（best-effort）—— 失败也清，免得反复失败把投放目录撑爆；
+/// 保留数**不低于本批目标数**，绝不误清刚落的文件。
+async fn deliver_agent_package(
+    config: &Config,
+    client: &CenterClient,
+    pusher: &AgentPackageClient,
+    targets: &[(String, String, String)],
+) -> Result<(), String> {
+    let drop_dir = config
+        .agent_package_drop_dir
+        .as_deref()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .ok_or_else(|| "未配置 agent_package_drop_dir（② 投放目录）".to_string())?;
+    let container_dir = config
+        .agent_package_container_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .ok_or_else(|| "未配置 agent_package_container_dir（网关容器路径前缀）".to_string())?;
+
+    let outcome = async {
+        // 逐平台：取包 → 校验 → 落盘 → 记下（本机路径，容器可见）。
+        let mut delivered: Vec<(String, String, String, String)> =
+            Vec::with_capacity(targets.len());
+        for (platform, artifact_url, artifact_sha256) in targets {
+            // 取包：gwlinkd 的制品客户端（带 CA-S / 客户端证书）。
+            let bytes = wist_artifact::source::read_source_with_client(
+                &client.artifact_http_client(),
+                artifact_url,
+                wist_artifact::source::MAX_ARTIFACT_BYTES,
+                wist_artifact::source::FETCH_TIMEOUT,
+            )
+            .await
+            .map_err(|err| format!("取包失败 {platform} {artifact_url}: {err}"))?;
+
+            // 摘要校验：不符即拒，绝不把错内容交付网关。
+            let expected = wist_artifact::digest::parse_digest(artifact_sha256).map_err(|err| {
+                format!("中心给的摘要形态不对（{platform} {artifact_sha256}）：{err}")
+            })?;
+            let actual = wist_artifact::digest::sha256_hex_bytes(&bytes);
+            if actual != expected {
+                return Err(format!(
+                    "制品摘要不符（{platform}）：期望 {expected}，实得 {actual}"
+                ));
+            }
+
+            // 安全文件名（防 `..` / 控制字符把落点带出投放目录）+ **平台限定**（同版本多平台可能同名制品）。
+            let filename = platform_drop_filename(platform, artifact_url)?;
+            // 落到宿主投放目录（网关容器只读挂载同一份）：先写临时再改名，避免半截文件被读。
+            let drop_path = drop_dir.join(&filename);
+            let write_dir = drop_dir.to_path_buf();
+            let write_target = drop_path.clone();
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                std::fs::create_dir_all(&write_dir)
+                    .map_err(|err| format!("建投放目录失败 {}: {err}", write_dir.display()))?;
+                let partial = partial_path(&write_target);
+                std::fs::write(&partial, &bytes)
+                    .map_err(|err| format!("写投放文件失败 {}: {err}", partial.display()))?;
+                std::fs::rename(&partial, &write_target)
+                    .map_err(|err| format!("落盘投放文件失败 {}: {err}", write_target.display()))
+            })
+            .await
+            .map_err(|err| format!("投放任务异常: {err}"))??;
+
+            let container_path = format!("{}/{}", container_dir.trim_end_matches('/'), filename);
+            delivered.push((
+                platform.clone(),
+                container_path,
+                artifact_url.clone(),
+                artifact_sha256.clone(),
+            ));
+        }
+
+        // 一次 POST 带全部平台 —— 网关侧整批一次提交（任一不合格整体拒绝落库）。
+        let items: Vec<AgentPackageItem<'_>> = delivered
+            .iter()
+            .map(
+                |(platform, package_url, origin, package_sha256)| AgentPackageItem {
+                    platform,
+                    package_url,
+                    origin,
+                    package_sha256,
+                },
+            )
+            .collect();
+        pusher.push(&items).await?;
+        Ok::<(), String>(())
+    }
+    .await;
+
+    // 无论成败都按数量清旧（best-effort）：失败也清（免得反复失败把投放目录撑爆）；
+    // 保留数**不低于本批目标数** —— 否则 keep 偏小时可能把刚落的文件清掉。
+    let keep = match config.agent_package_drop_keep {
+        Some(0) => Some(0), // 0 = 不清理
+        Some(keep) => Some(keep.max(targets.len())),
+        None => Some(DEFAULT_AGENT_PACKAGE_DROP_KEEP.max(targets.len())),
+    };
+    prune_old_drops(drop_dir, keep).await;
+    outcome
+}
+
+/// 投放目录保留份数的缺省值（清理时按 mtime 保留最新 N 份）。
+const DEFAULT_AGENT_PACKAGE_DROP_KEEP: usize = 12;
+
+/// 按数量清旧：保留投放目录里**最新** `keep` 份，删其余。`0` = 不清理。
+/// **best-effort**：失败只告警 —— 清理不该让一次交付变成失败。
+async fn prune_old_drops(drop_dir: &Path, keep: Option<usize>) {
+    let keep = keep.unwrap_or(DEFAULT_AGENT_PACKAGE_DROP_KEEP);
+    if keep == 0 {
+        return;
+    }
+    let dir = drop_dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || prune_drop_dir(&dir, keep)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => eprintln!("event=AgentPackageDropPruneFailed error={err}"),
+        Err(err) => eprintln!("event=AgentPackageDropPruneFailed error={err}"),
+    }
+}
+
+/// 按 mtime 保留**最新** `keep` 个普通文件，删其余（子目录不动）。单一文件删除失败只告警。
+fn prune_drop_dir(dir: &Path, keep: usize) -> Result<(), String> {
+    let mut entries: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .map_err(|err| format!("读投放目录失败 {}: {err}", dir.display()))?
+        .flatten()
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        entries.push((modified, path));
+    }
+    if entries.len() <= keep {
+        return Ok(());
+    }
+    entries.sort_by_key(|(modified, _)| *modified);
+    let drop_count = entries.len() - keep;
+    for (_, path) in entries.into_iter().take(drop_count) {
+        if let Err(err) = std::fs::remove_file(&path) {
+            eprintln!(
+                "event=AgentPackageDropPruneSkip path={} error={err}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 从制品地址取一个**安全的单段文件名**：去 query、取末段；拒空 / `.` / `..` / 含路径分隔或控制字符。
+///
+/// 该名字拼进投放目录后的**本机路径**会被交给网关取包，绝不能让 `..` 或分隔符把落点带出目录。
+fn safe_artifact_filename(source: &str) -> Result<String, String> {
+    let name = source
+        .split('?')
+        .next()
+        .unwrap_or(source)
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(format!("从制品地址取不出安全文件名：{source}"));
+    }
+    if name.chars().any(|ch| ch == '\\' || ch.is_control()) {
+        return Err(format!("制品文件名含非法字符：{name}"));
+    }
+    Ok(name.to_string())
+}
+
+/// 投放文件名 = `<平台>__<制品原名>`。
+///
+/// 同一版本的**多平台**制品，来源原名**可能相同**（用户上传时同名）—— 落在同一投放目录会互相覆盖：
+/// 后一个平台把前一个的文件改名覆盖掉，交付里两个平台指向**同一份内容**，网关摘要校验必有一方不过，
+/// 整批被拒（fail-closed，但原因难定位）。前缀平台即可保证「一平台一份」。
+///
+/// 网关取包只按**内容**认版本/架构、按报文里的 `platform` 认平台（不看文件名），故改名安全。
+fn platform_drop_filename(platform: &str, artifact_url: &str) -> Result<String, String> {
+    let platform = safe_path_segment(platform, "制品平台")?;
+    let name = safe_artifact_filename(artifact_url)?;
+    Ok(format!("{platform}__{name}"))
+}
+
+/// 校验一个可拼进本机路径的**安全单段**：非空、非 `.` / `..`、不含路径分隔符或控制字符。
+fn safe_path_segment(value: &str, what: &str) -> Result<String, String> {
+    if value.is_empty() || value == "." || value == ".." {
+        return Err(format!("{what}为空或不安全：{value:?}"));
+    }
+    if value.contains('/') || value.chars().any(|ch| ch == '\\' || ch.is_control()) {
+        return Err(format!("{what}含非法字符：{value}"));
+    }
+    Ok(value.to_string())
+}
+
+/// 落盘用的临时名：**追加** `.partial`（不用 `with_extension` —— 它会把 `.gz` 换成 `.partial`，
+/// 不同扩展名的同名制品会撞到同一个临时文件）。
+fn partial_path(target: &Path) -> PathBuf {
+    let mut name = target.as_os_str().to_os_string();
+    name.push(".partial");
+    PathBuf::from(name)
 }
 
 /// 指数退避：0 → 初值，否则翻倍到上限。
@@ -1098,6 +1423,8 @@ mod tests {
         /// register 依次响应（多余调用重复最后一个）。
         registers: Vec<(u16, String)>,
         reg_idx: usize,
+        /// 收到的 `upgrade-result` body（按到达顺序）。
+        reports: Vec<String>,
     }
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -1116,6 +1443,9 @@ mod tests {
             link_token: None,
             gateway_self_endpoint: None,
             gateway_self_ca: None,
+            agent_package_drop_dir: None,
+            agent_package_container_dir: None,
+            agent_package_drop_keep: None,
             renew_lead_seconds: None,
             upgrader_program: None,
             upgrade_on_failure: None,
@@ -1191,6 +1521,8 @@ mod tests {
                         }
                     }
                     let head = String::from_utf8_lossy(&buf);
+                    let body_start = head.find("\r\n\r\n").map(|i| i + 4).unwrap_or(head.len());
+                    let req_body = head[body_start..].to_string();
                     let request_line = head.lines().next().unwrap_or_default();
                     let mut parts = request_line.split_whitespace();
                     let method = parts.next().unwrap_or_default().to_string();
@@ -1216,6 +1548,13 @@ mod tests {
                                 .get(idx)
                                 .cloned()
                                 .unwrap_or((404, "no register".into()))
+                        } else if route == "/api/v1/gateway/upgrade-result" {
+                            guard.reports.push(req_body.clone());
+                            (
+                                200,
+                                r#"{"gateway_id":"gw-1","work_id":"w","accepted_at":"2026-10-09T00:00:00Z"}"#
+                                    .into(),
+                            )
                         } else {
                             (404, "not found".into())
                         }
@@ -1467,6 +1806,953 @@ mod tests {
             .await
             .expect_err("应报错");
         assert!(err.contains("WIST_GWLINKD_LINK_TOKEN"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 发布 ②：`push-agent-package` 计划 → **gwlinkd 取包**（带 CA-S 客户端）→ 校验摘要 → 落到投放目录 → 环回**交付**网关 + 回报中心 `done` + 落游标。
+    #[tokio::test]
+    async fn drive_agent_package_push_fetches_delivers_and_reports() {
+        // 本机平台：认不出就跳过（罕见主机）。
+        let Some(platform) = wist_gwlinkd::target::HostTarget::detect().target_triple() else {
+            eprintln!("skip: 测试机平台不可识别");
+            return;
+        };
+
+        let dir = temp_dir("agent-package-push");
+
+        // 制品桩：gwlinkd 用自己的客户端取它（http 明文即可）。任意路径都回同一段字节。
+        let payload = b"fake-agentd-package-bytes".to_vec();
+        let digest = wist_artifact::digest::sha256_hex_bytes(&payload);
+        let artifact_base = serve_artifact(payload.clone()).await;
+
+        // **多平台**：契约 `artifacts` 带两个平台（本机 + 另一个 —— 机队平台可能 ≠ 网关本机平台）。
+        let other_platform = if platform == "aarch64-apple-darwin" {
+            "x86_64-unknown-linux-musl".to_string()
+        } else {
+            "aarch64-apple-darwin".to_string()
+        };
+        let host_url = format!("{artifact_base}/wist-agentd-0.1.9-{platform}.tar.gz");
+        let other_url = format!("{artifact_base}/wist-agentd-0.1.9-{other_platform}.tar.gz");
+
+        // 网关桩：捕获环回交付 POST，回 200。
+        let (gw_base, rx) = one_shot_gateway("200 OK", r#"{"packages":[]}"#).await;
+
+        // 中心桩（只用于回执）。
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let client = CenterClient::new(serve_center(Arc::clone(&stub)).await);
+
+        let drop_dir = dir.join("packages");
+        let mut config = test_config(&dir, client.endpoint().to_string());
+        config.gateway_self_endpoint = Some(gw_base.clone());
+        config.agent_package_drop_dir = Some(drop_dir.clone());
+        config.agent_package_container_dir = Some("/packages".into());
+
+        let mut plan = push_plan(None, None); // 走 `artifacts` 分支，单值留空
+        plan.artifacts = vec![
+            multi_artifact(&platform, &host_url, &digest),
+            multi_artifact(&other_platform, &other_url, &digest),
+        ];
+        let pusher = AgentPackageClient::new(gw_base);
+        drive_agent_package_push(&config, &client, &pusher, &plan).await;
+
+        // 落盘：**两个平台**各自文件都在（文件名前缀平台），内容一致。
+        for platform in [&platform, &other_platform] {
+            let dropped = drop_dir.join(format!("{platform}__wist-agentd-0.1.9-{platform}.tar.gz"));
+            assert_eq!(
+                std::fs::read(&dropped).unwrap_or_else(|err| panic!("{}: {err}", dropped.display())),
+                payload,
+                "取到的字节落到投放目录（{platform}）"
+            );
+        }
+
+        // 网关收到**一次**环回交付，body 带**两个**平台（整批一次提交）。
+        let request = rx.await.expect("gateway captured");
+        assert!(
+            request.starts_with("POST /api/v1/gateway/agent-package "),
+            "{request}"
+        );
+        for platform in [&platform, &other_platform] {
+            assert!(
+                request.contains(&format!("\"platform\":\"{platform}\"")),
+                "多平台：{platform} 要在同一次交付里：{request}"
+            );
+            assert!(
+                request.contains(&format!(
+                    "\"package_url\":\"/packages/{platform}__wist-agentd-0.1.9-{platform}.tar.gz\""
+                )),
+                "{request}"
+            );
+        }
+        assert!(
+            request.contains(&format!("\"origin\":\"{host_url}\"")),
+            "{request}"
+        );
+        assert!(
+            request.contains(&format!("\"package_sha256\":\"sha256:{digest}\"")),
+            "{request}"
+        );
+
+        // 中心收到 `done` 回执（回填发布计划条目）。
+        let reports = stub.lock().unwrap().reports.clone();
+        assert_eq!(reports.len(), 1, "one upgrade-result report");
+        assert!(reports[0].contains("\"status\":\"done\""), "{}", reports[0]);
+        assert!(
+            reports[0].contains("\"work_id\":\"plan-push-1\""),
+            "{}",
+            reports[0]
+        );
+
+        // 落游标：同一计划不再重复驱动。
+        let cursor = wist_gwlinkd::state::load_upgrade_cursor(&dir);
+        assert_eq!(cursor.last_plan_id.as_deref(), Some("plan-push-1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// ② 计划的 `GatewayUpgradePlan`（**单值回落**）：`artifact_url` / `artifact_sha256` 可省（造失败分支）。
+    /// `artifacts` 留空 —— 走「旧中心 / 单值 + 本机平台」回落；多平台用例另自行置 `plan.artifacts`。
+    fn push_plan(url: Option<&str>, sha: Option<&str>) -> wist_control::GatewayUpgradePlan {
+        wist_control::GatewayUpgradePlan {
+            gateway_id: "gw-1".into(),
+            has_plan: true,
+            plan_id: Some("plan-push-1".into()),
+            component: Some("wist-agentd".into()),
+            to_version: Some("0.1.9".into()),
+            artifact_url: url.map(str::to_string),
+            action: Some(wist_control::ACTION_PUSH_AGENT_PACKAGE.into()),
+            artifact_sha256: sha.map(str::to_string),
+            artifacts: Vec::new(),
+        }
+    }
+
+    /// ② 多平台制品项（造 `plan.artifacts` 用）。
+    fn multi_artifact(
+        platform: &str,
+        url: &str,
+        sha_without_prefix: &str,
+    ) -> wist_control::GatewayUpgradeArtifact {
+        wist_control::GatewayUpgradeArtifact {
+            platform: platform.to_string(),
+            artifact_url: url.to_string(),
+            artifact_sha256: format!("sha256:{sha_without_prefix}"),
+        }
+    }
+
+    /// `target_artifacts`：`artifacts` 非空（**多平台**，中心给该版本全部平台）优先；为空才回落
+    /// 单值 `artifact_url` + 摘要 + **本机平台**（旧中心 / ① 兼容）。
+    #[test]
+    fn target_artifacts_prefers_the_multi_platform_list() {
+        // 多平台清单优先：单值即使也在，也被忽略。
+        let mut plan = push_plan(Some("https://c/single.tar.gz"), Some("sha256:single"));
+        plan.artifacts = vec![
+            multi_artifact("x86_64-unknown-linux-musl", "https://c/a.tar.gz", "aa"),
+            multi_artifact("aarch64-apple-darwin", "https://c/b.tar.gz", "bb"),
+        ];
+        assert_eq!(
+            target_artifacts(&plan).expect("targets"),
+            vec![
+                (
+                    "x86_64-unknown-linux-musl".to_string(),
+                    "https://c/a.tar.gz".to_string(),
+                    "sha256:aa".to_string(),
+                ),
+                (
+                    "aarch64-apple-darwin".to_string(),
+                    "https://c/b.tar.gz".to_string(),
+                    "sha256:bb".to_string(),
+                ),
+            ],
+            "多平台清单优先，避开单值"
+        );
+
+        // 清单为空 → 回落单值 + **本机平台**（认不出本机平台则报可读原因）。
+        let single = push_plan(Some("https://c/single.tar.gz"), Some("sha256:single"));
+        match wist_gwlinkd::target::HostTarget::detect().target_triple() {
+            Some(host) => assert_eq!(
+                target_artifacts(&single).expect("targets"),
+                vec![(
+                    host.to_string(),
+                    "https://c/single.tar.gz".to_string(),
+                    "sha256:single".to_string(),
+                )]
+            ),
+            None => assert!(
+                target_artifacts(&single).is_err(),
+                "认不出本机平台应报错"
+            ),
+        }
+
+        // 单值缺地址 → 报可读原因（清单也空）。
+        let missing = push_plan(None, Some("sha256:x"));
+        assert!(target_artifacts(&missing).unwrap_err().contains("未派生制品地址"));
+    }
+
+    /// **同名制品**（同版本多平台的来源原名相同）不得互相覆盖：投放文件名前缀平台 → 一平台一份，
+    /// 交付里两个平台各指各的文件（否则后者覆盖前者，网关摘要校验必有一方不过、整批被拒）。
+    #[tokio::test]
+    async fn drive_agent_package_push_keeps_same_named_platforms_separate() {
+        let dir = temp_dir("agent-package-samename");
+        let payload = b"same-named-bytes".to_vec();
+        let digest = wist_artifact::digest::sha256_hex_bytes(&payload);
+        let artifact_base = serve_artifact(payload.clone()).await;
+        // **相同的末段文件名**给两个不同平台。
+        let shared_url = format!("{artifact_base}/wist-agentd-0.2.1.tar.gz");
+
+        let (gw_base, rx) = one_shot_gateway("200 OK", r#"{"packages":[]}"#).await;
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let client = CenterClient::new(serve_center(Arc::clone(&stub)).await);
+
+        let drop_dir = dir.join("packages");
+        let mut config = test_config(&dir, client.endpoint().to_string());
+        config.agent_package_drop_dir = Some(drop_dir.clone());
+        config.agent_package_container_dir = Some("/packages".into());
+
+        let mut plan = push_plan(None, None);
+        plan.artifacts = vec![
+            multi_artifact("aarch64-apple-darwin", &shared_url, &digest),
+            multi_artifact("x86_64-unknown-linux-musl", &shared_url, &digest),
+        ];
+        let pusher = AgentPackageClient::new(gw_base);
+        drive_agent_package_push(&config, &client, &pusher, &plan).await;
+
+        for platform in ["aarch64-apple-darwin", "x86_64-unknown-linux-musl"] {
+            let dropped = drop_dir.join(format!("{platform}__wist-agentd-0.2.1.tar.gz"));
+            assert_eq!(
+                std::fs::read(&dropped).unwrap_or_else(|err| panic!("{}: {err}", dropped.display())),
+                payload,
+                "同名制品不得互相覆盖（{platform}）"
+            );
+        }
+
+        let request = rx.await.expect("gateway captured");
+        assert!(
+            request.contains(
+                "\"package_url\":\"/packages/aarch64-apple-darwin__wist-agentd-0.2.1.tar.gz\""
+            ),
+            "{request}"
+        );
+        assert!(
+            request.contains(
+                "\"package_url\":\"/packages/x86_64-unknown-linux-musl__wist-agentd-0.2.1.tar.gz\""
+            ),
+            "{request}"
+        );
+        let reports = stub.lock().unwrap().reports.clone();
+        assert!(
+            reports[0].contains("\"status\":\"done\""),
+            "{}",
+            reports[0]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 一次性网关桩：捕获收到的原始请求，并按给定状态码/体回一次；返回 `http://addr`。
+    async fn one_shot_gateway(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gw");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0_u8; 4096];
+                let read = sock.read(&mut buf).await.unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..read]).to_string());
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// 极简制品桩：任意 GET 都回这段字节（`application/octet-stream`），可反复取。
+    async fn serve_artifact(bytes: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind artifact");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let bytes = bytes.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        bytes.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&bytes).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// 多平台：**每个平台取各自的字节、各自校验各自的摘要**（防跳平台摘要串味），
+    /// 交付报文里每个平台带自己的 `package_url` / `package_sha256`。
+    #[tokio::test]
+    async fn drive_agent_package_push_keeps_each_platforms_own_bytes_and_digest() {
+        let Some(platform) = wist_gwlinkd::target::HostTarget::detect().target_triple() else {
+            eprintln!("skip: 测试机平台不可识别");
+            return;
+        };
+        let other = if platform == "aarch64-apple-darwin" {
+            "x86_64-unknown-linux-musl".to_string()
+        } else {
+            "aarch64-apple-darwin".to_string()
+        };
+        let dir = temp_dir("agent-package-perplatform");
+
+        // 两个平台各自的制品桩：**不同字节、不同摘要**。
+        let bytes_host = b"host-platform-bytes".to_vec();
+        let bytes_other = b"other-platform-bytes".to_vec();
+        let digest_host = wist_artifact::digest::sha256_hex_bytes(&bytes_host);
+        let digest_other = wist_artifact::digest::sha256_hex_bytes(&bytes_other);
+        let base_host = serve_artifact(bytes_host.clone()).await;
+        let base_other = serve_artifact(bytes_other.clone()).await;
+        let url_host = format!("{base_host}/wist-agentd-0.2.1-{platform}.tar.gz");
+        let url_other = format!("{base_other}/wist-agentd-0.2.1-{other}.tar.gz");
+
+        let (gw_base, rx) = one_shot_gateway("200 OK", r#"{"packages":[]}"#).await;
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let client = CenterClient::new(serve_center(Arc::clone(&stub)).await);
+
+        let drop_dir = dir.join("packages");
+        let mut config = test_config(&dir, client.endpoint().to_string());
+        config.agent_package_drop_dir = Some(drop_dir.clone());
+        config.agent_package_container_dir = Some("/packages".into());
+
+        let mut plan = push_plan(None, None);
+        plan.artifacts = vec![
+            multi_artifact(&platform, &url_host, &digest_host),
+            multi_artifact(&other, &url_other, &digest_other),
+        ];
+        let pusher = AgentPackageClient::new(gw_base);
+        drive_agent_package_push(&config, &client, &pusher, &plan).await;
+
+        // 各平台落到自己的文件、写的是**自己那份**字节。
+        assert_eq!(
+            std::fs::read(drop_dir.join(format!("{platform}__wist-agentd-0.2.1-{platform}.tar.gz")))
+                .expect("host dropped"),
+            bytes_host,
+            "本机平台文件内容"
+        );
+        assert_eq!(
+            std::fs::read(drop_dir.join(format!("{other}__wist-agentd-0.2.1-{other}.tar.gz")))
+                .expect("other dropped"),
+            bytes_other,
+            "另一平台文件内容"
+        );
+
+        // 交付报文里每个平台带**自己的**摘要（不是同一份串给所有平台）。
+        let request = rx.await.expect("gateway captured");
+        for (platform, digest) in [(&platform, &digest_host), (&other, &digest_other)] {
+            assert!(
+                request.contains(&format!("\"platform\":\"{platform}\"")),
+                "{request}"
+            );
+            assert!(
+                request.contains(&format!("\"package_sha256\":\"sha256:{digest}\"")),
+                "{platform} 的摘要在报文里：{request}"
+            );
+        }
+        let reports = stub.lock().unwrap().reports.clone();
+        assert!(reports[0].contains("\"status\":\"done\""), "{}", reports[0]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 一批里**任一平台**取包/摘要失败 → **不**交付网关（不碰环回面）、回报 `failed`。
+    /// 前置平台已落盘的文件会留下（见设计 `edge/agent-package-push-to-gateways.md` §10 遗留；网关侧未被触碰）。
+    #[tokio::test]
+    async fn drive_agent_package_push_stops_before_delivery_when_one_platform_fails() {
+        let Some(platform) = wist_gwlinkd::target::HostTarget::detect().target_triple() else {
+            eprintln!("skip: 测试机平台不可识别");
+            return;
+        };
+        let other = if platform == "aarch64-apple-darwin" {
+            "x86_64-unknown-linux-musl".to_string()
+        } else {
+            "aarch64-apple-darwin".to_string()
+        };
+        let dir = temp_dir("agent-package-partial");
+
+        let bytes_host = b"host-ok-bytes".to_vec();
+        let digest_host = wist_artifact::digest::sha256_hex_bytes(&bytes_host);
+        let base_host = serve_artifact(bytes_host.clone()).await;
+        let url_host = format!("{base_host}/wist-agentd-0.2.1-{platform}.tar.gz");
+
+        // 另一平台：摘要**故意写错**（取到的字节对不上），驱动应在第二个平台拒绝。
+        let base_other = serve_artifact(b"other-bytes".to_vec()).await;
+        let url_other = format!("{base_other}/wist-agentd-0.2.1-{other}.tar.gz");
+
+        let (gw_base, mut rx) = one_shot_gateway("200 OK", r#"{"packages":[]}"#).await;
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let client = CenterClient::new(serve_center(Arc::clone(&stub)).await);
+
+        let drop_dir = dir.join("packages");
+        let mut config = test_config(&dir, client.endpoint().to_string());
+        config.agent_package_drop_dir = Some(drop_dir.clone());
+        config.agent_package_container_dir = Some("/packages".into());
+
+        let mut plan = push_plan(None, None);
+        plan.artifacts = vec![
+            multi_artifact(&platform, &url_host, &digest_host),
+            multi_artifact(
+                &other,
+                &url_other,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ];
+        let pusher = AgentPackageClient::new(gw_base);
+        drive_agent_package_push(&config, &client, &pusher, &plan).await;
+
+        // 不交付：网关的环回面**从未**被联系到。
+        assert!(
+            rx.try_recv().is_err(),
+            "一批里任一平台失败 → 不交付网关（不碰环回面）"
+        );
+        // 前置平台已落盘的文件留下（best-effort；不影响网关）。
+        assert!(
+            drop_dir
+                .join(format!("{platform}__wist-agentd-0.2.1-{platform}.tar.gz"))
+                .exists(),
+            "前置平台文件已落盘（遗留，无害）"
+        );
+        // 回报 failed，detail 带「摘要不符」。
+        let reports = stub.lock().unwrap().reports.clone();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].contains("\"status\":\"failed\""), "{}", reports[0]);
+        assert!(reports[0].contains("摘要不符"), "{}", reports[0]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 旧中心兼容（**端到端**）：计划**不带** `artifacts` 时，回落单值 `artifact_url` + 摘要 + **本机平台**，
+    /// 照样取包 / 校验 / 落盘 / 交付（不只是 `target_artifacts` 单测）。
+    #[tokio::test]
+    async fn drive_agent_package_push_falls_back_to_single_value_for_old_centers() {
+        let Some(platform) = wist_gwlinkd::target::HostTarget::detect().target_triple() else {
+            eprintln!("skip: 测试机平台不可识别");
+            return;
+        };
+        let dir = temp_dir("agent-package-fallback");
+        let payload = b"fallback-bytes".to_vec();
+        let digest = wist_artifact::digest::sha256_hex_bytes(&payload);
+        let base = serve_artifact(payload.clone()).await;
+        let url = format!("{base}/wist-agentd-0.1.9-{platform}.tar.gz");
+
+        let (gw_base, rx) = one_shot_gateway("200 OK", r#"{"packages":[]}"#).await;
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let client = CenterClient::new(serve_center(Arc::clone(&stub)).await);
+
+        let drop_dir = dir.join("packages");
+        let mut config = test_config(&dir, client.endpoint().to_string());
+        config.agent_package_drop_dir = Some(drop_dir.clone());
+        config.agent_package_container_dir = Some("/packages".into());
+
+        // 旧中心：只有单值（`artifacts` 为空）。
+        let plan = push_plan(Some(&url), Some(&format!("sha256:{digest}")));
+        assert!(plan.artifacts.is_empty(), "旧中心不带清单");
+        let pusher = AgentPackageClient::new(gw_base);
+        drive_agent_package_push(&config, &client, &pusher, &plan).await;
+
+        // 回落用**本机平台**，落到带平台前缀的文件。
+        assert_eq!(
+            std::fs::read(drop_dir.join(format!("{platform}__wist-agentd-0.1.9-{platform}.tar.gz")))
+                .expect("dropped"),
+            payload
+        );
+        let request = rx.await.expect("gateway captured");
+        assert!(
+            request.contains(&format!("\"platform\":\"{platform}\"")),
+            "{request}"
+        );
+        assert!(
+            request.contains(&format!(
+                "\"package_url\":\"/packages/{platform}__wist-agentd-0.1.9-{platform}.tar.gz\""
+            )),
+            "{request}"
+        );
+        assert!(
+            request.contains(&format!("\"package_sha256\":\"sha256:{digest}\"")),
+            "{request}"
+        );
+        let reports = stub.lock().unwrap().reports.clone();
+        assert!(reports[0].contains("\"status\":\"done\""), "{}", reports[0]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 交付成功后按 `agent_package_drop_keep` 清旧：`keep` 恰好够时**不**丢本次交付，只清更早的旧份。
+    #[tokio::test]
+    async fn drive_agent_package_push_prunes_old_drops_without_losing_this_delivery() {
+        let Some(platform) = wist_gwlinkd::target::HostTarget::detect().target_triple() else {
+            eprintln!("skip: 测试机平台不可识别");
+            return;
+        };
+        let other = if platform == "aarch64-apple-darwin" {
+            "x86_64-unknown-linux-musl".to_string()
+        } else {
+            "aarch64-apple-darwin".to_string()
+        };
+        let dir = temp_dir("agent-package-prune-delivery");
+        let drop_dir = dir.join("packages");
+        std::fs::create_dir_all(&drop_dir).expect("mk drop dir");
+        // 两个**陈旧**文件（mtime 显式设老，不依赖调度）：交付后应被清掉。
+        use std::time::{Duration, UNIX_EPOCH};
+        for name in ["stale-a.bin", "stale-b.bin"] {
+            let path = drop_dir.join(name);
+            std::fs::write(&path, b"old").expect("write stale");
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open stale")
+                .set_modified(UNIX_EPOCH + Duration::from_secs(1))
+                .expect("set stale mtime");
+        }
+
+        let payload = b"prune-bytes".to_vec();
+        let digest = wist_artifact::digest::sha256_hex_bytes(&payload);
+        let base = serve_artifact(payload.clone()).await;
+        let url_host = format!("{base}/wist-agentd-0.2.1-{platform}.tar.gz");
+        let url_other = format!("{base}/wist-agentd-0.2.1-{other}.tar.gz");
+
+        let (gw_base, rx) = one_shot_gateway("200 OK", r#"{"packages":[]}"#).await;
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let client = CenterClient::new(serve_center(Arc::clone(&stub)).await);
+
+        let mut config = test_config(&dir, client.endpoint().to_string());
+        config.agent_package_drop_dir = Some(drop_dir.clone());
+        config.agent_package_container_dir = Some("/packages".into());
+        // 故意配小（1 < 本批 2 份）：保留数会被抬到本批目标数，故**不**会误清本次交付。
+        config.agent_package_drop_keep = Some(1);
+
+        let mut plan = push_plan(None, None);
+        plan.artifacts = vec![
+            multi_artifact(&platform, &url_host, &digest),
+            multi_artifact(&other, &url_other, &digest),
+        ];
+        let pusher = AgentPackageClient::new(gw_base);
+        drive_agent_package_push(&config, &client, &pusher, &plan).await;
+        let _ = rx.await.expect("gateway captured");
+
+        // keep=1 但被抬到本批 2 → 只保最新两份 = 本次交付的两份；陈旧的两份被清。
+        assert!(
+            drop_dir
+                .join(format!("{platform}__wist-agentd-0.2.1-{platform}.tar.gz"))
+                .exists()
+                && drop_dir
+                    .join(format!("{other}__wist-agentd-0.2.1-{other}.tar.gz"))
+                    .exists(),
+            "本次交付两份都在（keep 不低于本批目标数）"
+        );
+        assert!(
+            !drop_dir.join("stale-a.bin").exists() && !drop_dir.join("stale-b.bin").exists(),
+            "陈旧两份被清（keep 抬到 2）"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// P7：交付**失败也会**按数量清旧（best-effort）—— 反复失败不致把投放目录撑爆；
+    /// 同时保留数不低于本批目标数，不会误清刚落的文件。
+    #[tokio::test]
+    async fn drive_agent_package_push_prunes_old_drops_even_when_delivery_fails() {
+        let Some(platform) = wist_gwlinkd::target::HostTarget::detect().target_triple() else {
+            eprintln!("skip: 测试机平台不可识别");
+            return;
+        };
+        let other = if platform == "aarch64-apple-darwin" {
+            "x86_64-unknown-linux-musl".to_string()
+        } else {
+            "aarch64-apple-darwin".to_string()
+        };
+        let dir = temp_dir("agent-package-prune-on-failure");
+        let drop_dir = dir.join("packages");
+        std::fs::create_dir_all(&drop_dir).expect("mk drop dir");
+        // 三个陈旧文件，mtime 递增（不依赖调度）。
+        use std::time::{Duration, UNIX_EPOCH};
+        for (index, name) in ["old-1.bin", "old-2.bin", "old-3.bin"].iter().enumerate() {
+            let path = drop_dir.join(name);
+            std::fs::write(&path, b"old").expect("write stale");
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open stale")
+                .set_modified(UNIX_EPOCH + Duration::from_secs(index as u64 + 1))
+                .expect("set stale mtime");
+        }
+
+        // 本机平台好、另一平台摘要写错 → 交付失败（在写好本机平台文件后）。
+        let bytes = b"ok-bytes".to_vec();
+        let digest = wist_artifact::digest::sha256_hex_bytes(&bytes);
+        let base = serve_artifact(bytes).await;
+        let url_a = format!("{base}/wist-agentd-0.2.1-{platform}.tar.gz");
+        let url_b = format!("{base}/wist-agentd-0.2.1-{other}.tar.gz");
+
+        let (gw_base, mut rx) = one_shot_gateway("200 OK", r#"{"packages":[]}"#).await;
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let client = CenterClient::new(serve_center(Arc::clone(&stub)).await);
+
+        let mut config = test_config(&dir, client.endpoint().to_string());
+        config.agent_package_drop_dir = Some(drop_dir.clone());
+        config.agent_package_container_dir = Some("/packages".into());
+        config.agent_package_drop_keep = Some(1); // 抬到本批 2
+
+        let mut plan = push_plan(None, None);
+        plan.artifacts = vec![
+            multi_artifact(&platform, &url_a, &digest),
+            multi_artifact(
+                &other,
+                &url_b,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ];
+        let pusher = AgentPackageClient::new(gw_base);
+        drive_agent_package_push(&config, &client, &pusher, &plan).await;
+
+        // 失败：不交付。
+        assert!(rx.try_recv().is_err(), "失败不交付网关");
+        // 但清旧跑了：4 份（3 陈旧 + 1 新落）→ keep 抬到 2 → 清最旧的 2 份；
+        // 剩 old-3 + 本机平台文件。
+        assert!(
+            !drop_dir.join("old-1.bin").exists() && !drop_dir.join("old-2.bin").exists(),
+            "陈旧两份被清（失败也清）"
+        );
+        assert!(drop_dir.join("old-3.bin").exists(), "较新陈旧一份保留（keep=2）");
+        assert!(
+            drop_dir
+                .join(format!("{platform}__wist-agentd-0.2.1-{platform}.tar.gz"))
+                .exists(),
+            "本批已落的一份不被误清"
+        );
+        // 回报 failed，detail 带「摘要不符」。
+        let reports = stub.lock().unwrap().reports.clone();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].contains("\"status\":\"failed\""), "{}", reports[0]);
+        assert!(reports[0].contains("摘要不符"), "{}", reports[0]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 失败分支：中心**没派生地址** → **不**碰网关，回报 `failed`，仍落游标（一份计划只驱一次）。
+    #[tokio::test]
+    async fn drive_agent_package_push_reports_failure_without_a_url() {
+        let dir = temp_dir("agent-package-no-url");
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let client = CenterClient::new(serve_center(Arc::clone(&stub)).await);
+        let config = test_config(&dir, client.endpoint().to_string());
+        // 指向一个不会被联系到的 endpoint（缺地址时不该推）。
+        let pusher = AgentPackageClient::new("http://127.0.0.1:1");
+
+        let plan = push_plan(None, Some("sha256:deadbeef"));
+        drive_agent_package_push(&config, &client, &pusher, &plan).await;
+
+        let reports = stub.lock().unwrap().reports.clone();
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].contains("\"status\":\"failed\""),
+            "{}",
+            reports[0]
+        );
+        assert!(reports[0].contains("未派生制品地址"), "{}", reports[0]);
+        assert_eq!(
+            wist_gwlinkd::state::load_upgrade_cursor(&dir)
+                .last_plan_id
+                .as_deref(),
+            Some("plan-push-1")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 失败分支：中心**没带摘要** → 回报 `failed`，仍落游标。
+    #[tokio::test]
+    async fn drive_agent_package_push_reports_failure_without_a_digest() {
+        let dir = temp_dir("agent-package-no-sha");
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let client = CenterClient::new(serve_center(Arc::clone(&stub)).await);
+        let config = test_config(&dir, client.endpoint().to_string());
+        let pusher = AgentPackageClient::new("http://127.0.0.1:1");
+
+        let plan = push_plan(
+            Some("https://center.example/wist-agentd-0.1.9.tar.gz"),
+            None,
+        );
+        drive_agent_package_push(&config, &client, &pusher, &plan).await;
+
+        let reports = stub.lock().unwrap().reports.clone();
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].contains("\"status\":\"failed\""),
+            "{}",
+            reports[0]
+        );
+        assert!(reports[0].contains("未带制品摘要"), "{}", reports[0]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 失败分支：网关**拒收**（如平台不符）→ 回报 `failed`，detail 带网关响应体，仍落游标。
+    #[tokio::test]
+    async fn drive_agent_package_push_reports_a_gateway_rejection() {
+        let Some(platform) = wist_gwlinkd::target::HostTarget::detect().target_triple() else {
+            eprintln!("skip: 测试机平台不可识别");
+            return;
+        };
+        let dir = temp_dir("agent-package-reject");
+        let payload = b"reject-bytes".to_vec();
+        let digest = wist_artifact::digest::sha256_hex_bytes(&payload);
+        let artifact_base = serve_artifact(payload).await;
+        let artifact_url = format!("{artifact_base}/wist-agentd-0.1.9-{platform}.tar.gz");
+
+        let (gw_base, rx) = one_shot_gateway(
+            "400 Bad Request",
+            "artifact platform `x86_64-unknown-linux-musl` does not match the package triple `aarch64-apple-darwin`",
+        )
+        .await;
+
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let client = CenterClient::new(serve_center(Arc::clone(&stub)).await);
+        let mut config = test_config(&dir, client.endpoint().to_string());
+        config.agent_package_drop_dir = Some(dir.join("packages"));
+        config.agent_package_container_dir = Some("/packages".into());
+        let pusher = AgentPackageClient::new(gw_base);
+
+        let plan = push_plan(Some(&artifact_url), Some(&format!("sha256:{digest}")));
+        drive_agent_package_push(&config, &client, &pusher, &plan).await;
+
+        // 网关确实被联系到。
+        let _ = rx.await.expect("gateway captured");
+        let reports = stub.lock().unwrap().reports.clone();
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].contains("\"status\":\"failed\""),
+            "{}",
+            reports[0]
+        );
+        assert!(reports[0].contains("400"), "{}", reports[0]);
+        assert_eq!(
+            wist_gwlinkd::state::load_upgrade_cursor(&dir)
+                .last_plan_id
+                .as_deref(),
+            Some("plan-push-1")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 失败分支：**未配置投放目录** → fail-closed（不碰网关、不落盘），回报 `failed`。
+    #[tokio::test]
+    async fn drive_agent_package_push_fails_closed_without_a_drop_dir() {
+        let Some(platform) = wist_gwlinkd::target::HostTarget::detect().target_triple() else {
+            eprintln!("skip: 测试机平台不可识别");
+            return;
+        };
+        let dir = temp_dir("agent-package-nodrop");
+        let payload = b"nodrop-bytes".to_vec();
+        let digest = wist_artifact::digest::sha256_hex_bytes(&payload);
+        let artifact_base = serve_artifact(payload).await;
+        let artifact_url = format!("{artifact_base}/wist-agentd-0.1.9-{platform}.tar.gz");
+
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let client = CenterClient::new(serve_center(Arc::clone(&stub)).await);
+        // 故意**不**配投放目录。
+        let config = test_config(&dir, client.endpoint().to_string());
+        let pusher = AgentPackageClient::new("http://127.0.0.1:1");
+
+        let plan = push_plan(Some(&artifact_url), Some(&format!("sha256:{digest}")));
+        drive_agent_package_push(&config, &client, &pusher, &plan).await;
+
+        let reports = stub.lock().unwrap().reports.clone();
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].contains("\"status\":\"failed\""),
+            "{}",
+            reports[0]
+        );
+        assert!(
+            reports[0].contains("agent_package_drop_dir"),
+            "{}",
+            reports[0]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 失败分支：**投放目录配了、容器前缀空白** → 同样 fail-closed（空白视为未配置）。
+    #[tokio::test]
+    async fn drive_agent_package_push_fails_closed_with_a_blank_container_dir() {
+        let Some(platform) = wist_gwlinkd::target::HostTarget::detect().target_triple() else {
+            eprintln!("skip: 测试机平台不可识别");
+            return;
+        };
+        let dir = temp_dir("agent-package-blankprefix");
+        let payload = b"blank-prefix".to_vec();
+        let digest = wist_artifact::digest::sha256_hex_bytes(&payload);
+        let artifact_base = serve_artifact(payload).await;
+        let artifact_url = format!("{artifact_base}/wist-agentd-0.1.9-{platform}.tar.gz");
+
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let client = CenterClient::new(serve_center(Arc::clone(&stub)).await);
+        let mut config = test_config(&dir, client.endpoint().to_string());
+        config.agent_package_drop_dir = Some(dir.join("packages"));
+        config.agent_package_container_dir = Some("   ".into());
+        let pusher = AgentPackageClient::new("http://127.0.0.1:1");
+
+        let plan = push_plan(Some(&artifact_url), Some(&format!("sha256:{digest}")));
+        drive_agent_package_push(&config, &client, &pusher, &plan).await;
+
+        let reports = stub.lock().unwrap().reports.clone();
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].contains("\"status\":\"failed\""),
+            "{}",
+            reports[0]
+        );
+        assert!(
+            reports[0].contains("agent_package_container_dir"),
+            "{}",
+            reports[0]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 失败分支：取到的包**摘要不符**（与中心给的 `artifact_sha256` 对不上）→
+    /// **不落盘、不碰网关**，回报 `failed`。
+    #[tokio::test]
+    async fn drive_agent_package_push_rejects_a_digest_mismatch() {
+        let Some(platform) = wist_gwlinkd::target::HostTarget::detect().target_triple() else {
+            eprintln!("skip: 测试机平台不可识别");
+            return;
+        };
+        let dir = temp_dir("agent-package-badsha");
+        // 桩回的字节是真字节，但计划里的期望摘要故意对不上。
+        let payload = b"tampered-bytes".to_vec();
+        let artifact_base = serve_artifact(payload).await;
+        let artifact_url = format!("{artifact_base}/wist-agentd-0.1.9-{platform}.tar.gz");
+
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let client = CenterClient::new(serve_center(Arc::clone(&stub)).await);
+        let drop_dir = dir.join("packages");
+        let mut config = test_config(&dir, client.endpoint().to_string());
+        config.agent_package_drop_dir = Some(drop_dir.clone());
+        config.agent_package_container_dir = Some("/packages".into());
+        // 指向不会被联系到的 endpoint（摘要不符时不该推）。
+        let pusher = AgentPackageClient::new("http://127.0.0.1:1");
+
+        let plan = push_plan(
+            Some(&artifact_url),
+            Some("sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+        );
+        drive_agent_package_push(&config, &client, &pusher, &plan).await;
+
+        // 不落盘。
+        assert!(
+            !drop_dir
+                .join(format!("{platform}__wist-agentd-0.1.9-{platform}.tar.gz"))
+                .exists(),
+            "摘要不符不得落盘"
+        );
+        // 回报 failed，detail 带「摘要不符」（而不是连接错）。
+        let reports = stub.lock().unwrap().reports.clone();
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].contains("\"status\":\"failed\""),
+            "{}",
+            reports[0]
+        );
+        assert!(reports[0].contains("摘要不符"), "{}", reports[0]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 制品文件名必须安全：拒空 / `.` / `..` / 控制字符；正常末段原样保留（去 query）。
+    #[test]
+    fn safe_artifact_filename_rejects_unsafe_names() {
+        assert_eq!(
+            safe_artifact_filename("https://c/a/b/wist-agentd-0.1.9.tar.gz").unwrap(),
+            "wist-agentd-0.1.9.tar.gz"
+        );
+        assert_eq!(
+            safe_artifact_filename("https://c/pkg.tar.gz?sig=1").unwrap(),
+            "pkg.tar.gz"
+        );
+        assert!(safe_artifact_filename("https://c/").is_err());
+        assert!(safe_artifact_filename("https://c/..").is_err());
+        assert!(safe_artifact_filename("https://c/.").is_err());
+        assert!(safe_artifact_filename("https://c/a\u{7}b").is_err());
+    }
+
+    /// 投放文件名**平台限定**：`<平台>__<原名>`；空 / `.` / `..` / 含分隔符 / 控制字符的平台报错。
+    #[test]
+    fn platform_drop_filename_qualifies_and_rejects_unsafe_platforms() {
+        assert_eq!(
+            platform_drop_filename(
+                "aarch64-apple-darwin",
+                "https://c/x/wist-agentd-0.2.1.tar.gz"
+            )
+            .unwrap(),
+            "aarch64-apple-darwin__wist-agentd-0.2.1.tar.gz"
+        );
+        assert!(platform_drop_filename("", "https://c/x/p.tar.gz").is_err());
+        assert!(platform_drop_filename("..", "https://c/x/p.tar.gz").is_err());
+        assert!(platform_drop_filename(".", "https://c/x/p.tar.gz").is_err());
+        assert!(platform_drop_filename("a/b", "https://c/x/p.tar.gz").is_err());
+        assert!(platform_drop_filename("a\\b", "https://c/x/p.tar.gz").is_err());
+        assert!(platform_drop_filename("a\nb", "https://c/x/p.tar.gz").is_err());
+    }
+
+    /// 落盘临时名**追加** `.partial`，不替换扩展名（否则 `x.tar.gz` / `x.tar.zst` 会撞同一临时文件）。
+    #[test]
+    fn partial_path_appends_instead_of_replacing_the_extension() {
+        assert_eq!(
+            partial_path(std::path::Path::new("/drop/pkg.tar.gz")),
+            std::path::PathBuf::from("/drop/pkg.tar.gz.partial")
+        );
+    }
+
+    /// 交付后按 mtime 保留**最新** N 份，删其余；子目录不动。
+    #[test]
+    fn prune_drop_dir_keeps_the_newest_files() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = temp_dir("agent-package-prune");
+        for (index, name) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").expect("write");
+            let file = std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open");
+            file.set_modified(UNIX_EPOCH + Duration::from_secs(index as u64 * 10))
+                .expect("set mtime");
+        }
+        std::fs::create_dir(dir.join("sub")).expect("mkdir");
+
+        prune_drop_dir(&dir, 2).expect("prune");
+
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name != "sub")
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["d", "e"], "保留最新两份");
+        assert!(dir.join("sub").is_dir(), "子目录不动");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `agent_package_drop_keep = 0` = 不清理。
+    #[tokio::test]
+    async fn prune_old_drops_is_a_noop_when_disabled() {
+        let dir = temp_dir("agent-package-prune-off");
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.join(name), b"x").expect("write");
+        }
+        prune_old_drops(&dir, Some(0)).await;
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "0 = 不清理");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

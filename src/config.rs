@@ -28,6 +28,20 @@ pub struct Config {
     /// 网关以自签证书提供 HTTPS 时需要；缺省 = 用系统根。
     #[serde(default)]
     pub gateway_self_ca: Option<PathBuf>,
+    /// 发布 ②「Agent 包交付」的**投放目录**（**宿主侧**，绝对路径）：收到中心的 agentd 包后，
+    /// gwlinkd 先把它落成文件放这里，再环回把**本机路径**交给网关托管（取包由 gwlinkd、托管在网关）。
+    /// 与网关容器的挂载点（[`Self::agent_package_container_dir`]，典型 `/packages`）指向同一份目录。
+    /// 缺省 = 未启用 ②（收到 `push-agent-package` 计划会明确报错）。
+    #[serde(default)]
+    pub agent_package_drop_dir: Option<PathBuf>,
+    /// 上面那份投放目录在**网关容器里**的路径（发给网关的 `package_url` 前缀，如 `/packages`）：
+    /// 宿主与容器是同一目录、路径写法不同。缺省 = 未启用 ②。
+    #[serde(default)]
+    pub agent_package_container_dir: Option<String>,
+    /// 投放目录**保留份数**：交付成功后按 mtime 保留最新 N 份，其余清掉（`0` = 不清理）。
+    /// 缺省 12 —— 投放目录是交付中转区，不应无界增长。见 [`Self::agent_package_drop_dir`]。
+    #[serde(default)]
+    pub agent_package_drop_keep: Option<usize>,
     /// 客户端证书轮换提前量（秒，缺省 3600）。
     #[serde(default)]
     pub renew_lead_seconds: Option<i64>,
@@ -257,6 +271,13 @@ gateway_id = "gw-local"
 # gateway_self_endpoint = "https://127.0.0.1:3000"
 # gateway_self_ca = "state/gateway-ca.crt.pem"
 
+# 可选：发布 ②「Agent 包交付」（gwlinkd 取包、网关托管）。
+# 收到中心派下的 agent 包后，gwlinkd 先把包落到宿主投放目录，再环回把**本机路径**交给网关。
+# 下面两项指向**同一份**目录（宿主写法 vs 容器写法）：
+#   agent_package_drop_dir      = "packages"            # 宿主侧目录（应与网关容器挂载的宿主机目录一致）
+#   agent_package_container_dir = "/packages"           # 该目录在网关容器里的路径（发给网关的 package_url 前缀）
+#   agent_package_drop_keep     = 12                     # 交付成功后保留最新 N 份（0 = 不清理；缺省 12）
+
 # 可选：一次性接入券（写上 = 起进程即自联；被消费即废）
 # link_token = ""
 "#;
@@ -287,6 +308,9 @@ mod tests {
         assert!(config.link_token.is_none());
         assert!(config.gateway_self_endpoint.is_none());
         assert!(config.gateway_self_ca.is_none());
+        assert!(config.agent_package_drop_dir.is_none());
+        assert!(config.agent_package_container_dir.is_none());
+        assert!(config.agent_package_drop_keep.is_none());
         assert!(config.renew_lead_seconds.is_none());
         assert!(config.upgrader_program.is_none());
         assert!(config.upgrade_on_failure.is_none());

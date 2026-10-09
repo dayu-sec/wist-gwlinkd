@@ -20,8 +20,8 @@ libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 # 注：不写 `webpki-roots` —— 0.13 里 TLS 根由 `rustls`（系统根）决定，它只是可选依赖的隐式 feature
 # （reqwest 源码不引用），0.13.5 已去掉；留着会把本仓钉死在 0.13.1。
-wist-control = { version = "0.9" }
-#wist-control = { version = "0.9", path = "../wist-control" }
+wist-control = { version = "0.13" }
+#wist-control = { path = "../wist-control" }
 # gateway↔center 注册/凭据契约（客户端证书 mTLS）。
 
 # 底座 crate：取制品（中心派生的制品地址，带信任锚 / 客户端证书）+ 摘要口径。
