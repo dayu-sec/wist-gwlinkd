@@ -279,7 +279,10 @@ async fn decode<T: serde::de::DeserializeOwned>(
         .await
         .source_raw_err(CenterReason::Http, format!("读取 {what} 响应体失败"))?;
     if !status.is_success() {
-        let message = format!("{what} 失败（{status}）：{}", body_head(&body));
+        let message = match error_envelope(&body) {
+            Some((code, message)) => format!("{what} 失败（{status}）[{code}]：{message}"),
+            None => format!("{what} 失败（{status}）：{}", body_head(&body)),
+        };
         return Err(
             if status == reqwest::StatusCode::UNAUTHORIZED
                 || status == reqwest::StatusCode::FORBIDDEN
@@ -296,6 +299,27 @@ async fn decode<T: serde::de::DeserializeOwned>(
             body_head(&body)
         ))
     })
+}
+
+/// 从中心错误体里取出 `{ "error": { code, message } }` 信封；非信封（旧式纯文本）→ None。
+///
+/// 中心 0.8 起错误体统一为该信封。`code` 一并折进 detail，好让按子原因的判断
+/// （如 `detail_contains("certificate_required")`）继续成立。
+fn error_envelope(body: &str) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    let code = error
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if code.is_empty() && message.is_empty() {
+        return None;
+    }
+    Some((code.to_string(), message.to_string()))
 }
 
 /// 响应体在错误 detail（进而进日志）里只留前 [`BODY_HEAD_CHARS`] 个字符。
@@ -424,6 +448,30 @@ mod tests {
             .await
             .expect_err("must fail");
         assert!(err.is_unauthorized(), "{err}");
+    }
+
+    /// 中心的 `{ "error": { code, message } }` 信封：拆出 `code` / `message`，`code` 折进 detail
+    /// （子原因判断仍成立），且不把整段 JSON 抄进错误文案。
+    #[tokio::test]
+    async fn a_center_error_envelope_is_unwrapped() {
+        let endpoint = one_shot_server(
+            "401 Unauthorized",
+            r#"{"error":{"code":"certificate_required","message":"gateway identity rejected: certificate_required","severity":"warning"}}"#,
+        )
+        .await;
+        let client = CenterClient::new(endpoint);
+        let err = client
+            .report_status(&status_payload())
+            .await
+            .expect_err("must fail");
+        assert!(err.is_unauthorized(), "{err}");
+        let rendered = err.to_string();
+        assert!(rendered.contains("certificate_required"), "{rendered}");
+        assert!(
+            err.detail_contains("certificate_required"),
+            "子原因判断应仍成立: {rendered}"
+        );
+        assert!(!rendered.contains("severity"), "信封原文外泄: {rendered}");
     }
 
     #[tokio::test]

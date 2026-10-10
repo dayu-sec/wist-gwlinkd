@@ -3,6 +3,14 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.7.1-alpha] - 2026-10-10
+
+### 变更
+
+- **适配中心 `{ "error": { code, message } }` 错误信封**：gwlinkd 的 center 客户端从错误体里拆出
+  `code` / `message`（`code` 一并折进 detail，按子原因的判断如 `certificate_required` 仍成立），
+  不再把整段 JSON 抄进错误文案；非信封（旧式纯文本）保持原样。
+
 ## [0.7.0-alpha] - 2026-10-10
 
 ### 新增

@@ -2425,7 +2425,7 @@ dependencies = [
 
 [[package]]
 name = "wist-gwlinkd"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "env_logger",
  "flate2",
