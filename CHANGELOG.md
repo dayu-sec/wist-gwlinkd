@@ -3,6 +3,14 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.0-alpha] - 2026-10-11
+
+### 变更
+
+- **运行日志改用共享 crate `wist-log`**：删掉本仓 `logging.rs`，`[log]` 段统一由 `wist_log::init`
+  装配（级别 / 格式 / 落点 / 轮转），与 gateway / center / agentd 同口径；键名规范为 `max_seconds`
+  （旧名 `max_age_seconds` 以 alias 继续接受，缺少配置不改）。
+
 ## [0.7.1-alpha] - 2026-10-10
 
 ### 变更

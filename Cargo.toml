@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-gwlinkd"
-version = "0.7.1" #@gxl:set(version)
+version = "0.8.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 description = "Host-side resident keeping a wist gateway stack linked to WistCenter (register / heartbeat / upgrade)"
@@ -17,9 +17,11 @@ toml = "1.1"
 # 结构化错误治理：`StructError<R>` + `#[derive(OrionError)]` reason（见 `src/error.rs`）。
 # 默认 feature 已带 `log`（0.9 起 `OperationContext` 为纯数据、`AutoLogGuard` 负责 Drop 日志），与下面的 `env_logger` 走同一条 `log` facade。
 orion-error = { version = "0.9", features = ["derive", "serde_json"] }
-# 运行日志：`env_logger` 走 `log` facade，`RUST_LOG` 控级别，落 stderr（journald / launchd 收）。
+# 运行日志：`log` 门面（写）+ 共享 crate `wist-log`（收：env_logger / 格式 / 轮转，`[log]` 段）。
 log = "0.4"
-env_logger = "0.11"
+# 本地联调切 path。
+wist-log = { version = "0.1" }
+#wist-log = { version = "0.1", path = "../wist-log" }
 ring = "0.17"
 tokio = { version = "1.48", features = ["full"] }
 libc = "0.2"

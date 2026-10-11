@@ -2425,9 +2425,8 @@ dependencies = [
 
 [[package]]
 name = "wist-gwlinkd"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
- "env_logger",
  "flate2",
  "libc",
  "log",
@@ -2442,7 +2441,20 @@ dependencies = [
  "toml",
  "wist-artifact",
  "wist-control",
+ "wist-log",
  "x509-parser",
+]
+
+[[package]]
+name = "wist-log"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bec1f26d1bb1228679d1c45511ece74c3909d512eca3838812c815bd2b1b1152"
+dependencies = [
+ "env_logger",
+ "log",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

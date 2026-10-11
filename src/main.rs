@@ -41,13 +41,21 @@ fn config_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(wist_gwlinkd::DEFAULT_CONFIG_PATH))
 }
 
+/// 按 `[log]` 段初始化运行日志（统一走共享 crate `wist-log`）。
+fn log_init(section: &wist_log::LogSection) {
+    wist_log::init(
+        section,
+        &wist_log::Identity::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+    );
+}
+
 /// 尽力按配置文件里的 `[log]` 段初始化日志；配置读不了就回落缺省（stderr / info）。
 ///
 /// 用于不强制读配置的子命令（`service`）—— 有配置就尊重它的落点 / 级别，没有也不报错。
 fn init_logging_from_config_or_default() {
     match Config::load(&config_path()) {
-        Ok(config) => wist_gwlinkd::logging::init(&config.log),
-        Err(_) => wist_gwlinkd::logging::init(&Default::default()),
+        Ok(config) => log_init(&config.log),
+        Err(_) => log_init(&wist_log::LogSection::default()),
     }
 }
 
@@ -63,7 +71,7 @@ async fn main() -> ExitCode {
         }
         "diagnose" => match Config::load(&config_path()) {
             Ok(config) => {
-                wist_gwlinkd::logging::init(&config.log);
+                log_init(&config.log);
                 run_diagnose(&config)
             }
             Err(err) => {
@@ -87,7 +95,7 @@ async fn main() -> ExitCode {
             let path = config_path();
             match Config::load(&path) {
                 Ok(config) => {
-                    wist_gwlinkd::logging::init(&config.log);
+                    log_init(&config.log);
                     match run(&config, &path).await {
                         Ok(()) => ExitCode::SUCCESS,
                         Err(err) => {
@@ -1383,7 +1391,7 @@ async fn run_unlink(args: &[String]) -> ExitCode {
     let config = match Config::load(&path) {
         Ok(config) => {
             // 已读到配置：日志按它的 `[log]` 段初始化（与 `run` 同口径）。
-            wist_gwlinkd::logging::init(&config.log);
+            log_init(&config.log);
             config
         }
         Err(err) => {

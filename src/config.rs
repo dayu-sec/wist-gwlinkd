@@ -91,7 +91,7 @@ pub struct Config {
     /// `[log]` 段：**本进程自己**的运行日志（级别 / 格式 / 落点）。缺省 `info` / `text` / stderr。
     /// 与网关侧的 `[logs]`（被采集 agent 日志的落盘保留）无关。
     #[serde(default)]
-    pub log: crate::logging::LogSection,
+    pub log: wist_log::LogSection,
 }
 
 /// `[upgrade]` 段。
@@ -343,7 +343,7 @@ gateway_id = "gw-local"
 # file   = "/var/log/wist-gwlinkd.log"   # 给了就写文件（相对路径按配置文件目录解析；自动建父目录）；缺省写 stderr
 # max_bytes       = 67108864             # 单文件上限（字节），写满轮转成 file.1/file.2/…（缺省 64 MiB）
 # keep_files      = 4                    # 保留的历史分卷个数（0 = 不留历史；缺省 4）
-# max_age_seconds = 604800               # 历史分卷保留时长（秒）；0 = 不按时间清（缺省 7 天）
+# max_seconds     = 604800               # 历史分卷保留时长（秒）；0 = 不按时间清（缺省 7 天）
 # 注意：轮转由 gwlinkd 进程自己做；**不要再给这个文件挂 logrotate**，两套轮转会互相打架。
 "#;
 
@@ -385,7 +385,7 @@ mod tests {
         assert!(config.upgrade_tool_require_arch.is_none());
         assert!(config.upgrade.component.is_empty());
         assert!(config.log.level.is_none());
-        assert_eq!(config.log.format, crate::logging::LogFormat::Text);
+        assert_eq!(config.log.format, wist_log::LogFormat::Text);
         assert!(config.log.file.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -401,7 +401,7 @@ mod tests {
         .expect("write");
         let config = Config::load(&path).expect("load");
         assert_eq!(config.log.level.as_deref(), Some("warn"));
-        assert_eq!(config.log.format, crate::logging::LogFormat::Json);
+        assert_eq!(config.log.format, wist_log::LogFormat::Json);
         assert_eq!(
             config.log.file.as_deref(),
             Some(Path::new("/tmp/gwlinkd.log"))

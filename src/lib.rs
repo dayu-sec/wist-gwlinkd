@@ -19,7 +19,7 @@ pub mod executor;
 pub mod identity;
 pub mod link_request;
 pub mod linkd_status;
-pub mod logging;
+// NOTE(hand-added): 运行日志（`[log]` 段）已抽到共享 crate `wist-log`。
 pub mod selfreport;
 pub mod service;
 pub mod state;
