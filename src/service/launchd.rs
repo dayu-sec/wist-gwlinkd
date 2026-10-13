@@ -94,6 +94,17 @@ pub fn plist_text(spec: &ServiceSpec, log_dir_override: Option<&Path>) -> String
         "    <string>{}</string>\n",
         escape_xml(&spec.config_path.display().to_string())
     ));
+    // 现场态配置（中心地址 / 网关标识 / 信任锚）与主配置分文件，必须显式告知进程。
+    if let Some(pub_config) = spec.pub_config.as_deref() {
+        text.push_str(&format!(
+            "    <key>{}</key>\n",
+            escape_xml(crate::config::PUB_CONFIG_ENV)
+        ));
+        text.push_str(&format!(
+            "    <string>{}</string>\n",
+            escape_xml(&pub_config.display().to_string())
+        ));
+    }
     text.push_str("  </dict>\n");
     text.push_str("</dict>\n</plist>\n");
     text

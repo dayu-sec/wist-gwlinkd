@@ -59,6 +59,15 @@ pub fn unit_text(spec: &ServiceSpec) -> String {
         CONFIG_ENV,
         systemd_arg(&spec.config_path.display().to_string())
     ));
+    // 现场态配置（中心地址 / 网关标识 / 信任锚）与主配置分文件且**不一定同目录**
+    // （栈布局在 identity/gwlinkd/）—— 必须显式告知进程。
+    if let Some(pub_config) = spec.pub_config.as_deref() {
+        text.push_str(&format!(
+            "Environment={}={}\n",
+            crate::config::PUB_CONFIG_ENV,
+            systemd_arg(&pub_config.display().to_string())
+        ));
+    }
     text.push_str("Restart=always\n");
     text.push_str("RestartSec=5\n");
     text.push_str("KillSignal=SIGTERM\n");

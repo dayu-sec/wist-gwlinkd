@@ -1,8 +1,8 @@
 //! 断开本机网关与 Center 的连接（`wist-gwlinkd unlink`）。
 //!
 //! 「与 Center 的连接」= 本机 gwlinkd 手里的**注册态**：客户端证书 + 链接配置 + 待消费注册券 +
-//! 身份 / 实例，以及 `gwlinkd.toml` 里的一次性接入券 `link_token`（留着它下次启动会**绕过页面
-//! 自动重连**）。本命令把这些清掉，让网关回到**未接入**。
+//! 身份 / 实例，以及**现场态配置**（`gwlinkd-pub.toml`）里的一次性接入券 `link_token`
+//! （留着它下次启动会**绕过页面**自动重连）。本命令把这些清掉，让网关回到**未接入**。
 //!
 //! 这样 **link（`onboard`）与 unlink 同属 gwlinkd** —— 同一份状态、同一个 owner，由它集中管理；
 //! 上层（如开发态 `dev/unlink-center.sh`）只需「停进程 + 调本命令」，不做文件手术。
@@ -24,6 +24,8 @@ use crate::state;
 /// 簿记（游标 / 记录 / 心跳，清成干净起点；运行中已拒绝，不会有在飞的升级）。
 /// **不含**中心信任锚（默认保留，见 [`Config::trust_bundle`]）与 `gwlinkd.lock`。
 ///
+/// 其中哪些落在**身份目录**（`identity_dir`）而非 `state_dir`，见 [`IDENTITY_STATE_FILES`]。
+///
 /// 公开（而非私有）：bin 层集成测试（`tests/unlink_cli.rs`）据此断言产物，与实现共享**同一份清单**，
 /// 免得新增/改名文件时两边漂移。
 pub const LINK_STATE_FILES: &[&str] = &[
@@ -37,6 +39,19 @@ pub const LINK_STATE_FILES: &[&str] = &[
     state::UPGRADE_HEARTBEAT_FILE,
 ];
 
+/// [`LINK_STATE_FILES`] 里落在**身份目录**（`Config::identity_dir`）的那些；其余在 `state_dir`。
+/// 客户端证书 + 私钥是不可再生的长期身份，与锁 / 簿记 / 临时券分开存（前者进 `contract`）。
+pub const IDENTITY_STATE_FILES: &[&str] = &[state::CREDENTIAL_FILE];
+
+/// 某个待删文件该去哪个目录找。
+fn file_dir<'a>(config: &'a Config, name: &str) -> &'a Path {
+    if IDENTITY_STATE_FILES.contains(&name) {
+        config.identity_dir()
+    } else {
+        &config.state_dir
+    }
+}
+
 /// `unlink` 的结果（供 CLI / 上层打印）。`dry_run` 时列出的是**将要**删除的东西，未落盘。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnlinkReport {
@@ -44,7 +59,7 @@ pub struct UnlinkReport {
     pub state_dir: PathBuf,
     /// 删除（或 dry-run 下将删除）的注册态文件（文件名）。
     pub removed_state_files: Vec<String>,
-    /// 是否从 `gwlinkd.toml` 去掉了 `link_token`。
+    /// 是否从现场态配置（`gwlinkd-pub.toml`）去掉了 `link_token`。
     pub link_token_removed: bool,
     /// 中心信任锚**配置路径**（`trust_bundle`；未删时供展示）。
     pub trust_bundle: PathBuf,
@@ -61,7 +76,7 @@ pub struct UnlinkReport {
 /// 而不是只删配置当下指的那份。去重；不存在的候选在删除时按 NotFound 跳过。
 fn anchor_candidates(config: &Config, config_path: &Path) -> Vec<PathBuf> {
     let mut out = vec![config.trust_bundle.clone()];
-    let mut candidates = vec![config.state_dir.join(state::TRUST_BUNDLE_FILE)];
+    let mut candidates = vec![config.identity_dir().join(state::TRUST_BUNDLE_FILE)];
     if let Some(dir) = config_path.parent() {
         candidates.push(dir.join(state::TRUST_BUNDLE_FILE));
     }
@@ -75,8 +90,8 @@ fn anchor_candidates(config: &Config, config_path: &Path) -> Vec<PathBuf> {
 
 /// 断开连接。
 ///
-/// `config_path` 用来改写 `gwlinkd.toml`（去掉 `link_token`）。`forget_center` 为真时连中心信任锚
-/// （[`Config::trust_bundle`]）一并删除，否则保留。`dry_run` 为真时只算不落盘（也就不需要为「正在运行」
+/// `config_path` 用来定位**现场态**配置（去掉 `link_token`；落点见 `config::pub_config_path`）。
+/// `forget_center` 为真时连中心信任锚（[`Config::trust_bundle`]）一并删除，否则保留。`dry_run` 为真时只算不落盘（也就不需要为「正在运行」
 /// 买单 —— 那是对**真删**的保护）。真删时运行中（拿得到单实例锁）→ 报错，要求先停。
 pub fn unlink(
     config_path: &Path,
@@ -95,17 +110,22 @@ pub fn unlink(
     // **先去掉一次性接入券 `link_token`**：它是「下次启动**绕过页面**自动重连」的闸门。放在删注册态
     // **之前**，这样即使配置写失败，也不会停在「证书已删、券还在」那种会**悄悄自动重连**的半截态
     // （顺序反了的话，部分失败恰好把机器留在最不该留的状态）。
+    // 券写在**现场态的值文件**（`.env`）里，所以去券就是去掉它的那一行。
+    let pub_path = config::pub_config_path(config_path);
     let link_token_removed = if dry_run {
-        // 与 `remove_link_token` 同判据：配置文件里存在 `link_token` 键。
-        config.link_token.is_some()
+        // 与 `remove_link_token` 同判据：券的变量在 `.env` 里有值。
+        config
+            .link_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
     } else {
-        config::remove_link_token(config_path)
+        config::remove_link_token(&pub_path)
             .map_err(|err| StateReason::Io.err(err.display_chain()))?
     };
 
     let mut removed_state_files = Vec::new();
     for name in LINK_STATE_FILES {
-        let path = config.state_dir.join(name);
+        let path = file_dir(config, name).join(name);
         if dry_run {
             if path.exists() {
                 removed_state_files.push((*name).to_string());
@@ -165,20 +185,34 @@ mod tests {
         dir
     }
 
-    /// 写一份最小可加载的 gwlinkd.toml（CA 落在 `anchor` 指定处），返回配置路径。
+    /// 写一份最小可加载的 gwlinkd 本机配置：主配置 + 现场态声明 + `.env`（CA 落在 `anchor` 指定处）；
+    /// 返回**主配置路径**。现场值（含一次性券）写到声明旁边的 `.env` —— 与运行期同形。
     fn write_config(dir: &Path, anchor: &Path, link_token: Option<&str>) -> PathBuf {
         let state_dir = dir.join("state");
         std::fs::create_dir_all(&state_dir).expect("state dir");
-        let mut text = format!(
-            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"{}\"\nstate_dir = \"{}\"\n",
-            anchor.display(),
-            state_dir.display()
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(&path, format!("state_dir = \"{}\"\n", state_dir.display()))
+            .expect("config");
+        std::fs::write(
+            dir.join(crate::config::PUB_CONFIG_FILE_NAME),
+            "control_center_endpoint = \"${CENTER_ENDPOINT}\"\n\
+             gateway_id = \"${GATEWAY_ID}\"\n\
+             trust_bundle = \"${TRUST_BUNDLE}\"\n\
+             link_token = \"${LINK_TOKEN:-}\"\n",
+        )
+        .expect("declaration");
+        let mut env = format!(
+            "CENTER_ENDPOINT=https://c\nGATEWAY_ID=gw-1\nTRUST_BUNDLE={}\n",
+            anchor.display()
         );
         if let Some(token) = link_token {
-            text.push_str(&format!("link_token = \"{token}\"\n"));
+            env.push_str(&format!("LINK_TOKEN={token}\n"));
         }
-        let path = dir.join("gwlinkd.toml");
-        std::fs::write(&path, text).expect("config");
+        std::fs::write(
+            crate::config::pub_env_path(&dir.join(crate::config::PUB_CONFIG_FILE_NAME)),
+            env,
+        )
+        .expect(".env");
         path
     }
 
@@ -204,7 +238,15 @@ mod tests {
             assert!(!config.state_dir.join(name).exists(), "{name} 应被删");
         }
         assert!(report.link_token_removed, "应去掉 link_token");
-        assert!(Config::load(&path).expect("reload").link_token.is_none());
+        assert!(
+            Config::load(&path)
+                .expect("reload")
+                .link_token
+                .as_deref()
+                .unwrap_or("")
+                .is_empty(),
+            "券行应已删掉（声明里的 ${{LINK_TOKEN:-}} 现在解析为空）"
+        );
         assert!(report.removed_anchors.is_empty());
         assert!(anchor.exists(), "信任锚默认应保留");
         let _ = std::fs::remove_dir_all(dir);
@@ -366,10 +408,11 @@ mod tests {
         let config = Config::load(&path).expect("load");
         touch_registration_state(&config.state_dir);
 
-        // 配置路径不存在 → 去 link_token 必失败。
-        let unwritable = dir.join("missing-config.toml");
-        let err = unlink(&unwritable, &config, false, false).expect_err("应因配置不可读而失败");
-        assert!(err.contains("读取配置失败"), "{err}");
+        // 把 `.env` 写成**非 UTF-8** 字节 → 读必失败（非 NotFound），去券必失败。
+        let env_path = crate::config::pub_env_path(&crate::config::pub_config_path(&path));
+        std::fs::write(&env_path, [0xff_u8, 0xfe, 0x00]).expect("write invalid utf8");
+        let err = unlink(&path, &config, false, false).expect_err("应因 .env 不可读而失败");
+        assert!(err.contains("读取"), "{err}");
         for name in LINK_STATE_FILES {
             assert!(
                 config.state_dir.join(name).exists(),

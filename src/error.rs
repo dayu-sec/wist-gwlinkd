@@ -108,6 +108,27 @@ impl From<ConfigReason> for GwlinkdReason {
     }
 }
 
+/// 把共享配置 crate（`wist-config`）的 reason 升进本 crate 的 [`ConfigReason`]。
+///
+/// 「现场态分层加载 / 回写」已抽到 `wist-config`；它用自己的 `wist-error::ConfigReason`
+/// 词表（Io / Parse / Validation / General），这里把结果搬进本 crate 的命名空间
+/// （与 [`ConfigReason`] 的差别只有 `Parse` ↔ `ParseToml`）。
+impl From<wist_config::ConfigReason> for ConfigReason {
+    fn from(value: wist_config::ConfigReason) -> Self {
+        match value {
+            wist_config::ConfigReason::Io => ConfigReason::Io,
+            wist_config::ConfigReason::Parse => ConfigReason::ParseToml,
+            wist_config::ConfigReason::Validation => ConfigReason::Validation,
+            wist_config::ConfigReason::General(reason) => ConfigReason::General(reason),
+        }
+    }
+}
+
+/// 把 `wist-config` 的错误载体搬进本 crate 的配置错误载体（保留 detail / context / source）。
+pub(crate) fn lift_config_error(other: wist_config::ConfigError) -> ConfigError {
+    orion_error::convert_error::<wist_config::ConfigReason, ConfigReason>(other)
+}
+
 /// Error carrier for calls to `WistCenter`.
 pub type CenterResult<T> = Result<T, CenterError>;
 

@@ -3,6 +3,52 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.0-alpha] - 2026-10-13
+
+### 新增
+
+- **全局选项 `--conf` / `--pub`：命令行指定配置落点**（也接受 `--conf=<path>` / `--pub=<path>`，
+  可放在子命令前或后）。之前主配置 / 现场态声明的可加载路径只能靠环境变量
+  （`WIST_GWLINKD_CONFIG` / `WIST_GWLINKD_PUB_CONFIG`）给，手动跑 `diagnose` 等得先 `export`；
+  现在 `wist-gwlinkd diagnose --conf <主配置> --pub <现场态声明>` 一步到位。相对路径按**当前工作目录**
+  绝对化（不做 `canonicalize` —— 现场态声明可能尚不存在）；与 `service` 子命令自己的
+  `--config` / `--pub-config` 不冲突（名不同、语义不同）。
+
+### 变更
+
+- **配置分层：主配置（交付物）+ 现场态 `gwlinkd-pub.toml`（现场选择）**（与 `wist-gateway` 的
+  impl/pub 同口径）。主配置只放随部署环境渲染的项（`state_dir` / 回环自述面 / 投放目录 / 升级参数 / 日志），
+  升级 / 重渲**应该**覆盖它；而「接的是哪个中心、本网关在中心侧叫什么、信谁」是**现场选择** ——
+  现在单独一份 `gwlinkd-pub.toml`（路径由 `WIST_GWLINKD_PUB_CONFIG` 指定；未设则取主配置同目录），
+  由接入与`init-config` / 安装脚本写入，**升级 / 重渲永不覆盖**。
+  加载时读**两份**并合并：段（TOML table）可以重合、**叶子键不许重复**（重复即拒 —— 归属唯一，
+  不靠加载顺序）。为此 `control_center_endpoint` / `gateway_id` / `trust_bundle` 改为可缺省（空 = 未接入）。
+  **之前**这三个键同时由模板渲染与页面 `upsert` 写回，只是靠“两边恰好一致”才没出问题。
+- **身份目录与运行态目录分开**：新增 `identity_dir`（缺省 = `state_dir`，**不配即与旧版行为一致**）。
+  不可再生的身份材料（客户端证书 + 私钥 `credential.json`、中心信任锚）落这里，与 `state_dir`
+  （单实例锁 / 升级簿记 / 临时注册券 —— 可删可重建）分开：前者要进 `sys-prj.yml` 的 `contract`
+  （不进包 / 不重渲 / 必进备份），后者不该被当成现场事实。
+  `service install` 新增 `--pub-config`（把现场态路径写进 unit / plist 的环境变量），
+  `init-config` 同时生成主配置与现场态骶架（后者**只在缺失时补**，不覆盖现场值），
+  `unlink` 跨两目录删（主配置与现场态配置里的 `link_token` **都**会去掉）。
+- **`diagnose` 的「中心可达」从 TCP connect 升级为真打一次带客户端证书的接口**：旧实现只测 TCP 连通，
+  `https://` 打到明文端口这类**协议/scheme 不匹配**照样报绿（中心其实一直在拒所有上报）。
+  现在用 trust bundle + 客户端证书发一次 `GET /api/v1/gateway/upgrade-plan`，一次验完
+  「TCP / TLS / 证书被中心认」；错误串带**源链**（能直接看到 `InvalidContentType` / `UnknownIssuer` /
+  `certificate is not standards compliant` 这类真因）。本机**还没有**客户端证书（尚未注册）时，中心的
+  401 判 **WARN**（可达、只是未注册），不再误报为红。
+- **`upgrade.project` 检查口径调整（`upgrade_project_dir` = 执行器工作目录，不再等同 gops 工程根）**：
+  `upgrade_project_dir` 的通用要求只是「配了就得是**已存在的目录**」（执行器以它为 cwd）；`ops-prj.yml`
+  是 **gops 特有**要求。于是：目录不存在 → FAIL；目录在但（用 gops 执行器且）缺 `ops-prj.yml` 时
+  只给 **WARN**（运行期 `GopsExecutor::preflight` 仍会拒发）。
+
+### 修复
+
+- **一次性接入券用完即删**：接入券是**一次性**的（中心侧 `consume_link_token` 成功即清 hash，另有短 TTL），
+  之前页面路径把它写进配置文件后就**不再清理** —— 一张已作废的明文券会长期躺在盘上。
+  现在 `onboard` 成功即删，并在 `diagnose` 新增一条检查（**已接入却仍残留 `link_token`** → WARN）。
+  `remove_link_token` 也对“文件不存在”幂等（返回 `false` 而非报错）。
+
 ## [0.8.0-alpha] - 2026-10-11
 
 ### 变更

@@ -2,7 +2,6 @@
 //!
 //! **复用 [`crate::state`] 的判据**，不另写一套 —— 诊断与判定必须同源。
 
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -105,6 +104,7 @@ pub fn diagnose(config: &Config) -> Report {
         config_check(config),
         trust_check(config),
         credential_check(config),
+        leftover_link_token_check(config),
         regist_token_check(config),
         self_endpoint_check(config),
         self_ca_check(config),
@@ -143,7 +143,7 @@ fn config_check(config: &Config) -> Check {
             "config.endpoint",
             "控制中心 endpoint 未配置",
             "control_center_endpoint 为空",
-            "在 gwlinkd.toml 填写 control_center_endpoint",
+            "在 `gwlinkd-pub.toml` 填写 control_center_endpoint（或走网关「链接上级」页）",
         );
     }
     if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
@@ -200,8 +200,10 @@ fn validate_pem_certificate(path: &Path) -> ConfigResult<()> {
 }
 
 /// 运行期凭据：损坏→FAIL，缺失→WARN（首跑），就位→看有效期。
+///
+/// 读的是**身份目录**（`identity_dir`）：它才是不可再生的那对（证书 + 私钥）。
 fn credential_check(config: &Config) -> Check {
-    match state::credential_status(&config.state_dir) {
+    match state::credential_status(config.identity_dir()) {
         CredentialStatus::Present(credential) => {
             let remaining = credential.seconds_remaining();
             let lead = config.renew_lead_seconds.unwrap_or(3600);
@@ -237,12 +239,61 @@ fn credential_check(config: &Config) -> Check {
             "尚无客户端身份",
             "首跑会走 link-upstream → register",
         )
-        .with_hint("在 gwlinkd.toml 配 `link_token`（或设 WIST_GWLINKD_LINK_TOKEN）后运行 `wist-gwlinkd run` 完成首次置备"),
+        .with_hint(
+            "在 `gwlinkd-pub.toml` 配 `control_center_endpoint`，或走网关「链接上级」页提交接入链接（也可用 `link_token` + WIST_GWLINKD_LINK_TOKEN 离线预置）",
+        ),
         CredentialStatus::Corrupt(detail) => Check::fail(
             "credential.local",
             "客户端身份损坏",
             detail,
-            "修复或删除 state/credential.json 后重跑；若中心已初始化该实例需先在中心重置",
+            "修复或删除**身份目录**下的 credential.json 后重跑；若中心已初始化该实例需先在中心重置",
+        ),
+    }
+}
+
+/// 现场态配置里是否残留**已消费**的一次性接入券。
+///
+/// 券用一次即废；接入成功后 gwlinkd 会把它删掉。若已持有长期身份却还留着它，只是一张明文废券
+/// （不会自动重联 —— 有凭据就走 mTLS），故报 WARN 并提示删除。
+fn leftover_link_token_check(config: &Config) -> Check {
+    let Some(pub_path) = config.pub_config_path.as_deref() else {
+        return Check::ok(
+            "config.link_token",
+            "未解析到现场态配置（跳过券检查）",
+            "加载时未记录 gwlinkd-pub.toml 落点",
+        );
+    };
+    let token = config
+        .link_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match token {
+        None => Check::ok(
+            "config.link_token",
+            "无残留接入券",
+            pub_path.display().to_string(),
+        ),
+        Some(_)
+            if matches!(
+                state::credential_status(config.identity_dir()),
+                CredentialStatus::Present(_)
+            ) =>
+        {
+            Check::warn(
+                "config.link_token",
+                "已接入但现场态配置里仍留着一次性接入券",
+                format!(
+                    "{}（券一次性，接入成功即废；留着只是明文废券）",
+                    pub_path.display()
+                ),
+            )
+            .with_hint("删掉该文件里的 `link_token` 行（下次接入成功会自动删）")
+        }
+        Some(_) => Check::ok(
+            "config.link_token",
+            "有待消费的接入券（尚未接入）",
+            pub_path.display().to_string(),
         ),
     }
 }
@@ -310,45 +361,56 @@ fn upgrader_check(config: &Config) -> Check {
     }
 }
 
-/// 升级**工程根**：gops 从工程根解析 `ops-prj.yml`（`gops prj upgrade` **无**「指定工程」的旗标）。
-/// 没配 / 配错 → 第一次升级必失败，且报错只有退出码 —— 前置到诊断。
+/// 升级**工作目录**：执行器以它为 cwd（`GopsExecutor::command` 里 `current_dir`）。
 ///
-/// 只对 **gops** 执行器适用：站点脚本执行器不要求工程根。
+/// 通用要求只有一条：**配了就得拿它当 cwd，所以它得是个真实存在的目录**。
+/// `ops-prj.yml` 是 **gops 特有**的要求（`gops prj upgrade` 从 cwd 解析工程、**无**「指定工程」旗标）：
+/// 缺 marker 时 gops 会在升级那刻以退出码 255 失败 —— 但那是执行器的要求，不是目录本身的问题，
+/// 故这里只给 **WARN** 提示；运行期 [`crate::executor::GopsExecutor::preflight`] 仍会拒发（gops 确实跑不了）。
 fn upgrade_project_check(config: &Config) -> Check {
     let program = config
         .upgrader_program
         .as_deref()
         .unwrap_or(crate::executor::DEFAULT_UPGRADER_PROGRAM);
-    if !crate::executor::program_is_gops(program) {
-        return Check::ok(
-            "upgrade.project",
-            "非 gops 执行器：不校验工程根",
-            format!("upgrader_program = {program}"),
-        );
-    }
+    let is_gops = crate::executor::program_is_gops(program);
     match config.upgrade_project_dir.as_deref() {
-        None => Check::fail(
+        // 没配：gops 会跑到进程 cwd（不可预测）→ FAIL；非 gops 执行器不要求 cwd → OK。
+        None if is_gops => Check::fail(
             "upgrade.project",
-            "升级未配置工程根",
+            "升级未配置工作目录",
             "upgrade_project_dir 未设置（gops 从 cwd 解析工程，缺失会让升级以退出码失败）",
-            "把 upgrade_project_dir 指向含 ops-prj.yml 的运维工程根（`gops prj new` + `gops prj import`）",
+            "把 upgrade_project_dir 指向执行器的工作目录（gops 需含 ops-prj.yml）",
         ),
-        Some(dir) => {
-            if dir.join("ops-prj.yml").is_file() {
-                Check::ok(
-                    "upgrade.project",
-                    "升级工程根已配置",
-                    format!("{}（含 ops-prj.yml）", dir.display()),
-                )
+        None => Check::ok(
+            "upgrade.project",
+            "非 gops 执行器：不校验工作目录",
+            format!("upgrader_program = {program}"),
+        ),
+        // 配了、但目录不存在：任何执行器都没法拿它当 cwd → FAIL（通用错配，不是 gops 特有）。
+        Some(dir) if !dir.is_dir() => Check::fail(
+            "upgrade.project",
+            "升级工作目录不存在",
+            format!("{} 不是已存在的目录", dir.display()),
+            "把 upgrade_project_dir 指到一个已存在的目录",
+        ),
+        // 目录在 = 通用要求满足；只有 gops 才额外要求它是运维工程根（含 ops-prj.yml）→ 只提示。
+        Some(dir) if is_gops && !dir.join("ops-prj.yml").is_file() => Check::warn(
+            "upgrade.project",
+            "升级工作目录不是 gops 工程根",
+            format!("{} 下找不到 ops-prj.yml", dir.display()),
+        )
+        .with_hint(
+            "gops 升级时会拒掉：在工程根跑 `gops prj new` / `gops prj import`，或把 upgrade_project_dir 指对",
+        ),
+        Some(dir) => Check::ok(
+            "upgrade.project",
+            "升级工作目录已配置",
+            if is_gops {
+                format!("{}（含 ops-prj.yml）", dir.display())
             } else {
-                Check::fail(
-                    "upgrade.project",
-                    "升级工程根里没有 ops-prj.yml",
-                    format!("{} 下找不到 ops-prj.yml", dir.display()),
-                    "在工程根运行 `gops prj new` / `gops prj import`，或把 upgrade_project_dir 指对",
-                )
-            }
-        }
+                format!("{}（执行器 {program} 不要求工程根）", dir.display())
+            },
+        ),
     }
 }
 
@@ -443,84 +505,165 @@ fn upgrade_tools_check(config: &Config) -> Check {
     }
 }
 
-/// 中心可达性：解析 endpoint → TCP 连通。
+/// 一次阻塞探测的结局（在隔离线程里算完，只把纯数据带回来）。
+///
+/// **不带任何 reqwest 句柄回异步线程**：`reqwest::blocking` 的客户端自带运行时，
+/// 在异步上下文里被 drop 会 panic（`Cannot drop a runtime in a context where blocking is not allowed`）。
+enum Probe {
+    /// 拿到 HTTP 响应（状态码 + 已截断的单行 body）。
+    Response { status: u16, body: String },
+    /// 建探测客户端失败（信任锚 / 凭据问题）。
+    ClientBuild(String),
+    /// 连接 / TLS 失败（scheme、网络、证书问题）。
+    Transport(String),
+}
+
+/// 中心可达性：**真实打一次需要客户端证书的 GET**（`/api/v1/gateway/upgrade-plan`），
+/// 一次验完「TCP / TLS / 证书被中心认」三关。
+///
+/// 为什么不是 TCP connect：TCP 通**不代表能用** —— 「`https://` 打到明文端口」这类
+/// **协议/scheme 不匹配**只在 TLS 握手才暴露（rustls 报 `InvalidContentType`），
+/// 只测 TCP 会给假 OK（中心其实一直在拒所有上报）。
 fn reachability_check(config: &Config) -> Check {
     let endpoint = config.control_center_endpoint.trim();
-    let (host, port) = match parse_host_port(endpoint) {
-        Ok(parts) => parts,
-        Err(err) => {
-            return Check::fail(
-                "center.reachable",
-                "控制中心地址无法解析",
-                err.to_string(),
-                "检查 control_center_endpoint",
-            );
-        }
-    };
-    match (host.as_str(), port).to_socket_addrs() {
-        Ok(mut addrs) => match addrs.next() {
-            Some(addr) => match TcpStream::connect_timeout(&addr, PROBE_TIMEOUT) {
-                Ok(_) => Check::ok(
-                    "center.reachable",
-                    "TCP 可达控制中心",
-                    format!("已连上 {addr}"),
-                ),
-                Err(err) => Check::fail(
-                    "center.reachable",
-                    "控制中心不可达",
-                    format!("连接 {addr} 失败: {err}"),
-                    "检查网络/防火墙/中心是否在跑",
-                ),
-            },
-            None => Check::fail(
-                "center.reachable",
-                "控制中心地址无法解析",
-                format!("{host} 无地址记录"),
-                "检查 DNS",
-            ),
-        },
-        Err(err) => Check::fail(
+    if endpoint.is_empty() {
+        return Check::fail(
             "center.reachable",
-            "控制中心地址无法解析",
-            format!("{host}: {err}"),
-            "检查 DNS / /etc/hosts",
+            "控制中心未配置",
+            "control_center_endpoint 为空",
+            "先接入中心（网关「链接上级」页），或填 control_center_endpoint",
+        );
+    }
+    // 同步 `diagnose` 要能从 `#[tokio::main]` 的异步上下文里真打一次接口；
+    // 阻塞客户端自带运行时，**建/用/销毁都放到专用线程**做，只把纯数据带回来。
+    // 本机是否已有客户端凭据，决定 401/403 该判 FAIL（证书被拒）还是 WARN（尚未注册）。
+    let credential = state::load_credential(config.identity_dir());
+    let has_identity = credential.is_some();
+    // 探测用的 gateway_id：优先用**已注册凭据**里的身份（中心按客户端证书认人，query 必须与之相符）；
+    // 没有凭据时回落配置里的 gateway_id。**只读一次凭据**（别在下面再读一遍）。
+    let gateway_id = credential
+        .as_ref()
+        .map(|credential| credential.bundle.gateway_id.clone())
+        .unwrap_or_else(|| config.gateway_id.clone());
+    let probe = {
+        let endpoint = endpoint.to_string();
+        let trust = config.trust_bundle.clone();
+        let identity = credential.map(|c| c.identity_pem());
+        std::thread::spawn(move || probe_once(&endpoint, &trust, identity.as_deref(), &gateway_id))
+            .join()
+            .unwrap_or_else(|_| Probe::Transport("探测线程 panic".to_string()))
+    };
+    match probe {
+        Probe::Response { status, .. } if (200..300).contains(&status) => Check::ok(
+            "center.reachable",
+            "控制中心可达（mTLS 已通过）",
+            format!("{endpoint}（HTTP {status}）"),
+        ),
+        Probe::Response { status, body } => {
+            let detail = if body.is_empty() {
+                format!("HTTP {status}")
+            } else {
+                format!("HTTP {status}: {body}")
+            };
+            if status == 401 || status == 403 {
+                if has_identity {
+                    Check::fail(
+                        "center.reachable",
+                        "控制中心可达但拒绝了本机身份",
+                        detail,
+                        "证书未注册 / 已失效 / 与 gateway_id 不符 → 到中心重置该实例后重新置备",
+                    )
+                } else {
+                    // 本机还没有客户端证书：可达，只是**尚未注册**（首跑正是如此，不该判红）。
+                    Check::warn(
+                        "center.reachable",
+                        "控制中心可达（TLS 通过），但本机尚未注册",
+                        detail,
+                    )
+                    .with_hint("到网关「链接上级」页完成接入（link-upstream → register）")
+                }
+            } else {
+                Check::warn("center.reachable", "控制中心可达但返回非预期状态", detail)
+                    .with_hint("确认中心版本与网关协议一致（GET /api/v1/gateway/upgrade-plan）")
+            }
+        }
+        Probe::ClientBuild(reason) => Check::fail(
+            "center.reachable",
+            "无法构造中心探测客户端",
+            reason,
+            "检查 trust_bundle 与客户端身份（credential.json）",
+        ),
+        Probe::Transport(reason) => Check::fail(
+            "center.reachable",
+            "控制中心不可达（TCP/TLS 失败）",
+            format!("{endpoint}: {reason}"),
+            "核对 scheme：中心开了 TLS 用 https、明文用 http；再查网络 / 证书 / 端口",
         ),
     }
 }
 
-/// 从 endpoint 解析 `(host, port)`：缺端口按 scheme 取默认（http=80 / https=443）。
-fn parse_host_port(endpoint: &str) -> ConfigResult<(String, u16)> {
-    let (default_port, rest) = if let Some(rest) = endpoint.strip_prefix("https://") {
-        (443, rest)
-    } else if let Some(rest) = endpoint.strip_prefix("http://") {
-        (80, rest)
-    } else {
-        return Err(ConfigReason::Validation.err(format!("{endpoint} 缺少 http(s):// scheme")));
-    };
-    let authority = rest.split('/').next().unwrap_or("");
-    if authority.is_empty() {
-        return Err(ConfigReason::Validation.err(format!("{endpoint} 缺少主机名")));
-    }
-    // IPv6 字面量（[::1]:port）也要能吃下。
-    if let Some(rest) = authority.strip_prefix('[') {
-        let (host, tail) = rest
-            .split_once(']')
-            .ok_or_else(|| ConfigReason::Validation.err(format!("{authority} 方括号不配对")))?;
-        let port = match tail.strip_prefix(':') {
-            Some(value) => value
-                .parse()
-                .map_err(|_| ConfigReason::Validation.err(format!("{authority} 端口非法")))?,
-            None => default_port,
+/// 在**专用线程**里做一次阻塞探测：带信任锚（自签中心必需）与客户端身份（有凭据时），
+/// 打一次需要客户端证书的 GET。
+fn probe_once(endpoint: &str, trust: &Path, identity_pem: Option<&str>, gateway_id: &str) -> Probe {
+    let mut builder = reqwest::blocking::Client::builder().timeout(PROBE_TIMEOUT);
+    if trust.exists() {
+        let pem = match std::fs::read(trust) {
+            Ok(pem) => pem,
+            Err(err) => {
+                return Probe::ClientBuild(format!("读取信任锚 {} 失败: {err}", trust.display()));
+            }
         };
-        return Ok((host.to_string(), port));
+        match reqwest::Certificate::from_pem(&pem) {
+            Ok(cert) => builder = builder.add_root_certificate(cert),
+            Err(err) => {
+                return Probe::ClientBuild(format!("解析信任锚 {} 失败: {err}", trust.display()));
+            }
+        }
     }
-    match authority.rsplit_once(':') {
-        Some((host, port)) => Ok((
-            host.to_string(),
-            port.parse()
-                .map_err(|_| ConfigReason::Validation.err(format!("{authority} 端口非法")))?,
-        )),
-        None => Ok((authority.to_string(), default_port)),
+    if let Some(pem) = identity_pem {
+        match reqwest::Identity::from_pem(pem.as_bytes()) {
+            Ok(identity) => builder = builder.identity(identity),
+            Err(err) => return Probe::ClientBuild(format!("加载客户端证书/私钥失败: {err}")),
+        }
+    }
+    let client = match builder.build() {
+        Ok(client) => client,
+        Err(err) => return Probe::ClientBuild(format!("建探测客户端失败: {err}")),
+    };
+    let url = format!(
+        "{}/api/v1/gateway/upgrade-plan",
+        endpoint.trim_end_matches('/')
+    );
+    match client.get(url).query(&[("gateway_id", gateway_id)]).send() {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let body = truncate_one_line(&response.text().unwrap_or_default(), 200);
+            Probe::Response { status, body }
+        }
+        Err(err) => Probe::Transport(error_chain_one_line(&err)),
+    }
+}
+
+/// 把错误连同**源链**压成一行（reqwest 的 `Display` 只有顶层，真因在 `source()` 里 ——
+/// 「TLS 证书不认」「明文口」这类关键信息都在链上）。
+fn error_chain_one_line(err: &dyn std::error::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut cursor = err.source();
+    while let Some(source) = cursor {
+        parts.push(source.to_string());
+        cursor = source.source();
+    }
+    truncate_one_line(&parts.join(" -> "), 300)
+}
+
+/// 压成单行并截断（诊断展示用；错误串 / 响应体里的换行会让输出难读）。
+fn truncate_one_line(text: &str, max: usize) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= max {
+        one_line
+    } else {
+        let head: String = one_line.chars().take(max).collect();
+        format!("{head}…")
     }
 }
 
@@ -539,7 +682,6 @@ fn resolve_program(program: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("gwlinkd-doctor-{tag}-{}", std::process::id()));
@@ -553,6 +695,7 @@ mod tests {
             control_center_endpoint: "https://center.example".into(),
             trust_bundle: dir.join("ca.pem"),
             state_dir: dir.to_path_buf(),
+            identity_dir: None,
             gateway_id: "gw-1".into(),
             link_token: None,
             gateway_self_endpoint: None,
@@ -572,6 +715,7 @@ mod tests {
             upgrade_tool_require_arch: None,
             upgrade: Default::default(),
             log: Default::default(),
+            pub_config_path: None,
         }
     }
 
@@ -602,6 +746,64 @@ mod tests {
             status_of(&diagnose(&config(&dir)), "credential.local"),
             Status::Warn
         );
+    }
+
+    /// 造一份就位的长期身份（落在**身份目录**）。
+    fn write_credential(identity_dir: &Path) {
+        let credential = state::StoredCredential {
+            bundle: wist_control::GatewayCredentialBundle {
+                credential_id: "cred-test".into(),
+                gateway_id: "gw-1".into(),
+                instance_id: None,
+                certificate: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+                    .into(),
+                ca_bundle: None,
+                issued_at: wist_control::DateTime::from_rfc3339("2026-10-04T00:00:00Z")
+                    .expect("rfc3339"),
+                not_before: None,
+                not_after: Some(
+                    wist_control::DateTime::from_rfc3339("2099-01-01T00:00:00Z").expect("rfc3339"),
+                ),
+            },
+            private_key_pem: "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n"
+                .into(),
+        };
+        state::save_credential(identity_dir, &credential).expect("credential");
+    }
+
+    /// 已接入（持长期身份）却还在现场态配置里留着一次性接入券 → WARN（废券明文）。
+    #[test]
+    fn an_already_linked_host_with_a_leftover_link_token_warns() {
+        let dir = temp_dir("leftover-token");
+        let mut cfg = config(&dir);
+        cfg.pub_config_path = Some(dir.join("gwlinkd-pub.toml"));
+        cfg.link_token = Some("link_abc".into());
+        write_credential(&dir);
+        assert_eq!(
+            status_of(&diagnose(&cfg), "config.link_token"),
+            Status::Warn
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 尚无身份时的接入券是**待消费**（正常）→ OK。
+    #[test]
+    fn a_link_token_without_a_credential_is_fine() {
+        let dir = temp_dir("pending-token");
+        let mut cfg = config(&dir);
+        cfg.pub_config_path = Some(dir.join("gwlinkd-pub.toml"));
+        cfg.link_token = Some("link_abc".into());
+        assert_eq!(status_of(&diagnose(&cfg), "config.link_token"), Status::Ok);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 未记录落点时跳过（不误报）。
+    #[test]
+    fn a_leftover_link_token_check_skips_without_a_pub_path() {
+        let dir = temp_dir("no-pub-path");
+        let cfg = config(&dir);
+        assert_eq!(status_of(&diagnose(&cfg), "config.link_token"), Status::Ok);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -672,15 +874,41 @@ mod tests {
     }
 
     #[test]
-    fn a_gops_project_root_needs_the_ops_prj_marker() {
+    fn a_gops_work_dir_without_the_ops_prj_marker_warns() {
         let dir = temp_dir("proj-marker");
         let mut cfg = config(&dir);
         cfg.upgrader_program = Some("gops".into());
         cfg.upgrade_project_dir = Some(dir.join("prj"));
         std::fs::create_dir_all(dir.join("prj")).expect("mkdir");
-        // 目录在、但没 ops-prj.yml → FAIL。
-        assert_eq!(status_of(&diagnose(&cfg), "upgrade.project"), Status::Fail);
+        // 目录在、但没 ops-prj.yml → WARN（gops 特有要求，不当红；运行期 preflight 才拒发）。
+        assert_eq!(status_of(&diagnose(&cfg), "upgrade.project"), Status::Warn);
         std::fs::write(dir.join("prj").join("ops-prj.yml"), "kind: ops\n").expect("write");
+        assert_eq!(status_of(&diagnose(&cfg), "upgrade.project"), Status::Ok);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_missing_work_dir_fails_for_any_executor() {
+        let dir = temp_dir("proj-missing");
+        let mut cfg = config(&dir);
+        // 配了但目录不存在 → FAIL（通用错配：拿它当 cwd 会直接失败）。
+        cfg.upgrader_program = Some("gops".into());
+        cfg.upgrade_project_dir = Some(dir.join("nope"));
+        assert_eq!(status_of(&diagnose(&cfg), "upgrade.project"), Status::Fail);
+        // 非 gops 执行器同理：目录得存在，它才会被当作 cwd。
+        cfg.upgrader_program = Some("/bin/sh".into());
+        assert_eq!(status_of(&diagnose(&cfg), "upgrade.project"), Status::Fail);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_non_gops_executor_only_needs_an_existing_dir() {
+        let dir = temp_dir("proj-non-gops");
+        let mut cfg = config(&dir);
+        cfg.upgrader_program = Some("/bin/sh".into());
+        std::fs::create_dir_all(dir.join("work")).expect("mkdir");
+        // 目录在就够了，不要求 ops-prj.yml。
+        cfg.upgrade_project_dir = Some(dir.join("work"));
         assert_eq!(status_of(&diagnose(&cfg), "upgrade.project"), Status::Ok);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -757,32 +985,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn a_reachable_center_endpoint_is_ok() {
-        let dir = temp_dir("reach");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    /// 起一个一次性 TCP 服务：accept 后回一段**原始字节**。
+    ///
+    /// 用它能造两种场景：真 HTTP 200（可达）、或往 TLS 端口回明文（复刻 `InvalidContentType`）。
+    fn one_shot_raw_server(reply: &'static [u8]) -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let mut cfg = config(&dir);
-        cfg.control_center_endpoint = format!("http://{addr}");
-        assert_eq!(status_of(&diagnose(&cfg), "center.reachable"), Status::Ok);
-        drop(listener);
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf); // 读走 ClientHello / 请求，再回
+                let _ = stream.write_all(reply);
+                let _ = stream.flush();
+            }
+        });
+        addr
     }
 
     #[test]
-    fn parse_host_port_handles_scheme_defaults_and_ipv6() {
-        assert_eq!(
-            parse_host_port("https://c.example").unwrap(),
-            ("c.example".to_string(), 443)
-        );
-        assert_eq!(
-            parse_host_port("http://c.example:8080/x").unwrap(),
-            ("c.example".to_string(), 8080)
-        );
-        assert_eq!(
-            parse_host_port("http://[::1]:9000").unwrap(),
-            ("::1".to_string(), 9000)
-        );
-        assert!(parse_host_port("c.example").is_err());
+    fn a_reachable_center_endpoint_is_ok() {
+        let dir = temp_dir("reach");
+        let addr = one_shot_raw_server(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+        let mut cfg = config(&dir);
+        cfg.control_center_endpoint = format!("http://{addr}");
+        assert_eq!(status_of(&diagnose(&cfg), "center.reachable"), Status::Ok);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 复刻本次线上问题：gwlinkd 用 `https://` 打一个**明文**端口 —— 必须是 FAIL，
+    /// 而不是旧实现那种「TCP 连上了就 OK」的假绿。
+    #[test]
+    fn an_https_endpoint_against_a_plaintext_port_fails() {
+        let dir = temp_dir("reach-tls");
+        let addr = one_shot_raw_server(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n");
+        let mut cfg = config(&dir);
+        cfg.control_center_endpoint = format!("https://{addr}");
+        assert_eq!(status_of(&diagnose(&cfg), "center.reachable"), Status::Fail);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_refused_center_port_fails() {
+        let dir = temp_dir("reach-refused");
+        // 绑一个口拿到地址后立即释放 —— 几乎不可能还在监听。
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr");
+        let mut cfg = config(&dir);
+        cfg.control_center_endpoint = format!("http://{addr}");
+        assert_eq!(status_of(&diagnose(&cfg), "center.reachable"), Status::Fail);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 本机**还没有**客户端证书（尚未注册）时，中心的 401 是**预期**的 —— 判 WARN，
+    /// 而不是「身份被拒」的红（首跑就该是黄）。
+    #[test]
+    fn a_center_rejecting_an_unregistered_gateway_is_a_warning() {
+        let dir = temp_dir("reach-401");
+        let addr = one_shot_raw_server(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n");
+        let mut cfg = config(&dir);
+        cfg.control_center_endpoint = format!("http://{addr}");
+        assert_eq!(status_of(&diagnose(&cfg), "center.reachable"), Status::Warn);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // ── 无状态工具（tool-copy）组件体检 ──

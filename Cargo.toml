@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-gwlinkd"
-version = "0.8.0" #@gxl:set(version)
+version = "0.9.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 description = "Host-side resident keeping a wist gateway stack linked to WistCenter (register / heartbeat / upgrade)"
@@ -22,10 +22,14 @@ log = "0.4"
 # 本地联调切 path。
 wist-log = { version = "0.1" }
 #wist-log = { version = "0.1", path = "../wist-log" }
+# 分层配置（主配置 + 现场态声明 `${VAR}` + 同目录 .env），与网关 / 中心共用。
+wist-config = { version = "0.1" }
+# 本地联调切 path。
+#wist-config = { version = "0.1", path = "../wist-config" }
 ring = "0.17"
 tokio = { version = "1.48", features = ["full"] }
 libc = "0.2"
-reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls", "blocking"] }
 # 注：不写 `webpki-roots` —— 0.13 里 TLS 根由 `rustls`（系统根）决定，它只是可选依赖的隐式 feature
 # （reqwest 源码不引用），0.13.5 已去掉；留着会把本仓钉死在 0.13.1。
 wist-control = { version = "0.14" }

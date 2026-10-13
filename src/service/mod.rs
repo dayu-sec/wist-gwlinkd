@@ -136,6 +136,13 @@ pub struct ServiceSpec {
     pub bin: PathBuf,
     /// **绝对**配置路径（`gwlinkd.toml`；服务启动时工作目录不确定）。
     pub config_path: PathBuf,
+    /// **现场态**配置的绝对路径（`gwlinkd-pub.toml`）：`Some` 时写进
+    /// `WIST_GWLINKD_PUB_CONFIG`。
+    ///
+    /// 为什么要在 unit 里显式给：现场接线（中心地址 / 网关标识 / 信任锚）落在**主配置之外**
+    /// （主配置是渲染物，重渲会把它抹掉），而它不一定与主配置同目录（栈布局下在
+    /// `identity/gwlinkd/`）。不给就只能靠同目录约定名 —— 那条在栈布局下找不到。
+    pub pub_config: Option<PathBuf>,
     /// `system` 作用域下**以该用户身份运行**（systemd `User=` / launchd `UserName`）。
     /// `None` = 沿用默认（system 作用域 = root）。
     /// 为什么要它：gwlinkd 会回写 `gwlinkd.toml`（接入券）、在 `state_dir` 落身份/凭据，
@@ -152,9 +159,16 @@ impl ServiceSpec {
             scope,
             bin,
             config_path,
+            pub_config: None,
             run_as: None,
             run_as_group: None,
         }
+    }
+
+    /// 设置**现场态**配置路径（`--pub-config`）：写进 unit / plist 的环境变量。
+    pub fn with_pub_config(mut self, pub_config: Option<PathBuf>) -> Self {
+        self.pub_config = pub_config;
+        self
     }
 
     /// 设置 `system` 作用域的运行身份（`--run-as` / `--run-as-group`）。

@@ -31,6 +31,17 @@ wist-gwlinkd service uninstall --system # 停用并删定义
 wist-gwlinkd version
 ```
 
+**全局选项**（`--conf` / `--pub`，可放在子命令**前或后**）—— 手动指定配置落点，省去先 export 环境变量：
+
+- `--conf <path>` / `--conf=<path>`：主配置（`gwlinkd.toml`），等价于 `WIST_GWLINKD_CONFIG`；
+- `--pub <path>` / `--pub=<path>`：现场态声明（`gwlinkd-pub.toml`），等价于 `WIST_GWLINKD_PUB_CONFIG`。
+
+相对路径**按当前工作目录**解析（现场态声明可能尚不存在，故不做 `canonicalize`）。例：
+
+```bash
+wist-gwlinkd diagnose --conf ./dev/configs/gwlinkd/gwlinkd.toml --pub ./identity/gwlinkd/gwlinkd-pub.toml
+```
+
 ### 断开与 Center 的连接（`unlink`）
 
 link（`onboard`）与 unlink **同属 gwlinkd** —— 同一份注册态、同一个 owner。`unlink` 删掉**注册态**
@@ -114,6 +125,7 @@ binary = "gx"
 ```
 
 环境变量：`WIST_GWLINKD_CONFIG`（配置文件路径）、`WIST_GWLINKD_LINK_TOKEN`（首跑置备用的一次性接入 token）。
+也可以用命令行全局选项 `--conf <path>` / `--pub <path>` 代替前两者的**路径**部分（见上文「用法」）。
 
 升级由常驻周期从中心 `GET /api/v1/gateway/upgrade-plan` 拉 desired 驱动（按 `plan_id` 幂等，游标落盘跨重启）。
 执行器经 [**适配层**](src/executor.rs) 调用（`gops` 只是其中一个 impl）：驱动只认「构造调用 + 归一化结局」。

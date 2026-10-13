@@ -34,16 +34,31 @@ fn setup(tag: &str, link_token: Option<&str>) -> Fixture {
     std::fs::create_dir_all(&state_dir).expect("state dir");
     let anchor = dir.join("control-center.pem");
     std::fs::write(&anchor, "-----BEGIN CERTIFICATE-----\n").expect("ca");
+    // 主配置：只放交付物类键。
+    let config = dir.join("gwlinkd.toml");
+    std::fs::write(
+        &config,
+        format!("state_dir = \"{}\"\n", state_dir.display()),
+    )
+    .expect("config");
+    // 现场态：**声明**（只写引用）+ **值**（`.env`，含一次性券）。
+    let declaration = dir.join("gwlinkd-pub.toml");
+    std::fs::write(
+        &declaration,
+        "control_center_endpoint = \"${CENTER_ENDPOINT}\"\n\
+         gateway_id = \"${GATEWAY_ID}\"\n\
+         trust_bundle = \"${TRUST_BUNDLE}\"\n\
+         link_token = \"${LINK_TOKEN:-}\"\n",
+    )
+    .expect("declaration");
     let mut text = format!(
-        "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"{}\"\nstate_dir = \"{}\"\n",
-        anchor.display(),
-        state_dir.display()
+        "CENTER_ENDPOINT=https://c\nGATEWAY_ID=gw-1\nTRUST_BUNDLE={}\n",
+        anchor.display()
     );
     if let Some(token) = link_token {
-        text.push_str(&format!("link_token = \"{token}\"\n"));
+        text.push_str(&format!("LINK_TOKEN={token}\n"));
     }
-    let config = dir.join("gwlinkd.toml");
-    std::fs::write(&config, text).expect("config");
+    std::fs::write(dir.join(".env"), text).expect(".env");
     Fixture {
         dir,
         config,
@@ -98,10 +113,10 @@ fn unlink_removes_registration_state_and_link_token_but_keeps_the_anchor() {
         assert!(!fx.state_file(name).exists(), "{name} 应被删");
     }
     assert!(
-        !std::fs::read_to_string(&fx.config)
-            .expect("read config")
-            .contains("link_token"),
-        "link_token 应从配置去掉"
+        !std::fs::read_to_string(fx.dir.join(".env"))
+            .expect("read .env")
+            .contains("link_abc"),
+        "一次性券应从 .env 去掉"
     );
     assert!(fx.anchor.exists(), "信任锚默认保留");
     fx.cleanup();

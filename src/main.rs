@@ -9,7 +9,9 @@ use orion_error::prelude::*;
 use wist_control::{DateTime, ReportGatewayStatus};
 use wist_gwlinkd::agent_package::{AgentPackageClient, AgentPackageItem};
 use wist_gwlinkd::center::{self, CenterClient};
-use wist_gwlinkd::config::{Config, UpgradeInstall, upsert_link_settings};
+use wist_gwlinkd::config::{
+    Config, UpgradeInstall, pub_config_path, remove_link_token, upsert_link_settings,
+};
 use wist_gwlinkd::doctor::{self, Status};
 use wist_gwlinkd::error::{
     CenterError, CenterReason, CenterResult, GwlinkdError, GwlinkdReason, GwlinkdResult,
@@ -41,6 +43,67 @@ fn config_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(wist_gwlinkd::DEFAULT_CONFIG_PATH))
 }
 
+/// 解析**全局**选项 `--conf <path>` / `--pub <path>`（也接受 `--conf=<path>` / `--pub=<path>`），
+/// 把它们从参数里摘除；返回 `(conf, pub, 其余参数)`。
+///
+/// 为什么要它：主配置 / 现场态声明的可加载路径原本只能靠环境变量（`WIST_GWLINKD_CONFIG` /
+/// `WIST_GWLINKD_PUB_CONFIG`）给。`--conf` / `--pub` 让手动跑（如 `diagnose`）不必先 export。
+/// 与 `service` 子命令自己的 `--config` / `--pub-config` 不冲突（名不同、语义不同：那是装服务时写进 unit 的）。
+fn parse_global_paths(args: &[String]) -> (Option<PathBuf>, Option<PathBuf>, Vec<String>) {
+    let mut conf = None;
+    let mut pub_path = None;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        // 支持 `--x value` 与 `--x=value` 两种写法。
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        let target = match flag {
+            "--conf" => Some(&mut conf),
+            "--pub" => Some(&mut pub_path),
+            _ => None,
+        };
+        if let Some(slot) = target {
+            let value = match inline {
+                Some(value) => value,
+                None => {
+                    i += 1;
+                    match args.get(i) {
+                        Some(value) => value.clone(),
+                        None => {
+                            eprintln!("选项 {flag} 缺参数（用法：{flag} <path>）");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+            };
+            *slot = Some(PathBuf::from(value));
+        } else {
+            rest.push(arg.clone());
+        }
+        i += 1;
+    }
+    (conf, pub_path, rest)
+}
+
+/// 把命令行给的相对路径**按当前工作目录绝对化**（已是绝对路径则原样返回）。
+///
+/// 为什么需要：`wist-config` 把现场态声明（`WIST_GWLINKD_PUB_CONFIG`）当**相对主配置目录**解析。
+/// 若 `--conf` / `--pub` 都给相对路径、而主配置又在子目录里，`--pub` 会被算到主配置旁边而非
+/// 用户在 shell 里写下它的那个目录 —— 不是命令行用法的预期。两个都先按 cwd 绝对化，寻址就只由
+/// cwd 决定。不用 `canonicalize`：现场态声明可能**尚不存在**（接入时由 gwlinkd 创建）。
+fn absolutize_from_cwd(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(&path))
+        .unwrap_or(path)
+}
+
 /// 按 `[log]` 段初始化运行日志（统一走共享 crate `wist-log`）。
 fn log_init(section: &wist_log::LogSection) {
     wist_log::init(
@@ -63,7 +126,20 @@ fn init_logging_from_config_or_default() {
 async fn main() -> ExitCode {
     // 日志在**读到配置之后**才初始化（`[log]` 段决定级别 / 格式 / 落点）；配置读不了时
     // 日志还没起来，就直写 stderr —— 不要让启动失败静默。
-    let command = std::env::args().nth(1).unwrap_or_else(|| "run".to_string());
+    //
+    // 先摘出全局选项 `--conf` / `--pub`（它们决定配置落点），落成环境变量供 `wist-config`
+    // 分层加载寻址 —— 这样手动跑（如 `diagnose`）不必先 export 那两个变量。
+    let all: Vec<String> = std::env::args().collect();
+    let (conf, pub_path, rest) = parse_global_paths(&all[1..]);
+    if let Some(conf) = conf {
+        // SAFETY: 单进程启动期，此处先于任何线程读环境变量，无并发 reader。
+        unsafe { std::env::set_var("WIST_GWLINKD_CONFIG", absolutize_from_cwd(conf)) };
+    }
+    if let Some(pub_path) = pub_path {
+        // SAFETY: 同上。
+        unsafe { std::env::set_var("WIST_GWLINKD_PUB_CONFIG", absolutize_from_cwd(pub_path)) };
+    }
+    let command = rest.first().cloned().unwrap_or_else(|| "run".to_string());
     match command.as_str() {
         "version" | "-V" | "--version" => {
             println!("wist-gwlinkd {}", wist_gwlinkd::VERSION);
@@ -81,10 +157,10 @@ async fn main() -> ExitCode {
         },
         "service" => {
             init_logging_from_config_or_default();
-            run_service(&std::env::args().skip(2).collect::<Vec<_>>())
+            run_service(&rest[1..])
         }
-        "unlink" => run_unlink(&std::env::args().skip(2).collect::<Vec<_>>()).await,
-        "init-config" => match init_config_command(std::env::args().nth(2)) {
+        "unlink" => run_unlink(&rest[1..]).await,
+        "init-config" => match init_config_command(rest.get(1).cloned()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("[FAIL] {}", err.display_chain());
@@ -120,10 +196,11 @@ async fn main() -> ExitCode {
     }
 }
 
-/// 生成一份带注释的 `gwlinkd.toml` 骶架（`init-config [路径]`）。
+/// 生成一份带注释的 `gwlinkd.toml` 骶架 + 现场态 `gwlinkd-pub.toml`（`init-config [路径]`）。
 ///
-/// 与 `wist-gateway init-config` 同一套路：由程序生成，避免手抄。**不含密钥**；接入券
-/// `link_token` 由「链接上级」页 / gwlinkd 自联时写回。已存在同名文件时**覆盖**（会在输出里注明）。
+/// 与 `wist-gateway init-config` 同一套路：由程序生成，避免手抄。**不含密钥**。
+/// 主配置已存在则**覆盖**（它是交付物）；现场态配置**只在缺失时补**（它承载现场选择，
+/// 绝不能被一次 init 抹掉）。
 fn init_config_command(out_arg: Option<String>) -> GwlinkdResult<()> {
     let out_path = out_arg.map(PathBuf::from).unwrap_or_else(config_path);
     if let Some(parent) = out_path
@@ -145,11 +222,46 @@ fn init_config_command(out_arg: Option<String>) -> GwlinkdResult<()> {
     } else {
         println!("已生成配置：{}", out_path.display());
     }
+
+    // 现场态声明：**按缺补齐**（已存在就不动 —— 里面是声明，但现场可能改过变量名）。
+    let pub_path = pub_config_path(&out_path);
+    if pub_path.exists() {
+        println!("现场态声明已存在，保留：{}", pub_path.display());
+    } else {
+        write_new(&pub_path, wist_gwlinkd::config::default_pub_config_text())?;
+        println!("已生成现场态声明：{}", pub_path.display());
+    }
+    // 现场态**值**（`.env`）：同样**按缺补齐** —— 已有值一律保留（那是现场填的）。
+    let env_path = wist_gwlinkd::config::pub_env_path(&pub_path);
+    if env_path.exists() {
+        println!("现场态值已存在，保留：{}", env_path.display());
+    } else {
+        write_new(&env_path, wist_gwlinkd::config::default_env_text())?;
+        println!("已生成现场态值骨架：{}", env_path.display());
+    }
     println!(
-        "下一步：填 control_center_endpoint（自签中心再配 trust_bundle），然后 `wist-gwlinkd run`；"
+        "下一步：填 {} 里的 CENTER_ENDPOINT（自签中心再填 TRUST_BUNDLE），然后 `wist-gwlinkd run`；",
+        env_path.display()
     );
-    println!("       或走网关「链接上级」页提交接入链接 —— gwlinkd 拉到后会把值写回本文件。");
+    println!("       或走网关「链接上级」页提交接入链接 —— gwlinkd 会把值写回该文件。");
     Ok(())
+}
+
+/// 写一个新文件（父目录自建）；给“按缺补齐”的骨架用。
+fn write_new(path: &Path, text: String) -> GwlinkdResult<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).source_err(
+            GwlinkdReason::Config,
+            format!("创建目录失败 {}", parent.display()),
+        )?;
+    }
+    std::fs::write(path, text).source_err(
+        GwlinkdReason::Config,
+        format!("写入失败 {}", path.display()),
+    )
 }
 
 /// 常驻：单实例 → 首跑置备（若未注册）→ 周期【续期 / 拉升级目标 / 拉自述面 / 上报状态】。
@@ -161,7 +273,7 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
     let identity = state::load_or_create_identity(&config.state_dir)
         .map_err(|err| GwlinkdReason::Identity.err(err))?;
 
-    match state::credential_status(&config.state_dir) {
+    match state::credential_status(config.identity_dir()) {
         CredentialStatus::Present(_) => {
             // 已有客户端证书：遗留的 RegistToken 一定是旧的，清掉（避免误用）。
             state::clear_regist_token(&config.state_dir);
@@ -175,7 +287,7 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
         CredentialStatus::Corrupt(detail) => {
             // 损坏 ≠ 缺失：不能静默重置备（会覆盖掉唯一一份长期身份）。
             return Err(GwlinkdReason::Identity.err(format!(
-                "长期身份损坏：{detail}；修复或删除 state/credential.json 后重跑（若中心已初始化该实例，需先在中心重置）"
+                "长期身份损坏：{detail}；修复或删除身份目录下的 credential.json 后重跑（若中心已初始化该实例，需先在中心重置）"
             )));
         }
     }
@@ -194,7 +306,7 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
         None
     };
 
-    let mut credential = state::load_credential(&config.state_dir)
+    let mut credential = state::load_credential(config.identity_dir())
         .ok_or_else(|| GwlinkdReason::Identity.err("注册后仍无长期身份"))?;
     // 注册后所有网关面调用都走 **mTLS**（客户端证书认人）；续期后重建。
     let mut client = mtls_client(config, trust, &credential)?;
@@ -326,7 +438,8 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
         ticker.tick().await;
 
         // 上一轮轮换若有收尾未完成（内存/磁盘/客户端未对齐），先自愈重试。
-        if credential_dirty && let Err(err) = state::save_credential(&config.state_dir, &credential)
+        if credential_dirty
+            && let Err(err) = state::save_credential(config.identity_dir(), &credential)
         {
             log::warn!(
                 "event=CredentialSaveRetryFailed error={}",
@@ -396,7 +509,7 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                             );
                         }
                     }
-                    match state::save_credential(&config.state_dir, &credential) {
+                    match state::save_credential(config.identity_dir(), &credential) {
                         Ok(()) => credential_dirty = false,
                         Err(err) => {
                             credential_dirty = true;
@@ -1022,6 +1135,23 @@ fn link_token_from_env() -> Option<String> {
     }
 }
 
+/// 接入成功后把**已消费**的一次性接入券从现场态配置里删掉。
+///
+/// 券是一次性的（中心 `consume_link_token` 成功即清 hash，另有短 TTL）：留着它只是把一张
+/// 废券明文搁在盘上（`diagnose` 会报「已接入却仍残留 link_token」）。失败**不阻断**接入结果
+/// —— 只是留下一张废券，记一笔告警。
+fn clear_consumed_link_token(pub_path: &Path) {
+    match remove_link_token(pub_path) {
+        Ok(true) => log::info!("event=LinkTokenCleared path={}", pub_path.display()),
+        Ok(false) => {}
+        Err(err) => log::warn!(
+            "event=LinkTokenClearFailed path={} error={}",
+            pub_path.display(),
+            chain_one_line(&err)
+        ),
+    }
+}
+
 /// 首跑：确保拿到长期身份（可能等待页面提交的接入请求）。
 async fn first_run(
     path: &Path,
@@ -1037,7 +1167,12 @@ async fn first_run(
             config.control_center_endpoint.clone(),
             center::build_http_client(trust)?,
         );
-        return onboard(&link_client, config, identity, Some(token)).await;
+        let outcome = onboard(&link_client, config, identity, Some(token)).await;
+        if outcome.is_ok() {
+            // 券（若写在场态配置里）已被消费 —— 删掉，别把废券留在盘上（§6）。
+            clear_consumed_link_token(&pub_config_path(path));
+        }
+        return outcome;
     }
     // 无券：页面发起（环回接入请求）—— 拉取后在**这一步改写 gwlinkd.toml**。
     if let Some(base) = config.gateway_self_endpoint.as_deref() {
@@ -1064,18 +1199,20 @@ async fn onboard_from_gateway(
     if !request.has_request {
         return Ok(false);
     }
-    // 页面带的 CA 落盘（免得还要先手工预置信任锚）。
+    // 页面带的 CA 落盘（免得还要先手工预置信任锚）——落在**身份目录**：它是信任锚，现场事实。
     let trust_path = if request.trust_bundle_pem.trim().is_empty() {
         None
     } else {
         Some(state::save_trust_bundle(
-            &config.state_dir,
+            config.identity_dir(),
             &request.trust_bundle_pem,
         )?)
     };
-    // **在接入这一步改写本机配置**：把接入物落成 gwlinkd.toml —— 链接关系的持久记录（不走 DB）。
+    // **在接入这一步改写现场态配置**（`gwlinkd-pub.toml`）—— 链接关系的持久记录（不走 DB）。
+    // 写现场态而非主配置：主配置是渲染物，重渲会把它抹掉；且这两类键本来就不该混在一个文件里。
+    let pub_path = pub_config_path(path);
     upsert_link_settings(
-        path,
+        &pub_path,
         &request.center_endpoint,
         &request.gateway_id,
         &request.link_token,
@@ -1084,7 +1221,7 @@ async fn onboard_from_gateway(
     .conv_err()?;
     log::info!(
         "event=LinkRequestPersisted path={} center={}",
-        path.display(),
+        pub_path.display(),
         request.center_endpoint
     );
     // 以改写后的配置为准（endpoint / gateway_id / trust 都从文件读回）。
@@ -1101,6 +1238,8 @@ async fn onboard_from_gateway(
     );
     match onboard(&link_client, &updated, identity, Some(&request.link_token)).await {
         Ok(()) => {
+            // 券已被中心消费（一次性）——从现场态配置里删掉，别把废券留在盘上（§6）。
+            clear_consumed_link_token(&pub_path);
             let _ = client
                 .report_result(&updated.gateway_id, "Connected", "")
                 .await;
@@ -1175,7 +1314,7 @@ async fn retry_leftover_registration(
         .map(|saved| saved.control_center_endpoint)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| config.control_center_endpoint.clone());
-    let saved_ca = config.state_dir.join(state::TRUST_BUNDLE_FILE);
+    let saved_ca = config.identity_dir().join(state::TRUST_BUNDLE_FILE);
     let effective_trust: Option<&Path> = if saved_ca.exists() {
         Some(saved_ca.as_path())
     } else {
@@ -1320,7 +1459,7 @@ async fn register_once(
         bundle: result.credential_bundle,
         private_key_pem: keypair.private_key_pem,
     };
-    state::save_credential(&config.state_dir, &credential).map_err(|err| {
+    state::save_credential(config.identity_dir(), &credential).map_err(|err| {
         CenterReason::Local.err(format!("落长期身份失败: {}", err.op_display_chain()))
     })?;
     log::info!(
@@ -1514,7 +1653,7 @@ fn report_unlink(report: &UnlinkReport) {
 fn run_service(args: &[String]) -> ExitCode {
     let Some(action) = args.first().map(String::as_str) else {
         eprintln!(
-            "用法：wist-gwlinkd service <print|install|uninstall|status> [--system|--user] [--bin PATH] [--config PATH] [--run-as USER] [--run-as-group GROUP] [--force] [--no-activate]"
+            "用法：wist-gwlinkd service <print|install|uninstall|status> [--system|--user] [--bin PATH] [--config PATH] [--pub-config PATH] [--run-as USER] [--run-as-group GROUP] [--force] [--no-activate]"
         );
         return ExitCode::from(2);
     };
@@ -1534,6 +1673,7 @@ fn service_command(action: &str, rest: &[String]) -> GwlinkdResult<()> {
     let mut scope: Option<service::ServiceScope> = None;
     let mut bin: Option<PathBuf> = None;
     let mut config: Option<PathBuf> = None;
+    let mut pub_config: Option<PathBuf> = None;
     let mut run_as: Option<String> = None;
     let mut run_as_group: Option<String> = None;
     let mut force = false;
@@ -1573,6 +1713,10 @@ fn service_command(action: &str, rest: &[String]) -> GwlinkdResult<()> {
                 config = Some(PathBuf::from(need_arg(rest, i + 1, "--config")?));
                 i += 2;
             }
+            "--pub-config" => {
+                pub_config = Some(PathBuf::from(need_arg(rest, i + 1, "--pub-config")?));
+                i += 2;
+            }
             other => return Err(GwlinkdReason::InvalidArgs.err(format!("未知参数：{other}"))),
         }
     }
@@ -1596,7 +1740,9 @@ fn service_command(action: &str, rest: &[String]) -> GwlinkdResult<()> {
         None => service::default_config_path(scope)?,
     };
     let layout = service::ServiceLayout::resolve(platform, scope)?;
-    let spec = service::ServiceSpec::new(scope, bin, config).with_run_as(run_as, run_as_group);
+    let spec = service::ServiceSpec::new(scope, bin, config)
+        .with_run_as(run_as, run_as_group)
+        .with_pub_config(pub_config);
 
     match action {
         "print" => {
@@ -1717,6 +1863,75 @@ mod tests {
         );
     }
 
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn parse_global_paths_takes_conf_and_pub_and_leaves_the_rest() {
+        let (conf, pub_path, rest) = parse_global_paths(&args(&[
+            "diagnose",
+            "--conf",
+            "a/gwlinkd.toml",
+            "--pub",
+            "b/gwlinkd-pub.toml",
+        ]));
+        assert_eq!(conf, Some(PathBuf::from("a/gwlinkd.toml")));
+        assert_eq!(pub_path, Some(PathBuf::from("b/gwlinkd-pub.toml")));
+        assert_eq!(rest, args(&["diagnose"]));
+    }
+
+    #[test]
+    fn parse_global_paths_accepts_the_inline_equals_form() {
+        let (conf, pub_path, rest) =
+            parse_global_paths(&args(&["run", "--conf=a.toml", "--pub=b.toml"]));
+        assert_eq!(conf, Some(PathBuf::from("a.toml")));
+        assert_eq!(pub_path, Some(PathBuf::from("b.toml")));
+        assert_eq!(rest, args(&["run"]));
+    }
+
+    #[test]
+    fn parse_global_paths_is_order_independent_and_keeps_unknown_args() {
+        // 全局选项在子命令前后都能被摘出，其余参数（如 `service install --config X`）原样保留。
+        let (conf, pub_path, rest) = parse_global_paths(&args(&[
+            "service",
+            "install",
+            "--conf",
+            "c.toml",
+            "--config",
+            "unit-conf.toml",
+            "--pub",
+            "p.toml",
+        ]));
+        assert_eq!(conf, Some(PathBuf::from("c.toml")));
+        assert_eq!(pub_path, Some(PathBuf::from("p.toml")));
+        // `service` 自己的 `--config` 与全局 `--conf` 不同名，不被摘除。
+        assert_eq!(
+            rest,
+            args(&["service", "install", "--config", "unit-conf.toml"])
+        );
+    }
+
+    #[test]
+    fn parse_global_paths_without_flags_keeps_everything() {
+        let (conf, pub_path, rest) = parse_global_paths(&args(&["diagnose"]));
+        assert_eq!(conf, None);
+        assert_eq!(pub_path, None);
+        assert_eq!(rest, args(&["diagnose"]));
+    }
+
+    #[test]
+    fn absolutize_from_cwd_keeps_absolute_and_prefixes_relative() {
+        let abs = PathBuf::from("/tmp/abs/gwlinkd.toml");
+        assert_eq!(absolutize_from_cwd(abs.clone()), abs);
+
+        let cwd = std::env::current_dir().expect("cwd");
+        assert_eq!(
+            absolutize_from_cwd(PathBuf::from("rel/gwlinkd.toml")),
+            cwd.join("rel/gwlinkd.toml")
+        );
+    }
+
     // ── onboard 语义测试（中心用桩）──
 
     use std::sync::{Arc, Mutex};
@@ -1748,6 +1963,7 @@ mod tests {
             control_center_endpoint: endpoint,
             trust_bundle: dir.join("ca.pem"),
             state_dir: dir.to_path_buf(),
+            identity_dir: None,
             gateway_id: "gw-1".into(),
             link_token: None,
             gateway_self_endpoint: None,
@@ -1767,6 +1983,7 @@ mod tests {
             upgrade_tool_require_arch: None,
             upgrade: Default::default(),
             log: Default::default(),
+            pub_config_path: None,
         }
     }
 
@@ -1923,10 +2140,23 @@ mod tests {
         let dir = temp_dir("init-config");
         let path = dir.join("gwlinkd.toml");
         init_config_command(Some(path.display().to_string())).expect("init-config");
+        // 开箱即可加载：声明里的 `${VAR}` 由一并生成的 `.env` 骶架提供（值可为空）。
         let config = Config::load(&path).expect("生成的配置必须可加载");
+        // `.env` 骶架里 GATEWAY_ID=gw-local（声明里的 `${GATEWAY_ID}` 取到它）。
         assert_eq!(config.gateway_id, "gw-local");
-        assert!(config.link_token.is_none());
-        // 注释里的 `# link_token = ""` 不能被当成真配置。
+        assert!(config.control_center_endpoint.is_empty(), "空 = 尚未接入");
+        // `:-` 默认值：骶架里没有 LINK_TOKEN 行 → 空（= 无券）。
+        assert!(config.link_token.as_deref().unwrap_or("").is_empty());
+        // 声明 + 值两份都在，且声明**不含现场值**。
+        let decl = std::fs::read_to_string(wist_gwlinkd::config::pub_config_path(&path))
+            .expect("read declaration");
+        assert!(decl.contains("${CENTER_ENDPOINT}"), "{decl}");
+        assert!(!decl.contains("https://"), "声明不应含现场值：{decl}");
+        assert!(
+            wist_gwlinkd::config::pub_env_path(&wist_gwlinkd::config::pub_config_path(&path))
+                .is_file(),
+            ".env 骶架应已生成"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1967,25 +2197,45 @@ mod tests {
         ));
         let client = LinkRequestClient::new(url.clone());
         let config = test_config(&dir, url.clone());
-        // 配置文件的路径：接入那一步会**改写它**（把接入物落盘）。
+        // 配置路径：接入那一步会把**现场值**写进声明旁边的 `.env`（声明本身不动）。
+        // 主配置只放**交付物类**键。
         let config_path = dir.join("gwlinkd.toml");
         std::fs::write(
             &config_path,
-            format!(
-                "control_center_endpoint = \"{url}\"\ngateway_id = \"gw-old\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"{state}\"\n",
-                state = dir.display()
-            ),
+            format!("state_dir = \"{state}\"\n", state = dir.display()),
         )
         .expect("write config");
+        // 现场态声明：只写引用（与内置骶架同形）。
+        std::fs::write(
+            wist_gwlinkd::config::pub_config_path(&config_path),
+            "control_center_endpoint = \"${CENTER_ENDPOINT}\"\n\
+             gateway_id = \"${GATEWAY_ID}\"\n\
+             trust_bundle = \"${TRUST_BUNDLE:-}\"\n\
+             link_token = \"${LINK_TOKEN:-}\"\n",
+        )
+        .expect("write declaration");
 
         let registered = onboard_from_gateway(&config_path, &config, None, "ident-1", &client)
             .await
             .expect("onboard");
         assert!(registered, "有待办应完成接入");
-        // 接入物已改写进配置文件（= 链接关系的持久记录）。
+        // 现场接线**不写回主配置**（主配置是渲染物，重渲会抹掉它）。
         let written = std::fs::read_to_string(&config_path).expect("read config");
-        assert!(written.contains("link_token = \"link_abc\""), "{written}");
-        assert!(written.contains("gateway_id = \"gw-1\""), "{written}");
+        assert!(
+            !written.contains("control_center_endpoint") && !written.contains("gateway_id"),
+            "现场接线不应写回主配置：{written}"
+        );
+        // 现场接线落进声明旁边的 `.env`（= 链接关系的持久记录）；一次性券在成功接入后**已清掉**。
+        let env_path = wist_gwlinkd::config::pub_env_path(&wist_gwlinkd::config::pub_config_path(
+            &config_path,
+        ));
+        let env_text = std::fs::read_to_string(&env_path).expect("read .env");
+        assert!(env_text.contains("GATEWAY_ID=gw-1"), "{env_text}");
+        assert!(env_text.contains("CENTER_ENDPOINT="), "{env_text}");
+        assert!(
+            !env_text.contains("LINK_TOKEN="),
+            "一次性券应在接入成功后清掉：{env_text}"
+        );
         assert!(wist_gwlinkd::state::load_credential(&dir).is_some());
         let calls = stub.lock().unwrap().calls.clone();
         assert!(
@@ -2020,10 +2270,7 @@ mod tests {
         let config_path = dir.join("gwlinkd.toml");
         std::fs::write(
             &config_path,
-            format!(
-                "control_center_endpoint = \"{url}\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"{state}\"\n",
-                state = dir.display()
-            ),
+            format!("state_dir = \"{state}\"\n", state = dir.display()),
         )
         .expect("write config");
 

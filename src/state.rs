@@ -28,7 +28,8 @@ pub const UPGRADE_CURSOR_FILE: &str = "upgrade-cursor.json";
 pub const IDENTITY_FILE: &str = "identity";
 /// 一次运行的实例标识文件（注册用，重启保持稳定）。
 pub const INSTANCE_FILE: &str = "instance";
-/// 客户端证书+私钥文件（`StoredCredential`，0600）。
+/// 客户端证书+私钥文件（`StoredCredential`，0600）—— 落在**身份目录**（`Config::identity_dir`），
+/// 不是 `state_dir`：它是唯一真正不可再生的那对（丢了只能换 `gateway_id`），要进 `contract`。
 pub const CREDENTIAL_FILE: &str = "credential.json";
 /// link-upstream 返回的链接配置（信任锚 / 协议版本 / 注册 token 引用）。
 pub const LINK_CONFIG_FILE: &str = "link-config.json";
@@ -281,10 +282,12 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 /// 保存长期身份（`register` / `renew` 后；原子写 + 0600）。
-pub fn save_credential(state_dir: &Path, credential: &StoredCredential) -> StateResult<()> {
+///
+/// 传**身份目录**（`Config::identity_dir`）—— 与 `state_dir` 里的锁 / 簿记分开。
+pub fn save_credential(identity_dir: &Path, credential: &StoredCredential) -> StateResult<()> {
     let text =
         serde_json::to_string_pretty(credential).source_err(StateReason::Json, "序列化凭据失败")?;
-    write_secret(&path_in(state_dir, CREDENTIAL_FILE), &text)
+    write_secret(&path_in(identity_dir, CREDENTIAL_FILE), &text)
 }
 
 /// 长期身份的就位状态（区分「缺失」与「损坏」，不把损坏当缺失静默重置备）。
@@ -298,9 +301,9 @@ pub enum CredentialStatus {
     Present(StoredCredential),
 }
 
-/// 读长期身份的就位状态（见 [`CredentialStatus`]）。
-pub fn credential_status(state_dir: &Path) -> CredentialStatus {
-    let path = path_in(state_dir, CREDENTIAL_FILE);
+/// 读长期身份的就位状态（见 [`CredentialStatus`]）。传**身份目录**。
+pub fn credential_status(identity_dir: &Path) -> CredentialStatus {
+    let path = path_in(identity_dir, CREDENTIAL_FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return CredentialStatus::Missing,
@@ -314,9 +317,9 @@ pub fn credential_status(state_dir: &Path) -> CredentialStatus {
     }
 }
 
-/// 读长期身份；不存在、损坏或不可解析 → `None`。
-pub fn load_credential(state_dir: &Path) -> Option<StoredCredential> {
-    match credential_status(state_dir) {
+/// 读长期身份；不存在、损坏或不可解析 → `None`。传**身份目录**。
+pub fn load_credential(identity_dir: &Path) -> Option<StoredCredential> {
+    match credential_status(identity_dir) {
         CredentialStatus::Present(credential) => Some(credential),
         _ => None,
     }
@@ -327,12 +330,12 @@ pub fn save_regist_token(state_dir: &Path, token: &str) -> StateResult<()> {
     write_secret(&path_in(state_dir, REGIST_TOKEN_FILE), token)
 }
 
-/// 中心信任锚（CA-S）落盘文件名（PEM）。
+/// 中心信任锚（CA-S）落盘文件名（PEM）。落在**身份目录**（与凭据同处 —— 都是现场事实）。
 pub const TRUST_BUNDLE_FILE: &str = "control-center.pem";
 
-/// 落盘中心信任锚（CA-S PEM）：接入物从页面来时可免预置。返回落盘路径。
-pub fn save_trust_bundle(state_dir: &Path, pem: &str) -> StateResult<std::path::PathBuf> {
-    let path = path_in(state_dir, TRUST_BUNDLE_FILE);
+/// 落盘中心信任锚（CA-S PEM）：接入物从页面来时可免预置。返回落盘路径。传**身份目录**。
+pub fn save_trust_bundle(identity_dir: &Path, pem: &str) -> StateResult<std::path::PathBuf> {
+    let path = path_in(identity_dir, TRUST_BUNDLE_FILE);
     write_secret(&path, pem)?;
     Ok(path)
 }
