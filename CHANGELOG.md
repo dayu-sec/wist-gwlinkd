@@ -3,6 +3,13 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.3-alpha] - 2026-10-14
+
+### 变更
+
+- **COS 元数据键改名**：`x-cos-meta-sha256` → `x-cos-meta-artifact-sha256`（与契约里的
+  `artifact_sha256` 字段同词；`x-cos-meta-` 是 COS 对自定义元数据的强制前缀，去不掉）。
+
 ## [0.9.2-alpha] - 2026-10-14
 
 ### 变更
