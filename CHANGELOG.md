@@ -3,6 +3,13 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.2-alpha] - 2026-10-14
+
+### 变更
+
+- **制品推送到 COS 时自带 sha256**：上传的每个对象带自定义元数据 `x-cos-meta-sha256`（COS 对象只存
+  MD5 ETag，GitHub 资产摘要过不来）。录安装包 / 校验制品时可用 `coscli stat`（HEAD）读回，摘要不再「丢」。
+
 ## [0.9.1-alpha] - 2026-10-13
 
 ### 变更
