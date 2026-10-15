@@ -3,6 +3,28 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.10.0-alpha] - 2026-10-15
+
+### 新增
+
+- **`diagnose` / `service status` 不必再指定配置**：`--conf` 缺省时自动读**已装的服务定义**里那份
+  （bin / 主配置 / 现场态）—— host 侧常驻本就该认得自己那份，长路径不必敲两遍（敲错的名字会被
+  静默丢掉、回落到 `./gwlinkd.toml`，症状看着像「配置读不到」）。回落时在 stderr 说明一句。
+- **全局选项短名 `-c` / `-p`**（等价 `--conf` / `--pub`；前后位置与 `=` 内联写法同长名）。
+
+### 变更
+
+- **现场态变量名统一为 `GWLINKD_*`**（`init-config` 生成的声明 + 值骶架）：与网关栈 `.env` 同一套名，
+  避免「值写在一个名下、声明引用另一个名」的死键。声明仍是变量名唯一的映射来源 —— 已有现场不动，
+  但**两边要同名**。
+- **`diagnose` 的「下一步」按现状给**：身份缺失那条不再让人去配**已经配好**的 `control_center_endpoint`。
+
+### 修复
+
+- **macOS：系统级 launchd + `--run-as <用户>` 装的常驻起不来**：日志目录由 `service install`（root）
+  建出，launchd 以运行身份打不开 `StandardOutPath` / `StandardErrorPath`，`posix_spawn` 直接 EACCES ——
+  而**应用日志永远是空的**，极难定位。现在装服务时把该目录（及已存在的 stdio 文件）交给运行身份。
+
 ## [0.9.3-alpha] - 2026-10-14
 
 ### 变更

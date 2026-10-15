@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "wist-gwlinkd"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "flate2",
  "libc",
