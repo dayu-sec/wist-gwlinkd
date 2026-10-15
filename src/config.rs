@@ -235,7 +235,7 @@ pub fn pub_env_path(pub_path: &Path) -> PathBuf {
 /// 把页面提交的接入物落到**现场态的值文件**（`.env`，与现场态声明同目录）。
 ///
 /// **写哪个变量名**由**现场态声明**（`gwlinkd-pub.toml`）决定：
-/// 声明里 `control_center_endpoint = "${CENTER_ENDPOINT}"` ⇒ 写 `CENTER_ENDPOINT=…`。
+/// 声明里 `control_center_endpoint = "${GWLINKD_CENTER_ENDPOINT}"` ⇒ 写 `GWLINKD_CENTER_ENDPOINT=…`。
 /// 如此“配置键 → 变量名”的映射只有一处（声明），部署方可自由选名（如 `GWLINKD_TRUST_BUNDLE`）。
 ///
 /// 为什么写文件：链接关系是**部署接线**，落成 `.env` 即「持久记录」—— 这正是
@@ -345,43 +345,47 @@ state_dir = "state"
 /// 默认**现场态声明**模板（由 [`default_pub_config_text`] 返回）。
 ///
 /// **只写引用，不含现场值** —— 所以本文件随版本走、可被覆盖重渲；真值在同目录的 `.env`。
+///
+/// 变量名统一用 `GWLINKD_*` 前缀（与网关栈 `sys/setting/vars.yml` / `.env` 同一套名）——
+/// 两处叫法不同会出「死键」（写在一个名下、声明引用另一个名，看着配了实际没生效）。
 const DEFAULT_PUB_CONFIG_TEMPLATE: &str = r#"# wist-gwlinkd 现场态（接口层）**声明** —— 只写 `${VAR}` 引用，**不含现场值**。
 #
 # 本文件随版本走（可入库 / 重渲覆盖也动不到现场）：真值在同目录的 `.env`
 # （docker-compose 口径：`.env` 挨着本文件；**进程环境优先**）。
 # `${VAR}` 未定义且没给 `:-默认值` → **拒启**（fail-closed，不让“忘了写 .env”静默变空）。
 #
-# 左侧是 gwlinkd 的配置键；右侧变量名**由部署方自定**（栈里会用 CENTER_ENDPOINT / GWLINKD_*）。
+# 左侧是 gwlinkd 的配置键；右侧变量名**由部署方自定**，本仓默认统一 `GWLINKD_*`
+# （网关栈里是 GWLINKD_CENTER_ENDPOINT / GWLINKD_GATEWAY_ID / GWLINKD_TRUST_BUNDLE）。
 # 网关「链接上级」页接入时，gwlinkd 会把值写进 `.env` 里**本文件声明的那个变量名**。
 
 # 上级控制中心地址（空 = 尚未接入）
-control_center_endpoint = "${CENTER_ENDPOINT}"
+control_center_endpoint = "${GWLINKD_CENTER_ENDPOINT}"
 
 # 本网关在中心侧的标识（须与中心实例名一致）
-gateway_id = "${GATEWAY_ID}"
+gateway_id = "${GWLINKD_GATEWAY_ID}"
 
 # 中心 CA-S 信任锚路径（自签中心必需；公网中心可留空 → 回落系统根）
-trust_bundle = "${TRUST_BUNDLE:-}"
+trust_bundle = "${GWLINKD_TRUST_BUNDLE:-}"
 
 # 一次性接入券（由「链接上级」页写入 `.env`；接入成功后 gwlinkd 会删掉那一行）
-link_token = "${LINK_TOKEN:-}"
+link_token = "${GWLINKD_LINK_TOKEN:-}"
 "#;
 
 /// 默认**现场态值**骶架（由 [`default_env_text`] 返回）。
 const DEFAULT_ENV_TEMPLATE: &str = r#"# wist-gwlinkd 现场态（接口层）**值** —— 与同目录 gwlinkd-pub.toml 里的 `${VAR}` 一一对应。
 #
 # 本文件是**现场值**：升级 / 重渲不动它（声明文件可随时被重渲，会动值）。
-# 键名由声明里的 `${VAR}` 决定（部署方可自定，如 GWLINKD_TRUST_BUNDLE）。
+# 键名由声明里的 `${VAR}` 决定 —— 本仓默认统一 `GWLINKD_*`（部署方可自定）。
 # 由 `wist-gwlinkd init-config` / 安装脚本按缺补齐（键不存在或值为空才写，非空一律保留）。
 
 # 上级控制中心地址（空 = 尚未接入）
-CENTER_ENDPOINT=
+GWLINKD_CENTER_ENDPOINT=
 
 # 本网关在中心侧的标识（须与中心实例名一致）
-GATEWAY_ID=gw-local
+GWLINKD_GATEWAY_ID=gw-local
 
 # 中心 CA-S 信任锚路径（自签中心必需；空 = 回落系统根）
-TRUST_BUNDLE=
+GWLINKD_TRUST_BUNDLE=
 "#;
 
 #[cfg(test)]
@@ -628,12 +632,27 @@ mod tests {
     fn default_pub_config_text_declares_the_site_keys_as_references() {
         // 骨架**只写引用**（不含现场值）—— 所以它可以随版本走、被重渲也动不到现场。
         let skeleton = default_pub_config_text();
-        assert!(skeleton.contains("${CENTER_ENDPOINT}"), "{skeleton}");
-        assert!(skeleton.contains("${LINK_TOKEN:-}"), "{skeleton}");
+        assert!(
+            skeleton.contains("${GWLINKD_CENTER_ENDPOINT}"),
+            "{skeleton}"
+        );
+        assert!(skeleton.contains("${GWLINKD_LINK_TOKEN:-}"), "{skeleton}");
         assert!(
             !skeleton.contains("https://"),
             "骨架不应含现场值：{skeleton}"
         );
+        // 与值骶架同一套变量名：两处叫法不同会出「死键」。
+        let env_skeleton = default_env_text();
+        for name in [
+            "GWLINKD_CENTER_ENDPOINT",
+            "GWLINKD_GATEWAY_ID",
+            "GWLINKD_TRUST_BUNDLE",
+        ] {
+            assert!(
+                skeleton.contains(&format!("${{{name}")) && env_skeleton.contains(name),
+                "{name} 必须在声明与值两份骶架里同名：{skeleton}\n{env_skeleton}"
+            );
+        }
 
         // 配上 `.env` 后能真正加载。
         let dir = temp_dir("pub-skeleton");
@@ -641,7 +660,7 @@ mod tests {
             &dir,
             "",
             Some(&skeleton),
-            Some("CENTER_ENDPOINT=https://c\nGATEWAY_ID=gw-s\n"),
+            Some("GWLINKD_CENTER_ENDPOINT=https://c\nGWLINKD_GATEWAY_ID=gw-s\n"),
         );
         let parsed = Config::load(&main).expect("骨架 + .env 必须可解析");
         assert_eq!(parsed.control_center_endpoint, "https://c");
