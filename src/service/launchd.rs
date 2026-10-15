@@ -38,6 +38,35 @@ pub fn log_dir(scope: ServiceScope) -> ServiceResult<PathBuf> {
     }
 }
 
+/// 把 stdio 落点交给**运行身份**（`system` + `--run-as` 才有意义）。
+///
+/// 为什么必须做：带 `UserName` 的 LaunchDaemon，launchd 会用**该用户**去打开 `StandardOutPath` /
+/// `StandardErrorPath`；而 `service install` 是经 `sudo` 以 **root** 跑的，`create_dir_all` 建出来的
+/// 目录是 `root:wheel`（0755）—— 用户写不了这两个文件，于是
+/// `posix_spawn` 直接失败：`Service could not initialize: posix_spawn(...) error 0xd - Permission denied`，
+/// 而且**应用日志永远是空的**（launchd 连文件都没建），现场极易误判成「配置/二进制不对」。
+///
+/// 一并处理**已存在**的 stdio 文件：老安装是由 root 建的（那时服务可能以 root 在跑），
+/// 打开「已存在但写不了」的文件一样 EACCES。
+pub(super) fn hand_log_dir_to_run_as(log_dir: &Path, spec: &ServiceSpec) -> ServiceResult<()> {
+    // user 作用域本就以本人运行，目录天然可写。
+    if spec.scope != ServiceScope::System {
+        return Ok(());
+    }
+    let Some(user) = spec.run_as.as_deref() else {
+        return Ok(());
+    };
+    let identity = super::resolve_user(user, spec.run_as_group.as_deref())?;
+    super::chown_path(log_dir, identity, "launchd 日志目录")?;
+    for name in [STDOUT_FILE, STDERR_FILE] {
+        let file = log_dir.join(name);
+        if file.exists() {
+            super::chown_path(&file, identity, "launchd stdio 文件")?;
+        }
+    }
+    Ok(())
+}
+
 /// 渲染 plist 文本。`log_dir_override` 为 `None` 时回退到作用域默认日志目录。
 pub fn plist_text(spec: &ServiceSpec, log_dir_override: Option<&Path>) -> String {
     let working_dir = match spec.scope {
@@ -110,6 +139,57 @@ pub fn plist_text(spec: &ServiceSpec, log_dir_override: Option<&Path>) -> String
     text
 }
 
+/// 从 plist 文本里读回落点（`ProgramArguments` 的首个 string + 两条环境变量）。
+///
+/// 只认本模块 [`plist_text`] 渲染出来的形状（唯一来源）—— 不做通用 plist 解析。
+pub(super) fn parse_definition(text: &str) -> super::DefinitionPaths {
+    let body = strip_xml_comments(text);
+    super::DefinitionPaths {
+        bin: plist_string_after_key(&body, "ProgramArguments"),
+        config_path: plist_string_after_key(&body, CONFIG_ENV),
+        pub_config: plist_string_after_key(&body, crate::config::PUB_CONFIG_ENV),
+    }
+}
+
+/// 去掉 `<!-- … -->` 段：手工改过的 plist 常把旧值注掉，注释里的键不该被当成真值。
+fn strip_xml_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end) => rest = &rest[start + end + "-->".len()..],
+            // 注释没闭合：后面都当注释（宁可读不到，也不要把半截注释当真值）。
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 取 `<key>KEY</key>` 之后**第一个** `<string>…</string>` 并做 XML 反转义（空值 ⇒ `None`）。
+///
+/// `ProgramArguments` 是个 `<array>`，它的首个 `<string>` 就是程序路径 —— 正好也适用
+/// （后面的 `--config-dir` 等参数不在首个，天然忽略）。
+fn plist_string_after_key(text: &str, key: &str) -> Option<PathBuf> {
+    let needle = format!("<key>{key}</key>");
+    let rest = &text[text.find(&needle)? + needle.len()..];
+    let rest = &rest[rest.find("<string>")? + "<string>".len()..];
+    let end = rest.find("</string>")?;
+    let value = unescape_xml(&rest[..end]);
+    (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
+/// [`escape_xml`] 的逆（只反渲染时用到的五个实体；`&amp;` 得放最后，否则会二次解码）。
+fn unescape_xml(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
 fn kv_string(key: &str, value: &str) -> String {
     format!(
         "  <key>{}</key>\n  <string>{}</string>\n",
@@ -140,6 +220,66 @@ mod tests {
     #[test]
     fn plist_escapes_xml_special_characters() {
         assert_eq!(escape_xml("a&b<c\"d"), "a&amp;b&lt;c&quot;d");
+    }
+
+    #[test]
+    fn parse_definition_round_trips_what_render_writes() {
+        // 路径刻意难缠：`&` / `<` / 引号（渲染会做 XML 转义）—— 解析必须原样还原。
+        let spec = ServiceSpec::new(
+            ServiceScope::System,
+            PathBuf::from("/opt/a&b/bin/wist-gwlinkd"),
+            PathBuf::from("/opt/<cf g>/gwlinkd.toml"),
+        )
+        .with_pub_config(Some(PathBuf::from("/opt/\"pub\"/gwlinkd-pub.toml")));
+
+        let paths = parse_definition(&plist_text(&spec, None));
+        assert_eq!(paths.bin, Some(PathBuf::from("/opt/a&b/bin/wist-gwlinkd")));
+        assert_eq!(
+            paths.config_path,
+            Some(PathBuf::from("/opt/<cf g>/gwlinkd.toml"))
+        );
+        assert_eq!(
+            paths.pub_config,
+            Some(PathBuf::from("/opt/\"pub\"/gwlinkd-pub.toml"))
+        );
+    }
+
+    #[test]
+    fn parse_definition_yields_nothing_when_keys_are_absent() {
+        let paths = parse_definition("<plist version=\"1.0\"><dict></dict></plist>");
+        assert_eq!(paths, crate::service::DefinitionPaths::default());
+    }
+
+    #[test]
+    fn parse_definition_ignores_comments_and_empty_strings() {
+        // 注掉的旧值（`<!-- … -->`）+ 空 `<string></string>`：两者都不能被当真值。
+        let text = concat!(
+            "<plist version=\"1.0\"><dict>\n",
+            "<!-- <key>WIST_GWLINKD_CONFIG</key><string>/old/gone.toml</string> -->\n",
+            "<key>WIST_GWLINKD_CONFIG</key>\n<string></string>\n",
+            "</dict></plist>"
+        );
+        assert_eq!(parse_definition(text).config_path, None);
+    }
+
+    #[test]
+    fn parse_definition_takes_only_the_first_argument() {
+        // 与 agentd 同形：程序后面可以跟参数（如 `--config-dir …`）—— 只取首个当 bin。
+        let text = concat!(
+            "<plist version=\"1.0\"><dict>\n",
+            "<key>ProgramArguments</key>\n<array>\n",
+            "<string>/usr/local/bin/wist-gwlinkd</string>\n",
+            "<string>run</string>\n",
+            "<string>--config-dir</string>\n",
+            "<string>/etc/wist-gwlinkd</string>\n",
+            "</array>\n</dict></plist>"
+        );
+        let paths = parse_definition(text);
+        assert_eq!(
+            paths.bin,
+            Some(PathBuf::from("/usr/local/bin/wist-gwlinkd"))
+        );
+        assert_eq!(paths.config_path, None);
     }
 
     #[test]

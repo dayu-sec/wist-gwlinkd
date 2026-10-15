@@ -202,6 +202,9 @@ fn validate_pem_certificate(path: &Path) -> ConfigResult<()> {
 /// 运行期凭据：损坏→FAIL，缺失→WARN（首跑），就位→看有效期。
 ///
 /// 读的是**身份目录**（`identity_dir`）：它才是不可再生的那对（证书 + 私钥）。
+///
+/// 缺失那条的建议**按现状给**：endpoint 还没配就先让配它；已配好就不再说这件事 ——
+/// `config.endpoint` 那条刚报过「已配置」，这里再让人去配只会把人带偏。
 fn credential_check(config: &Config) -> Check {
     match state::credential_status(config.identity_dir()) {
         CredentialStatus::Present(credential) => {
@@ -234,14 +237,20 @@ fn credential_check(config: &Config) -> Check {
                 )
             }
         }
-        CredentialStatus::Missing => Check::warn(
-            "credential.local",
-            "尚无客户端身份",
-            "首跑会走 link-upstream → register",
-        )
-        .with_hint(
-            "在 `gwlinkd-pub.toml` 配 `control_center_endpoint`，或走网关「链接上级」页提交接入链接（也可用 `link_token` + WIST_GWLINKD_LINK_TOKEN 离线预置）",
-        ),
+        CredentialStatus::Missing => {
+            let hint = if config.control_center_endpoint.trim().is_empty() {
+                "先在本机现场态（`gwlinkd-pub.toml` / 同目录 `.env`）配 `control_center_endpoint`，\
+                 再走网关「链接上级」页提交接入链接（也可用 `link_token` + WIST_GWLINKD_LINK_TOKEN 离线预置）"
+            } else {
+                "走网关「链接上级」页提交接入链接（也可用 `link_token` + WIST_GWLINKD_LINK_TOKEN 离线预置）"
+            };
+            Check::warn(
+                "credential.local",
+                "尚无客户端身份",
+                "首跑会走 link-upstream → register",
+            )
+            .with_hint(hint)
+        }
         CredentialStatus::Corrupt(detail) => Check::fail(
             "credential.local",
             "客户端身份损坏",
@@ -746,6 +755,37 @@ mod tests {
             status_of(&diagnose(&config(&dir)), "credential.local"),
             Status::Warn
         );
+    }
+
+    /// 缺失身份的建议不该让人去配**已经配好**的 endpoint（上一行刚报过「已配置」）。
+    #[test]
+    fn a_missing_credential_hint_skips_an_endpoint_that_is_already_configured() {
+        let dir = temp_dir("cred-hint-endpoint");
+        let report = diagnose(&config(&dir));
+        let hint = report
+            .find("credential.local")
+            .expect("check")
+            .hint
+            .clone()
+            .expect("hint");
+        assert!(!hint.contains("control_center_endpoint"), "{hint}");
+        assert!(hint.contains("链接上级"), "{hint}");
+    }
+
+    /// endpoint 真缺的时候，建议还是要先把它配上。
+    #[test]
+    fn a_missing_credential_hint_asks_for_the_endpoint_when_it_is_missing() {
+        let dir = temp_dir("cred-hint-no-endpoint");
+        let mut cfg = config(&dir);
+        cfg.control_center_endpoint = "  ".into();
+        let report = diagnose(&cfg);
+        let hint = report
+            .find("credential.local")
+            .expect("check")
+            .hint
+            .clone()
+            .expect("hint");
+        assert!(hint.contains("control_center_endpoint"), "{hint}");
     }
 
     /// 造一份就位的长期身份（落在**身份目录**）。

@@ -43,12 +43,15 @@ fn config_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(wist_gwlinkd::DEFAULT_CONFIG_PATH))
 }
 
-/// 解析**全局**选项 `--conf <path>` / `--pub <path>`（也接受 `--conf=<path>` / `--pub=<path>`），
-/// 把它们从参数里摘除；返回 `(conf, pub, 其余参数)`。
+/// 解析**全局**选项 `--conf <path>` / `--pub <path>`（短名 `-c` / `-p`；也接受
+/// `--conf=<path>` / `-c=<path>` 这类内联写法），把它们从参数里摘除；返回 `(conf, pub, 其余参数)`。
 ///
 /// 为什么要它：主配置 / 现场态声明的可加载路径原本只能靠环境变量（`WIST_GWLINKD_CONFIG` /
-/// `WIST_GWLINKD_PUB_CONFIG`）给。`--conf` / `--pub` 让手动跑（如 `diagnose`）不必先 export。
+/// `WIST_GWLINKD_PUB_CONFIG`）给。`-c` / `-p` / `--conf` / `--pub` 让手动跑（如 `diagnose`）不必先 export。
 /// 与 `service` 子命令自己的 `--config` / `--pub-config` 不冲突（名不同、语义不同：那是装服务时写进 unit 的）。
+///
+/// 短名收在这里而不是让子命令各自实现：写 `-c <path>` 却没人认识时，它会被静默当成普通参数丢掉，
+/// 于是配置回落到默认的 `./gwlinkd.toml`，报出来的是「读不到 gwlinkd.toml」—— 极易误判成配置坏了。
 fn parse_global_paths(args: &[String]) -> (Option<PathBuf>, Option<PathBuf>, Vec<String>) {
     let mut conf = None;
     let mut pub_path = None;
@@ -62,8 +65,8 @@ fn parse_global_paths(args: &[String]) -> (Option<PathBuf>, Option<PathBuf>, Vec
             None => (arg.as_str(), None),
         };
         let target = match flag {
-            "--conf" => Some(&mut conf),
-            "--pub" => Some(&mut pub_path),
+            "--conf" | "-c" => Some(&mut conf),
+            "--pub" | "-p" => Some(&mut pub_path),
             _ => None,
         };
         if let Some(slot) = target {
@@ -104,6 +107,36 @@ fn absolutize_from_cwd(path: PathBuf) -> PathBuf {
         .unwrap_or(path)
 }
 
+/// `--conf` 缺省时，为**只读**子命令回落到已装服务定义里的配置。
+///
+/// 为什么：gwlinkd 是 host 侧常驻，它跑的那份配置就写在服务定义里（两个环境变量），而路径长到
+/// 没人愿意敲两遍 —— 敲错的名字还会被静默丢掉、回落到 `./gwlinkd.toml`（2026-10-15 实际踩过）。
+/// 有它，`wist-gwlinkd diagnose` 单独就够。回落发生时**明说一句**（写 stderr，不污染报告）。
+fn fallback_to_installed_config() {
+    if std::env::var_os("WIST_GWLINKD_CONFIG").is_some() {
+        return;
+    }
+    let Some(installed) = service::any_installed_definition() else {
+        return;
+    };
+    let Some(config) = installed.paths.config_path else {
+        return;
+    };
+    if !config.is_file() {
+        return;
+    }
+    eprintln!(
+        "（未给 --conf/-c：回落已装服务定义 {} 的配置）",
+        installed.definition_path.display()
+    );
+    // SAFETY: 单进程启动期，此处先于任何线程读环境变量，无并发 reader。
+    unsafe { std::env::set_var("WIST_GWLINKD_CONFIG", &config) };
+    if let Some(pub_config) = installed.paths.pub_config {
+        // SAFETY: 同上。
+        unsafe { std::env::set_var("WIST_GWLINKD_PUB_CONFIG", pub_config) };
+    }
+}
+
 /// 按 `[log]` 段初始化运行日志（统一走共享 crate `wist-log`）。
 fn log_init(section: &wist_log::LogSection) {
     wist_log::init(
@@ -140,6 +173,11 @@ async fn main() -> ExitCode {
         unsafe { std::env::set_var("WIST_GWLINKD_PUB_CONFIG", absolutize_from_cwd(pub_path)) };
     }
     let command = rest.first().cloned().unwrap_or_else(|| "run".to_string());
+    // 只读子命令：没给 `--conf`（也没设环境变量）时，回落到**已装服务定义**里那份配置。
+    // 只给 `diagnose`：`run` 落到别的配置太隐晦；写类子命令（`service install|uninstall`）也不用。
+    if command == "diagnose" {
+        fallback_to_installed_config();
+    }
     match command.as_str() {
         "version" | "-V" | "--version" => {
             println!("wist-gwlinkd {}", wist_gwlinkd::VERSION);
@@ -240,7 +278,7 @@ fn init_config_command(out_arg: Option<String>) -> GwlinkdResult<()> {
         println!("已生成现场态值骨架：{}", env_path.display());
     }
     println!(
-        "下一步：填 {} 里的 CENTER_ENDPOINT（自签中心再填 TRUST_BUNDLE），然后 `wist-gwlinkd run`；",
+        "下一步：填 {} 里的 GWLINKD_CENTER_ENDPOINT（自签中心再填 GWLINKD_TRUST_BUNDLE），然后 `wist-gwlinkd run`；",
         env_path.display()
     );
     println!("       或走网关「链接上级」页提交接入链接 —— gwlinkd 会把值写回该文件。");
@@ -1731,6 +1769,22 @@ fn service_command(action: &str, rest: &[String]) -> GwlinkdResult<()> {
     if run_as_group.is_some() && run_as.is_none() {
         return Err(GwlinkdReason::InvalidArgs.err("--run-as-group 需要同时给 --run-as"));
     }
+    // `service status` 是只读的：`--bin` / `--config` / `--pub-config` 没给时，回落到**已装定义**里
+    // 那份，而不是 `/etc/wist-gwlinkd/gwlinkd.toml` 这类作用域默认值 —— 它报的才是「这个服务」的真相。
+    // 只落到 `status`：`install` 是写操作，不能拿旧定义当缺省去重写它自己。
+    if action == "status"
+        && let Some(installed) = service::installed_definition(scope)
+    {
+        if bin.is_none() {
+            bin = installed.paths.bin;
+        }
+        if config.is_none() {
+            config = installed.paths.config_path;
+        }
+        if pub_config.is_none() {
+            pub_config = installed.paths.pub_config;
+        }
+    }
     let bin = match bin {
         Some(bin) => bin,
         None => service::default_bin()?,
@@ -1910,6 +1964,28 @@ mod tests {
             rest,
             args(&["service", "install", "--config", "unit-conf.toml"])
         );
+    }
+
+    #[test]
+    fn parse_global_paths_accepts_short_aliases() {
+        // `-c` / `-p` 与 `--conf` / `--pub` 同义（写错了会被静默丢掉 → 回落默认配置，很难查）。
+        let (conf, pub_path, rest) =
+            parse_global_paths(&args(&["diagnose", "-c", "a.toml", "-p", "b.toml"]));
+        assert_eq!(conf, Some(PathBuf::from("a.toml")));
+        assert_eq!(pub_path, Some(PathBuf::from("b.toml")));
+        assert_eq!(rest, args(&["diagnose"]));
+
+        let (conf, pub_path, rest) =
+            parse_global_paths(&args(&["diagnose", "-c=a.toml", "-p=b.toml"]));
+        assert_eq!(conf, Some(PathBuf::from("a.toml")));
+        assert_eq!(pub_path, Some(PathBuf::from("b.toml")));
+        assert_eq!(rest, args(&["diagnose"]));
+
+        // 短名放在子命令**前**（与长名同一口径：前后都行）。
+        let (conf, pub_path, rest) = parse_global_paths(&args(&["-c", "a.toml", "version"]));
+        assert_eq!(conf, Some(PathBuf::from("a.toml")));
+        assert_eq!(pub_path, None);
+        assert_eq!(rest, args(&["version"]));
     }
 
     #[test]
@@ -2142,15 +2218,15 @@ mod tests {
         init_config_command(Some(path.display().to_string())).expect("init-config");
         // 开箱即可加载：声明里的 `${VAR}` 由一并生成的 `.env` 骶架提供（值可为空）。
         let config = Config::load(&path).expect("生成的配置必须可加载");
-        // `.env` 骶架里 GATEWAY_ID=gw-local（声明里的 `${GATEWAY_ID}` 取到它）。
+        // `.env` 骶架里 GWLINKD_GATEWAY_ID=gw-local（声明里的 `${GWLINKD_GATEWAY_ID}` 取到它）。
         assert_eq!(config.gateway_id, "gw-local");
         assert!(config.control_center_endpoint.is_empty(), "空 = 尚未接入");
-        // `:-` 默认值：骶架里没有 LINK_TOKEN 行 → 空（= 无券）。
+        // `:-` 默认值：骶架里没有 GWLINKD_LINK_TOKEN 行 → 空（= 无券）。
         assert!(config.link_token.as_deref().unwrap_or("").is_empty());
         // 声明 + 值两份都在，且声明**不含现场值**。
         let decl = std::fs::read_to_string(wist_gwlinkd::config::pub_config_path(&path))
             .expect("read declaration");
-        assert!(decl.contains("${CENTER_ENDPOINT}"), "{decl}");
+        assert!(decl.contains("${GWLINKD_CENTER_ENDPOINT}"), "{decl}");
         assert!(!decl.contains("https://"), "声明不应含现场值：{decl}");
         assert!(
             wist_gwlinkd::config::pub_env_path(&wist_gwlinkd::config::pub_config_path(&path))
@@ -2208,10 +2284,10 @@ mod tests {
         // 现场态声明：只写引用（与内置骶架同形）。
         std::fs::write(
             wist_gwlinkd::config::pub_config_path(&config_path),
-            "control_center_endpoint = \"${CENTER_ENDPOINT}\"\n\
-             gateway_id = \"${GATEWAY_ID}\"\n\
-             trust_bundle = \"${TRUST_BUNDLE:-}\"\n\
-             link_token = \"${LINK_TOKEN:-}\"\n",
+            "control_center_endpoint = \"${GWLINKD_CENTER_ENDPOINT}\"\n\
+             gateway_id = \"${GWLINKD_GATEWAY_ID}\"\n\
+             trust_bundle = \"${GWLINKD_TRUST_BUNDLE:-}\"\n\
+             link_token = \"${GWLINKD_LINK_TOKEN:-}\"\n",
         )
         .expect("write declaration");
 
@@ -2230,10 +2306,10 @@ mod tests {
             &config_path,
         ));
         let env_text = std::fs::read_to_string(&env_path).expect("read .env");
-        assert!(env_text.contains("GATEWAY_ID=gw-1"), "{env_text}");
-        assert!(env_text.contains("CENTER_ENDPOINT="), "{env_text}");
+        assert!(env_text.contains("GWLINKD_GATEWAY_ID=gw-1"), "{env_text}");
+        assert!(env_text.contains("GWLINKD_CENTER_ENDPOINT="), "{env_text}");
         assert!(
-            !env_text.contains("LINK_TOKEN="),
+            !env_text.contains("GWLINKD_LINK_TOKEN="),
             "一次性券应在接入成功后清掉：{env_text}"
         );
         assert!(wist_gwlinkd::state::load_credential(&dir).is_some());

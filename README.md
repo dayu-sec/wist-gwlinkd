@@ -31,10 +31,23 @@ wist-gwlinkd service uninstall --system # 停用并删定义
 wist-gwlinkd version
 ```
 
-**全局选项**（`--conf` / `--pub`，可放在子命令**前或后**）—— 手动指定配置落点，省去先 export 环境变量：
+**全局选项**（`--conf` / `--pub`，短名 `-c` / `-p`；可放在子命令**前或后**）—— 手动指定配置落点，省去先 export 环境变量：
 
-- `--conf <path>` / `--conf=<path>`：主配置（`gwlinkd.toml`），等价于 `WIST_GWLINKD_CONFIG`；
-- `--pub <path>` / `--pub=<path>`：现场态声明（`gwlinkd-pub.toml`），等价于 `WIST_GWLINKD_PUB_CONFIG`。
+- `--conf <path>` / `-c <path>`（也接受 `=` 内联写法）：主配置（`gwlinkd.toml`），等价于 `WIST_GWLINKD_CONFIG`；
+- `--pub <path>` / `-p <path>`（同上）：现场态声明（`gwlinkd-pub.toml`），等价于 `WIST_GWLINKD_PUB_CONFIG`。
+
+> 别写成没定义的名字（如 `-C`）：**认不出的参数会被静默当作普通参数丢掉**，配置就回落到当前目录的
+> `./gwlinkd.toml`，报出来的是「读取配置失败 gwlinkd.toml」—— 看着像配置坏了，其实是指错了选项。
+
+**不给 `--conf` 时的回落（只读子命令）**：`diagnose` 与 `service status` 会读**已装的服务定义**
+（launchd plist / systemd unit 里的 `ProgramArguments` 与 `WIST_GWLINKD_(PUB_)CONFIG`），直接用那份：
+
+- 于是 `wist-gwlinkd diagnose` 单独跑就够 —— 不必把 `/Users/…/configs/gwlinkd/gwlinkd.toml` 这种
+  超长路径敲两遍（敲错还会被静默丢掉）；
+- `service status` 也报的是「**这个服务**」的真相（bin / config / state），而不是 `default_config_path`
+  那类作用域默认值；
+- 回落发生时向 **stderr** 明说一句（不污染 `diagnose` 的 stdout 报告）；
+- `run` 与写类子命令（`service install` / `uninstall`）**不做**这个回落（行为太隐晦 / 不能拿旧定义当缺省去重写它自己）。
 
 相对路径**按当前工作目录**解析（现场态声明可能尚不存在，故不做 `canonicalize`）。例：
 
@@ -125,7 +138,7 @@ binary = "gx"
 ```
 
 环境变量：`WIST_GWLINKD_CONFIG`（配置文件路径）、`WIST_GWLINKD_LINK_TOKEN`（首跑置备用的一次性接入 token）。
-也可以用命令行全局选项 `--conf <path>` / `--pub <path>` 代替前两者的**路径**部分（见上文「用法」）。
+也可以用命令行全局选项 `--conf <path>` / `-c <path>` / `--pub <path>` / `-p <path>` 代替前两者的**路径**部分（见上文「用法」）。
 
 升级由常驻周期从中心 `GET /api/v1/gateway/upgrade-plan` 拉 desired 驱动（按 `plan_id` 幂等，游标落盘跨重启）。
 执行器经 [**适配层**](src/executor.rs) 调用（`gops` 只是其中一个 impl）：驱动只认「构造调用 + 归一化结局」。
