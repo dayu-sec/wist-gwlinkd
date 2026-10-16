@@ -310,7 +310,7 @@ fn leftover_link_token_check(config: &Config) -> Check {
 
 /// 自述面 endpoint：**空串等同未配置**。
 ///
-/// 现场态 `.env` 里写 `GWLINKD_SELF_ENDPOINT=`（有键无值）会让 `Option<String>` 成 `Some("")`；
+/// 配置里把它写成空串（`gateway_self_endpoint = ""` —— 模板没做非空判断、或手改过渲染产物）时，
 /// 若照原样当「已配置」，新检查会拿空串拼出相对 URL 去探测，报一条「TCP/TLS 失败」的 FAIL
 /// —— 与真因（根本没配）无关。故统一在这里收口：trim 后为空即视为未配。
 fn configured_self_endpoint(config: &Config) -> Option<&str> {
