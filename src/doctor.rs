@@ -98,7 +98,7 @@ impl Report {
     }
 }
 
-/// 运行全部检查：配置 → 信任锚 → 凭据 → 自述面 → 执行器 → 升级态 → 中心可达。
+/// 运行全部检查：配置 → 信任锚 → 凭据 → 自述面（含**环回可达**）→ 执行器 → 升级态 → 中心可达。
 pub fn diagnose(config: &Config) -> Report {
     let checks = vec![
         config_check(config),
@@ -108,6 +108,7 @@ pub fn diagnose(config: &Config) -> Report {
         regist_token_check(config),
         self_endpoint_check(config),
         self_ca_check(config),
+        self_reachable_check(config),
         upgrader_check(config),
         upgrade_project_check(config),
         upgrade_check(config),
@@ -307,9 +308,22 @@ fn leftover_link_token_check(config: &Config) -> Check {
     }
 }
 
+/// 自述面 endpoint：**空串等同未配置**。
+///
+/// 现场态 `.env` 里写 `GWLINKD_SELF_ENDPOINT=`（有键无值）会让 `Option<String>` 成 `Some("")`；
+/// 若照原样当「已配置」，新检查会拿空串拼出相对 URL 去探测，报一条「TCP/TLS 失败」的 FAIL
+/// —— 与真因（根本没配）无关。故统一在这里收口：trim 后为空即视为未配。
+fn configured_self_endpoint(config: &Config) -> Option<&str> {
+    config
+        .gateway_self_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+}
+
 /// 自述面：未配→健康度恒为 unknown（WARN）；配了→OK。
 fn self_endpoint_check(config: &Config) -> Check {
-    match config.gateway_self_endpoint.as_deref() {
+    match configured_self_endpoint(config) {
         Some(endpoint) => Check::ok("self.endpoint", "已配置网关自述面", endpoint),
         None => Check::warn(
             "self.endpoint",
@@ -347,6 +361,106 @@ fn self_ca_check(config: &Config) -> Check {
             "换成合法的 PEM 证书文件",
         ),
     }
+}
+
+/// 环回面可达：本机 gwlinkd **够不够得到本机网关**（`self-state` / `link-request` /
+/// `linkd-status` / `agent-package` 共用同一个入口与信任锚）。
+///
+/// 为什么单列一条：`self.endpoint` / `self.ca` 只证明「配了、文件在」，**不证明连通** —— 而环回面
+/// 在**容器部署**下可能把宿主自己的连接判成「外来」而全线 403（网关 < v0.11.0；见
+/// `wist-design/doc/design/edge/gateway-status-report.md` §4）。那种故障的症状（心跳推不上去、
+/// 页面报「未检测到 gwlinkd 心跳」、接入不了）看着像「中心配错」，其实卡在本机这一跳。
+fn self_reachable_check(config: &Config) -> Check {
+    let Some(endpoint) = configured_self_endpoint(config) else {
+        // 没配自述面：本机这一跳不做（`self.endpoint` 已单独给 WARN），不是红。
+        return Check::ok(
+            "self.reachable",
+            "未配置网关自述面（跳过探测）",
+            "gateway_self_endpoint 为空",
+        );
+    };
+    // 同 `center.reachable`：阻塞客户端**建/用/毁都放专用线程**，只把纯数据带回来。
+    let probe = {
+        let endpoint = endpoint.to_string();
+        let trust = config.gateway_self_ca.clone();
+        let gateway_id = config.gateway_id.clone();
+        std::thread::spawn(move || probe_self(&endpoint, trust.as_deref(), &gateway_id))
+            .join()
+            .unwrap_or_else(|_| Probe::Transport("探测线程 panic".to_string()))
+    };
+    match probe {
+        Probe::Response { status, .. } if (200..300).contains(&status) => Check::ok(
+            "self.reachable",
+            "网关环回面可达",
+            format!("{endpoint}（HTTP {status}）"),
+        ),
+        // 403 **且**带着环回护栏的 code：自述面无鉴权，这说明「环回面**认不出本机**」
+        // （容器部署下宿主那一跳）—— 正是本次真故障。
+        // 为什么还要看 body：403 也可能来自前置代理 / 别的层，那种情形不能照抄这条结论。
+        // （body 已按**展示**需要截断到 200 字符；`code` 在错误信封最前面，稳定落在窗口内。）
+        Probe::Response { status, body } if status == 403 && body.contains("loopback_only") => {
+            Check::fail(
+                "self.reachable",
+                "网关环回面拒绝了本机（把它判成了「外来」）",
+                format!("HTTP {status}: {body}"),
+                "容器部署需网关 ≥ v0.11.0（本机 = 环回 ∪ 容器默认网关）；核对网关启动日志 `event=LocalHostPeers`，\
+                 必要时用 `[server] self_face_allow` 兑底",
+            )
+        }
+        // 400 + 「缺 gateway_id」：自述面过了环回那关才校验该参数 —— 说明**本机这一跳是通的**，
+        // 是本机 `gateway_id` 为空（首跑置备阶段可能如此）。结论要指向本机配置，
+        // 而不是泛化成「网关返回非预期状态」（那样无从下手）。
+        Probe::Response { status, body }
+            if status == 400 && body.contains("self_state_missing_gateway_id") =>
+        {
+            Check::warn(
+                "self.reachable",
+                "网关环回面可达，但本机未提供 gateway_id",
+                format!("HTTP {status}: {body}"),
+            )
+            .with_hint(
+                "配本机 `gateway_id`（gwlinkd.toml，或现场态 `.env` 里的 `GWLINKD_GATEWAY_ID`）；\
+                 自述面 / 状态上报都以它认人",
+            )
+        }
+        Probe::Response { status, body } => {
+            let detail = if body.is_empty() {
+                format!("HTTP {status}")
+            } else {
+                format!("HTTP {status}: {body}")
+            };
+            Check::warn("self.reachable", "网关环回面可达但返回非预期状态", detail).with_hint(
+                "确认 gateway_self_endpoint 指到网关、网关版本与期望一致；401/403 若不是环回护栏，\
+                            看 detail 里的 code（可能中间有代理）",
+            )
+        }
+        Probe::ClientBuild(reason) => Check::fail(
+            "self.reachable",
+            "无法构造环回探测客户端",
+            reason,
+            "检查 gateway_self_ca（PEM 信任锚）",
+        ),
+        Probe::Transport(reason) => Check::fail(
+            "self.reachable",
+            "网关环回面不可达（TCP/TLS 失败）",
+            format!("{endpoint}: {reason}"),
+            "核对 gateway_self_endpoint（地址 / 端口 / scheme）与 gateway_self_ca（自签网关必需）",
+        ),
+    }
+}
+
+/// 在**专用线程**里做一次阻塞探测：带环回信任锚，**不带客户端身份**
+/// （自述面只看来源是不是本机，不需要凭据）。
+fn probe_self(endpoint: &str, trust: Option<&Path>, gateway_id: &str) -> Probe {
+    let client = match probe_client(trust, None) {
+        Ok(client) => client,
+        Err(probe) => return probe,
+    };
+    let url = format!(
+        "{}/api/v1/gateway/self-state",
+        endpoint.trim_end_matches('/')
+    );
+    probe_get(&client, url, gateway_id)
 }
 
 /// 升级执行器：能在 PATH / 给定路径解析到才算 OK（否则真升级必失败）。
@@ -611,38 +725,47 @@ fn reachability_check(config: &Config) -> Check {
     }
 }
 
-/// 在**专用线程**里做一次阻塞探测：带信任锚（自签中心必需）与客户端身份（有凭据时），
+/// 在**专用线程**里做一次阻塞探测：带信任锚（自签必需）与客户端身份（有凭据时），
 /// 打一次需要客户端证书的 GET。
 fn probe_once(endpoint: &str, trust: &Path, identity_pem: Option<&str>, gateway_id: &str) -> Probe {
-    let mut builder = reqwest::blocking::Client::builder().timeout(PROBE_TIMEOUT);
-    if trust.exists() {
-        let pem = match std::fs::read(trust) {
-            Ok(pem) => pem,
-            Err(err) => {
-                return Probe::ClientBuild(format!("读取信任锚 {} 失败: {err}", trust.display()));
-            }
-        };
-        match reqwest::Certificate::from_pem(&pem) {
-            Ok(cert) => builder = builder.add_root_certificate(cert),
-            Err(err) => {
-                return Probe::ClientBuild(format!("解析信任锚 {} 失败: {err}", trust.display()));
-            }
-        }
-    }
-    if let Some(pem) = identity_pem {
-        match reqwest::Identity::from_pem(pem.as_bytes()) {
-            Ok(identity) => builder = builder.identity(identity),
-            Err(err) => return Probe::ClientBuild(format!("加载客户端证书/私钥失败: {err}")),
-        }
-    }
-    let client = match builder.build() {
+    let client = match probe_client(Some(trust), identity_pem) {
         Ok(client) => client,
-        Err(err) => return Probe::ClientBuild(format!("建探测客户端失败: {err}")),
+        Err(probe) => return probe,
     };
     let url = format!(
         "{}/api/v1/gateway/upgrade-plan",
         endpoint.trim_end_matches('/')
     );
+    probe_get(&client, url, gateway_id)
+}
+
+/// 建阻塞探测客户端：信任锚（**存在才加** —— 没有就回落系统根）+ 可选客户端身份。
+fn probe_client(
+    trust: Option<&Path>,
+    identity_pem: Option<&str>,
+) -> Result<reqwest::blocking::Client, Probe> {
+    let mut builder = reqwest::blocking::Client::builder().timeout(PROBE_TIMEOUT);
+    if let Some(path) = trust.filter(|path| path.exists()) {
+        let pem = std::fs::read(path).map_err(|err| {
+            Probe::ClientBuild(format!("读取信任锚 {} 失败: {err}", path.display()))
+        })?;
+        let cert = reqwest::Certificate::from_pem(&pem).map_err(|err| {
+            Probe::ClientBuild(format!("解析信任锚 {} 失败: {err}", path.display()))
+        })?;
+        builder = builder.add_root_certificate(cert);
+    }
+    if let Some(pem) = identity_pem {
+        let identity = reqwest::Identity::from_pem(pem.as_bytes())
+            .map_err(|err| Probe::ClientBuild(format!("加载客户端证书/私钥失败: {err}")))?;
+        builder = builder.identity(identity);
+    }
+    builder
+        .build()
+        .map_err(|err| Probe::ClientBuild(format!("建探测客户端失败: {err}")))
+}
+
+/// 打一次 GET（带 `gateway_id` 查询），把响应/传输失败归一成 [`Probe`]。
+fn probe_get(client: &reqwest::blocking::Client, url: String, gateway_id: &str) -> Probe {
     match client.get(url).query(&[("gateway_id", gateway_id)]).send() {
         Ok(response) => {
             let status = response.status().as_u16();
@@ -1028,19 +1151,31 @@ mod tests {
     /// 起一个一次性 TCP 服务：accept 后回一段**原始字节**。
     ///
     /// 用它能造两种场景：真 HTTP 200（可达）、或往 TLS 端口回明文（复刻 `InvalidContentType`）。
-    fn one_shot_raw_server(reply: &'static [u8]) -> std::net::SocketAddr {
+    fn one_shot_raw_server(reply: impl AsRef<[u8]> + Send + 'static) -> std::net::SocketAddr {
         use std::io::{Read, Write};
+        let reply = reply.as_ref().to_vec();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf); // 读走 ClientHello / 请求，再回
-                let _ = stream.write_all(reply);
+                let _ = stream.write_all(&reply);
                 let _ = stream.flush();
             }
         });
         addr
+    }
+
+    /// 造一份 HTTP/1.1 响应。`content-length` **按实际 body 字节数算** ——
+    /// 手写错（长短不一）会让 reqwest 读到 EOF 报错，测试就变成在测别的分支了。
+    fn raw_http_response(status_line: &str, content_type: Option<&str>, body: &str) -> Vec<u8> {
+        let mut out = format!("HTTP/1.1 {status_line}\r\n");
+        if let Some(content_type) = content_type {
+            out.push_str(&format!("content-type: {content_type}\r\n"));
+        }
+        out.push_str(&format!("content-length: {}\r\n\r\n{body}", body.len()));
+        out.into_bytes()
     }
 
     #[test]
@@ -1088,6 +1223,164 @@ mod tests {
         let mut cfg = config(&dir);
         cfg.control_center_endpoint = format!("http://{addr}");
         assert_eq!(status_of(&diagnose(&cfg), "center.reachable"), Status::Warn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ── 网关环回面可达（容器部署下「宿主判成外来」的眞故障） ──
+
+    /// 环回面可达：自述面 200 → OK。
+    #[test]
+    fn a_reachable_gateway_loopback_face_is_ok() {
+        let dir = temp_dir("self-reach");
+        let addr = one_shot_raw_server(raw_http_response("200 OK", None, "{}"));
+        let mut cfg = config(&dir);
+        cfg.gateway_self_endpoint = Some(format!("http://{addr}"));
+        assert_eq!(status_of(&diagnose(&cfg), "self.reachable"), Status::Ok);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// **本次线上故障的复刻**：环回面把宿主判成「外来」而 403 —— 必须 FAIL，且提示要能**照做**
+    /// （不只是「环回面拒绝」，而是「容器部署需网关 ≥ v0.11.0」）。
+    #[test]
+    fn a_loopback_only_rejection_is_a_failure_with_an_actionable_hint() {
+        let dir = temp_dir("self-reach-403");
+        let addr = one_shot_raw_server(raw_http_response(
+            "403 Forbidden",
+            Some("application/json"),
+            r#"{"error":{"code":"self_state_loopback_only","message":"self-state is loopback-only"}}"#,
+        ));
+        let mut cfg = config(&dir);
+        cfg.gateway_self_endpoint = Some(format!("http://{addr}"));
+        let report = diagnose(&cfg);
+        let check = report.find("self.reachable").expect("check present");
+        assert_eq!(check.status, Status::Fail, "{check:?}");
+        let hint = check.hint.clone().unwrap_or_default();
+        assert!(hint.contains("v0.11.0"), "{hint}");
+        assert!(hint.contains("LocalHostPeers"), "{hint}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 端口不可达（网关挂了 / 地址写错）→ FAIL。
+    #[test]
+    fn a_refused_gateway_loopback_port_fails() {
+        let dir = temp_dir("self-reach-refused");
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr");
+        let mut cfg = config(&dir);
+        cfg.gateway_self_endpoint = Some(format!("http://{addr}"));
+        assert_eq!(status_of(&diagnose(&cfg), "self.reachable"), Status::Fail);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 没配自述面就**不探**（`self.endpoint` 已经单独给 WARN），不是红。
+    #[test]
+    fn an_unset_self_endpoint_skips_the_probe() {
+        let dir = temp_dir("self-reach-unset");
+        let cfg = config(&dir);
+        assert!(cfg.gateway_self_endpoint.is_none(), "夹具前提");
+        assert_eq!(status_of(&diagnose(&cfg), "self.reachable"), Status::Ok);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// **空串**等同未配置：别把它当「已配置」（否则会拿空串拼出相对 URL，报一条与本意无关的失败）。
+    #[test]
+    fn a_blank_self_endpoint_is_treated_as_unset() {
+        let dir = temp_dir("self-reach-blank");
+        let mut cfg = config(&dir);
+        cfg.gateway_self_endpoint = Some("   ".into());
+        let report = diagnose(&cfg);
+        assert_eq!(status_of(&report, "self.endpoint"), Status::Warn);
+        assert_eq!(status_of(&report, "self.reachable"), Status::Ok);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 403 也**可能来自前置代理 / 别的层** —— 那种 403 不带环回护栏的 code，
+    /// 不能照抄「容器部署需网关 ≥ v0.11.0」那条结论，只判 WARN。
+    #[test]
+    fn a_foreign_403_without_the_loopback_marker_is_only_a_warning() {
+        let dir = temp_dir("self-reach-403-proxy");
+        let addr = one_shot_raw_server(raw_http_response(
+            "403 Forbidden",
+            Some("application/json"),
+            r#"{"error":{"code":"forbidden","message":"blocked by proxy"}}"#,
+        ));
+        let mut cfg = config(&dir);
+        cfg.gateway_self_endpoint = Some(format!("http://{addr}"));
+        let report = diagnose(&cfg);
+        let check = report.find("self.reachable").expect("check present");
+        assert_eq!(check.status, Status::Warn, "{check:?}");
+        let hint = check.hint.clone().unwrap_or_default();
+        assert!(!hint.contains("v0.11.0"), "普通 403 不该赖网关版本：{hint}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 本机 `gateway_id` 为空：网关自述面过环回那关后才回 400（`self_state_missing_gateway_id`）
+    /// —— 结论要指向**本机配置**。
+    #[test]
+    fn a_missing_gateway_id_rejection_points_at_the_local_config() {
+        let dir = temp_dir("self-reach-no-gateway-id");
+        let addr = one_shot_raw_server(raw_http_response(
+            "400 Bad Request",
+            Some("application/json"),
+            r#"{"error":{"code":"self_state_missing_gateway_id","message":"missing gateway_id"}}"#,
+        ));
+        let mut cfg = config(&dir);
+        cfg.gateway_id = String::new();
+        cfg.gateway_self_endpoint = Some(format!("http://{addr}"));
+        let report = diagnose(&cfg);
+        let check = report.find("self.reachable").expect("check present");
+        assert_eq!(check.status, Status::Warn, "{check:?}");
+        let hint = check.hint.clone().unwrap_or_default();
+        assert!(hint.contains("gateway_id"), "{hint}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `https://` 打**明文**端口（scheme 不匹配）→ FAIL（不是「TCP 连上了就 OK」）。
+    #[test]
+    fn an_https_self_endpoint_against_a_plaintext_port_fails() {
+        let dir = temp_dir("self-reach-tls");
+        let addr = one_shot_raw_server(raw_http_response("400 Bad Request", None, ""));
+        let mut cfg = config(&dir);
+        cfg.gateway_self_endpoint = Some(format!("https://{addr}"));
+        assert_eq!(status_of(&diagnose(&cfg), "self.reachable"), Status::Fail);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 环回信任锚**存在但读不了** → FAIL（构造探测客户端就失败），且 hint 要指向该项。
+    ///
+    /// 为什么用「目录」而不是 `chmod 000`：`Certificate::from_pem` 对垃圾内容是**容忍**的
+    /// （返回 Ok、拿去探测照样 200），拿它造不出这个分支；而权限位对 root 无效（CI 可能是 root）。
+    /// 路径存在、`fs::read` 必失败（EISDIR）—— 平台无关且不怕 root。
+    #[test]
+    fn an_unreadable_self_trust_anchor_fails_the_probe() {
+        let dir = temp_dir("self-reach-bad-ca");
+        let ca = dir.join("ca-as-dir");
+        std::fs::create_dir(&ca).expect("mkdir ca");
+        let addr = one_shot_raw_server(raw_http_response("200 OK", None, "{}"));
+        let mut cfg = config(&dir);
+        cfg.gateway_self_endpoint = Some(format!("http://{addr}"));
+        cfg.gateway_self_ca = Some(ca);
+        let report = diagnose(&cfg);
+        let check = report.find("self.reachable").expect("check present");
+        assert_eq!(check.status, Status::Fail, "{check:?}");
+        let hint = check.hint.clone().unwrap_or_default();
+        assert!(hint.contains("gateway_self_ca"), "{hint}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 2xx 都算可达（这里 204 无 body）—— 判据是**区间**，不是「恰好 200」。
+    #[test]
+    fn any_2xx_from_the_gateway_loopback_face_counts_as_reachable() {
+        let dir = temp_dir("self-reach-204");
+        let addr = one_shot_raw_server(raw_http_response("204 No Content", None, ""));
+        let mut cfg = config(&dir);
+        cfg.gateway_self_endpoint = Some(format!("http://{addr}"));
+        let report = diagnose(&cfg);
+        let check = report.find("self.reachable").expect("check present");
+        assert_eq!(check.status, Status::Ok, "{check:?}");
+        assert!(check.detail.contains("204"), "{:?}", check.detail);
         let _ = std::fs::remove_dir_all(dir);
     }
 
