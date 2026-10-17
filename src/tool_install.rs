@@ -131,6 +131,28 @@ impl ToolInstaller {
         expected_sha256: Option<&str>,
     ) -> UpgradeResult<String> {
         let (binary, existing) = self.preflight(component)?;
+        self.install_to(component, &binary, &existing, artifact, expected_sha256)
+            .await
+    }
+
+    /// 同 [`Self::install_with_digest`]，但目标由**调用方指定**（自更新用：目标是本进程真身）。
+    ///
+    /// 取件 / 摘要 / 架构 / 原子替换与工具路径完全同一套；区别只在于**不查组件目录** ——
+    /// 自更新覆盖的是“自己”，而组件目录解决的是“PATH 上的某个工具”。
+    pub async fn install_to(
+        &self,
+        component: &str,
+        binary: &str,
+        existing: &Path,
+        artifact: &str,
+        expected_sha256: Option<&str>,
+    ) -> UpgradeResult<String> {
+        if !existing.is_file() {
+            return Err(UpgradeReason::Preflight.err(format!(
+                "组件 {component} 的自更新目标不存在或不是文件：{}",
+                existing.display()
+            )));
+        }
 
         // 取件来源必须是可取形态：本机**绝对路径**或 `http(s)://` URL。中心没派制品地址时
         // 驱动会退化成裸版本串（`v0.16.1-alpha`），那会被当 URL 解析而失败 —— 提前报可读错。
@@ -149,7 +171,7 @@ impl ToolInstaller {
                 })?;
 
         // **摘要校验**：解包覆盖前先核 —— 不符的字节绝不能拿去覆盖本机工具。
-        let sha_note = verify_expected_digest(&bytes, artifact, expected_sha256, &binary)?;
+        let sha_note = verify_expected_digest(&bytes, artifact, expected_sha256, binary)?;
 
         // **架构护栏**：解包覆盖前先核 —— 错架构的二进制覆盖上去不会报错，只会让工具静默报废。
         // 只在「确实是 tar.gz」时核；不是 tar.gz 交给下面解包报「解包失败」。
@@ -187,6 +209,9 @@ impl ToolInstaller {
             std::process::id(),
             now_stamp(),
         ));
+        // `spawn_blocking` 要求 'static：把目标与备份路径转成 owned。
+        let binary = binary.to_string();
+        let existing = existing.to_path_buf();
         // 解包 / 备份 / 覆盖都是**阻塞**文件操作，搬到 blocking 线程，别占住 async worker。
         let detail = tokio::task::spawn_blocking(move || {
             let result = replace_binary(&bytes, &staging, &binary, &existing, &backup_dir);
@@ -600,6 +625,26 @@ mod tests {
         assert!(blank.preflight("galaxy-ops").is_err());
         assert!(installer.handles("galaxy-ops"));
         assert!(!installer.handles("galaxy-flow"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn install_to_rejects_a_missing_target_before_fetching() {
+        use std::collections::BTreeMap;
+
+        let dir = temp_dir("install-to-missing");
+        let tools = ToolInstaller::new(BTreeMap::new(), &dir, reqwest::Client::new());
+        let err = tools
+            .install_to(
+                "wist-gwlinkd",
+                "wist-gwlinkd",
+                &dir.join("missing-binary"),
+                "https://example.invalid/wist-gwlinkd.tar.gz",
+                None,
+            )
+            .await
+            .expect_err("missing target must fail before any fetch");
+        assert!(err.contains("自更新目标不存在"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

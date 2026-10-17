@@ -7,9 +7,10 @@
 //! 「构造调用 + 归一化结局」。**成功要佐证**：执行器报成后，再用网关**自述面**独立确认
 //! 「网关确实回来了且健康」——只信执行器一面之词会让 `done` 可能是假的。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncReadExt;
@@ -35,15 +36,48 @@ pub const RECOVERY_VERIFY_TIMEOUT: Duration = Duration::from_secs(300);
 /// 佐证轮询间隔。
 const RECOVERY_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-/// 升级回执的投递方（中心客户端 + 状态目录 + 自述面）。
+/// 本进程自身的组件名（与中心发布的 release `component` 对齐）。
+///
+/// 升级计划里出现它时**不走组件目录、也不走 gops**：覆盖的目标就是本进程自己，
+/// 覆盖成功后由服务管理器拉起（systemd `Restart=always` / launchd `KeepAlive`）。
+pub const SELF_COMPONENT: &str = "wist-gwlinkd";
+
+/// 升级回执的投递方（中心客户端 + 状态/身份目录 + 自述面）。
 ///
 /// **不**捕获凭据快照：升级可能跨越一次 `renew`（旧证书立即失效），回执时**现读**最新凭据。
 #[derive(Debug, Clone)]
 pub struct UpgradeReporter {
     pub client: CenterClient,
+    /// 升级簿记（记录 / 游标 / 心跳）所在目录。
     pub state_dir: PathBuf,
+    /// 长期身份（客户端证书）所在目录。
+    ///
+    /// 与 `state_dir` **可能不同**（网关栈的 `identity/gwlinkd` vs `configs/gwlinkd/state`）：
+    /// 回执要现读凭据，读错目录会让回执被静默跳过。
+    pub identity_dir: PathBuf,
     /// 网关自述面客户端（来自 `gateway_self_endpoint`）；**有它才能对「成功」做独立佐证**。
     pub self_client: Option<SelfReportClient>,
+}
+
+/// 自更新前置：本进程**确实由服务定义托管**，且定义里的二进制就是当前进程。
+///
+/// 两个条件缺一不可：覆盖成功后进程会退出并**指望服务管理器把它拉起来**；
+/// 手动跑的进程退出了就再也没有下文。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfUpdateTarget {
+    /// 服务定义里登记的二进制路径（可能是符号链接）。
+    pub service_bin: PathBuf,
+    /// 当前进程的可执行文件（用于确认真的是同一个目标）。
+    pub running_exe: PathBuf,
+}
+
+impl SelfUpdateTarget {
+    pub fn new(service_bin: impl Into<PathBuf>, running_exe: impl Into<PathBuf>) -> Self {
+        Self {
+            service_bin: service_bin.into(),
+            running_exe: running_exe.into(),
+        }
+    }
 }
 
 /// 升级驱动：把一次「升到某版本」交给执行器，并在状态目录记账 + 心跳。
@@ -57,6 +91,10 @@ pub struct UpgradeDriver {
     pub verify_timeout: Duration,
     /// **无状态工具**的进程内安装器：目录里标了 `tool-copy` 的组件走它（不经 gops）。缺省无。
     pub tools: Option<Arc<ToolInstaller>>,
+    /// 自更新目标：`Some` 才允许驱动 `wist-gwlinkd` 自己的升级。
+    pub self_update: Option<SelfUpdateTarget>,
+    /// 自更新已落盘、等主循环退出后由服务管理器拉起（主循环取一次就清）。
+    restart_requested: Arc<AtomicBool>,
 }
 
 impl UpgradeDriver {
@@ -67,6 +105,8 @@ impl UpgradeDriver {
             state_dir: state_dir.into(),
             verify_timeout: RECOVERY_VERIFY_TIMEOUT,
             tools: None,
+            self_update: None,
+            restart_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -82,8 +122,23 @@ impl UpgradeDriver {
         self
     }
 
-    /// 驱动一次升级：按**组件目录**判机制 —— 标了 `tool-copy` 的组件走
-    /// [`Self::start_tool`]（进程内装无状态工具），其余走 [`Self::start_gops`]（gops 执行器）。
+    /// 声明自更新目标（服务定义里的二进制 + 当前进程）。
+    ///
+    /// 没设它时，升级计划里的 `wist-gwlinkd` 会**前置失败**：自更新必须能靠服务管理器拉起，
+    /// 手动跑的进程退出后没人再拉起它。
+    pub fn with_self_update_target(mut self, target: SelfUpdateTarget) -> Self {
+        self.self_update = Some(target);
+        self
+    }
+
+    /// 取一次「自更新已落盘、请退出让服务管理器拉起」的标记（取后清零）。
+    pub fn take_restart_requested(&self) -> bool {
+        self.restart_requested.swap(false, Ordering::SeqCst)
+    }
+
+    /// 驱动一次升级：按**组件**判机制 —— 自身（[`SELF_COMPONENT`]）走自更新，
+    /// 标了 `tool-copy` 的组件走 [`Self::start_tool`]（进程内装无状态工具），
+    /// 其余走 [`Self::start_gops`]（gops 执行器）。
     ///
     /// 不额外声明期望摘要：无状态工具路径会从**内容寻址的制品名**（`pkg-<hex16>`）自推前缀校验。
     pub async fn start(
@@ -109,7 +164,7 @@ impl UpgradeDriver {
 
     /// 同 [`Self::start`]，但额外带**中心契约的期望摘要**（`artifact_sha256`）。
     ///
-    /// gops 路径忽略它（执行器自己取件自验）；无状态工具路径用它该校 `tool-copy` 取的制品。
+    /// gops 路径忽略它（执行器自己取件自验）；copy / 自更新路径用它该校取的制品。
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_digest(
         &self,
@@ -121,6 +176,18 @@ impl UpgradeDriver {
         artifact_url: Option<&str>,
         expected_sha256: Option<&str>,
     ) -> UpgradeResult<()> {
+        if component == Some(SELF_COMPONENT) {
+            return self
+                .start_self_update(
+                    work_id,
+                    from_version,
+                    to_version,
+                    reporter,
+                    artifact_url,
+                    expected_sha256,
+                )
+                .await;
+        }
         if let (Some(tools), Some(component)) = (self.tools.as_ref(), component)
             && tools.handles(component)
         {
@@ -145,6 +212,195 @@ impl UpgradeDriver {
             artifact_url,
         )
         .await
+    }
+
+    /// 驱动一次**自更新**：把中心发布的 `wist-gwlinkd` 制品**就地覆盖到本进程自己**。
+    ///
+    /// 与 [`Self::start_tool`] 的差别：
+    /// - **覆盖目标**是服务定义里的二进制（经符号链接解析到真身），不是 `PATH` 上的某个工具；
+    /// - **必须由服务管理器托管**：覆盖后本进程要退出，靠 systemd `Restart=always` / launchd
+    ///   `KeepAlive` 拉起新版本；手动 `run` 的进程退出后没人再拉起它；
+    /// - **成功不在当下回执**：写 `restarting` 记录后退出，新进程启动时用自身版本核对，
+    ///   再把 `done` / `failed` 回执中心（见 [`settle_pending_self_update`]）。
+    ///
+    /// 失败也落终态并回执，然后返回 `Ok`：这份计划已经“驱过”，主循环据此落游标，
+    /// 不每轮重驱；重试由中心新建补跑计划（与 tool-copy 同一取舍）。
+    #[allow(clippy::too_many_arguments)]
+    async fn start_self_update(
+        &self,
+        work_id: &str,
+        from_version: &str,
+        to_version: &str,
+        reporter: Option<UpgradeReporter>,
+        artifact_url: Option<&str>,
+        expected_sha256: Option<&str>,
+    ) -> UpgradeResult<()> {
+        let mut record = UpgradeRecord {
+            work_id: work_id.to_string(),
+            from_version: from_version.to_string(),
+            to_version: to_version.to_string(),
+            step: "preflight".to_string(),
+            status: "running".to_string(),
+            detail: String::new(),
+        };
+
+        let Some(target) = self.self_update.as_ref() else {
+            return self
+                .fail_self_update(
+                    &mut record,
+                    "preflight",
+                    "未检测到已安装的服务定义：自更新必须由 systemd / launchd 托管（先 `wist-gwlinkd service install`）；手动 run 的进程退出后没人拉起",
+                    reporter.as_ref(),
+                )
+                .await;
+        };
+        let Some(tools) = self.tools.as_ref() else {
+            return self
+                .fail_self_update(
+                    &mut record,
+                    "preflight",
+                    "自更新要求装配 ToolInstaller（with_tools）—— 这是内部接线错误",
+                    reporter.as_ref(),
+                )
+                .await;
+        };
+
+        // 服务定义里的二进制必须就是当前进程：否则覆盖的是“别人”，退出后也不会拉起它。
+        let service_bin = canonical(&target.service_bin);
+        let running_exe = canonical(&target.running_exe);
+        if service_bin != running_exe {
+            return self
+                .fail_self_update(
+                    &mut record,
+                    "preflight",
+                    format!(
+                        "服务定义指向 {}，当前进程是 {}：不覆盖别的二进制（请确认服务由同一份安装拉起）",
+                        service_bin.display(),
+                        running_exe.display()
+                    ),
+                    reporter.as_ref(),
+                )
+                .await;
+        }
+
+        // 写权限要在下载前就判：root 拥有 + 非 root 运行是安装形态问题，不是网络问题。
+        let Some(dir) = service_bin.parent() else {
+            return self
+                .fail_self_update(
+                    &mut record,
+                    "preflight",
+                    format!("自更新目标没有父目录：{}", service_bin.display()),
+                    reporter.as_ref(),
+                )
+                .await;
+        };
+        let probe = dir.join(format!(".wist-gwlinkd-self-update.{}", std::process::id()));
+        if let Err(err) = std::fs::write(&probe, b"") {
+            let _ = std::fs::remove_file(&probe);
+            return self
+                .fail_self_update(
+                    &mut record,
+                    "preflight",
+                    format!(
+                        "二进制目录不可写（{}）：{err}。自更新要求安装目录对运行用户可写；\
+                         非 root 服务请重跑中心「只装 gwlinkd」命令（真实二进制会落到运行用户可写目录）",
+                        dir.display()
+                    ),
+                    reporter.as_ref(),
+                )
+                .await;
+        }
+        let _ = std::fs::remove_file(&probe);
+
+        // 进入安装：写 running + 心跳（取件 / 校验可能跨多秒）。
+        state::write_upgrade_record(&self.state_dir, &record)?;
+        state::touch_heartbeat(&self.state_dir)?;
+        let heartbeat_state = self.state_dir.clone();
+        let _heartbeat = AbortOnDrop(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+            loop {
+                ticker.tick().await;
+                if let Err(err) = state::touch_heartbeat(&heartbeat_state) {
+                    log::warn!(
+                        "event=UpgradeHeartbeatFailed error={}",
+                        chain_one_line(&err)
+                    );
+                }
+            }
+        }));
+
+        let binary_name = service_bin
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(SELF_COMPONENT);
+        let detail = match tools
+            .install_to(
+                SELF_COMPONENT,
+                binary_name,
+                &service_bin,
+                artifact_url.unwrap_or(to_version),
+                expected_sha256,
+            )
+            .await
+        {
+            Ok(detail) => detail,
+            Err(reason) => {
+                return self
+                    .fail_self_update(
+                        &mut record,
+                        "install",
+                        reason.to_string(),
+                        reporter.as_ref(),
+                    )
+                    .await;
+            }
+        };
+
+        // 覆盖成功：**先不回执**。新进程启动时会核对版本并回执（见 `settle_pending_self_update`）。
+        record.status = "restarting".to_string();
+        record.step = "restart".to_string();
+        record.detail =
+            format!("{detail}；新版本已落盘，进程退出后由服务管理器拉起（重启后核对版本并回执）");
+        if let Err(err) = state::write_upgrade_record(&self.state_dir, &record) {
+            log::warn!(
+                "event=UpgradeRecordWriteFailed error={}",
+                chain_one_line(&err)
+            );
+        }
+        self.restart_requested.store(true, Ordering::SeqCst);
+        log::info!(
+            "event=SelfUpdateRestarting work_id={work_id} from_version={from_version} to_version={to_version}"
+        );
+        Ok(())
+    }
+
+    /// 自更新前置/安装失败：落可读终态 + 回执。返回 `Ok` 让调用方落游标（见 [`Self::start_self_update`]）。
+    async fn fail_self_update(
+        &self,
+        record: &mut UpgradeRecord,
+        step: &str,
+        reason: impl Into<String>,
+        reporter: Option<&UpgradeReporter>,
+    ) -> UpgradeResult<()> {
+        record.step = step.to_string();
+        record.status = "failed".to_string();
+        record.detail = reason.into();
+        log::error!(
+            "event=SelfUpdateFailed work_id={} step={} detail={}",
+            record.work_id,
+            record.step,
+            record.detail
+        );
+        if let Err(err) = state::write_upgrade_record(&self.state_dir, record) {
+            log::warn!(
+                "event=UpgradeRecordWriteFailed error={}",
+                chain_one_line(&err)
+            );
+        }
+        if let Some(reporter) = reporter {
+            report_record(reporter, record).await;
+        }
+        Ok(())
     }
 
     /// 驱动一次升级（gops 执行器）：写 `running` 记录，起执行器，**升级期间持续刷心跳**；执行器结束后写终态记录，
@@ -489,19 +745,118 @@ impl UpgradeDriver {
     }
 }
 
-/// 把一条终态记录回执给中心（现读最新凭据；无长期身份就跳过）。
-async fn report_record(reporter: &UpgradeReporter, record: &UpgradeRecord) {
-    match state::load_credential(&reporter.state_dir) {
+/// 把一条终态记录回执给中心（现读最新凭据；无长期身份 / 网络失败返回 `false`）。
+async fn report_record(reporter: &UpgradeReporter, record: &UpgradeRecord) -> bool {
+    match state::load_credential(&reporter.identity_dir) {
         Some(credential) => match reporter
             .client
             .report_upgrade_result(&credential.bundle.gateway_id, record)
             .await
         {
-            Ok(()) => log::info!("event=UpgradeReported work_id={}", record.work_id),
-            Err(err) => log::warn!("event=UpgradeReportFailed error={}", chain_one_line(&err)),
+            Ok(()) => {
+                log::info!("event=UpgradeReported work_id={}", record.work_id);
+                true
+            }
+            Err(err) => {
+                log::warn!("event=UpgradeReportFailed error={}", chain_one_line(&err));
+                false
+            }
         },
-        None => log::warn!("event=UpgradeReportSkipped 无长期身份"),
+        None => {
+            log::warn!("event=UpgradeReportSkipped 无长期身份");
+            false
+        }
     }
+}
+
+/// 重启后收尾**自更新**：上一条记录停在 `restarting` 说明上一进程已换完二进制并退出。
+///
+/// 用**当前进程的编译版本**核对计划目标：一致 → `done`；不一致 → `failed`（写明两侧版本）。
+/// 核对完才回执中心 —— 这是自更新路径的“成功佐证”（不能只信“文件已覆盖”）。
+pub async fn settle_pending_self_update(
+    state_dir: &Path,
+    identity_dir: &Path,
+    client: CenterClient,
+    current_version: &str,
+) {
+    let Some(record) = state::read_upgrade_record(state_dir) else {
+        return;
+    };
+    if record.status != "restarting" {
+        return;
+    }
+
+    let (status, step, detail) = self_update_settlement(&record.to_version, current_version);
+    let mut settled = record.clone();
+    settled.status = status;
+    settled.step = step;
+    settled.detail = detail;
+
+    let reporter = UpgradeReporter {
+        client,
+        state_dir: state_dir.to_path_buf(),
+        identity_dir: identity_dir.to_path_buf(),
+        self_client: None,
+    };
+    // 先回执、后落终态：回执失败就保持 `restarting`，下一轮再试（不把“没送到”记成“已完成”）。
+    if !report_record(&reporter, &settled).await {
+        log::warn!(
+            "event=SelfUpdateSettleRetry work_id={} status={}（回执未送达，保持 restarting）",
+            settled.work_id,
+            settled.status
+        );
+        return;
+    }
+    if let Err(err) = state::write_upgrade_record(state_dir, &settled) {
+        log::warn!(
+            "event=UpgradeRecordWriteFailed error={}",
+            chain_one_line(&err)
+        );
+    }
+    log::info!(
+        "event=SelfUpdateSettled work_id={} status={} current_version={}",
+        settled.work_id,
+        settled.status,
+        current_version
+    );
+}
+
+/// 自更新的版本判定（纯函数，便于测试）：`(status, step, detail)`。
+fn self_update_settlement(to_version: &str, current_version: &str) -> (String, String, String) {
+    let expected = normalize_version(to_version);
+    let current = normalize_version(current_version);
+    if expected.is_empty() {
+        return (
+            "failed".to_string(),
+            "verify".to_string(),
+            "重启后无法核对版本：计划未带目标版本".to_string(),
+        );
+    }
+    if current == expected {
+        (
+            "done".to_string(),
+            "verify".to_string(),
+            format!("重启后自更新完成：当前版本 {current_version}"),
+        )
+    } else {
+        (
+            "failed".to_string(),
+            "verify".to_string(),
+            format!(
+                "重启后版本不符：当前 {current_version}，期望 {to_version}（未回到目标版本，请查看服务日志）"
+            ),
+        )
+    }
+}
+
+/// 版本串归一化：去空白 + 去前导 `v` / `V`（中心 release 版本可能带 `v`，编译版本不带）。
+fn normalize_version(version: &str) -> String {
+    version.trim().trim_start_matches(['v', 'V']).to_string()
+}
+
+/// 能规范化就规范化（路径不存在时原样返回，交给后续可读失败）。
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// 读执行器日志里**本次运行**新增的那段（有界）。失败时把关键行进回执，少让人翻日志。
@@ -825,6 +1180,384 @@ mod tests {
         );
         assert!(args.contains("--health-timeout 30"), "{args}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 自更新：覆盖**本进程自己的二进制**、落 `restarting`、请主循环退出让服务管理器拉起。
+    #[tokio::test]
+    async fn a_self_update_replaces_its_own_binary_and_requests_restart() {
+        use std::collections::BTreeMap;
+
+        let dir = temp_dir("self-update");
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin");
+        let target = write_exec(&bin_dir, "wist-gwlinkd", "OLD");
+        let artifact = dir.join("wist-gwlinkd.tar.gz");
+        std::fs::write(
+            &artifact,
+            tool_archive(
+                "wist-gwlinkd-0.12.0-aarch64-apple-darwin/wist-gwlinkd",
+                b"NEW",
+            ),
+        )
+        .expect("artifact");
+
+        let tools = ToolInstaller::new(BTreeMap::new(), &dir, reqwest::Client::new())
+            .with_host_target(HostTarget::new("aarch64", "macos", true));
+        let driver = UpgradeDriver::new(
+            GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string()),
+            &dir,
+        )
+        .with_tools(tools)
+        .with_self_update_target(SelfUpdateTarget::new(target.clone(), target.clone()));
+        driver
+            .start(
+                "w-self",
+                "0.11.0",
+                "0.12.0",
+                Some(SELF_COMPONENT),
+                None,
+                Some(artifact.to_string_lossy().as_ref()),
+            )
+            .await
+            .expect("self update is handled");
+
+        let record = wait_terminal(&dir).await;
+        assert_eq!(record.status, "restarting", "{}", record.detail);
+        assert_eq!(record.step, "restart");
+        assert!(
+            record.detail.contains("服务管理器拉起"),
+            "{}",
+            record.detail
+        );
+        assert_eq!(std::fs::read(&target).expect("read"), b"NEW");
+        // 取一次就清零（主循环只该退出一次）。
+        assert!(driver.take_restart_requested());
+        assert!(!driver.take_restart_requested());
+        assert!(!dir.join("args.txt").exists(), "自更新不该走 gops 执行器");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 没装成服务（无自更新目标）→ 发之前就落可读失败，且**不请求退出**（手动 run 退出后没人拉起）。
+    #[tokio::test]
+    async fn a_self_update_without_a_managed_service_fails_before_fetch() {
+        let dir = temp_dir("self-update-unmanaged");
+        let driver = UpgradeDriver::new(
+            GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string()),
+            &dir,
+        );
+        driver
+            .start(
+                "w-self",
+                "0.11.0",
+                "0.12.0",
+                Some(SELF_COMPONENT),
+                None,
+                None,
+            )
+            .await
+            .expect("failure is recorded, not propagated");
+
+        let record = state::read_upgrade_record(&dir).expect("record");
+        assert_eq!(record.status, "failed");
+        assert_eq!(record.step, "preflight");
+        assert!(record.detail.contains("服务定义"), "{}", record.detail);
+        assert!(!driver.take_restart_requested());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 服务定义指向的二进制 ≠ 当前进程 → 不覆盖「别人」（覆盖了也不会被拉起）。
+    #[tokio::test]
+    async fn a_self_update_refuses_a_service_bin_that_is_not_the_running_exe() {
+        use std::collections::BTreeMap;
+
+        let dir = temp_dir("self-update-other-bin");
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin");
+        let service_bin = write_exec(&bin_dir, "wist-gwlinkd", "SERVICE");
+        let running_exe = write_exec(&bin_dir, "gwlinkd-dev", "RUNNING");
+
+        let tools = ToolInstaller::new(BTreeMap::new(), &dir, reqwest::Client::new());
+        let driver = UpgradeDriver::new(
+            GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string()),
+            &dir,
+        )
+        .with_tools(tools)
+        .with_self_update_target(SelfUpdateTarget::new(service_bin, running_exe));
+        driver
+            .start(
+                "w-self",
+                "0.11.0",
+                "0.12.0",
+                Some(SELF_COMPONENT),
+                None,
+                None,
+            )
+            .await
+            .expect("failure is recorded");
+
+        let record = state::read_upgrade_record(&dir).expect("record");
+        assert_eq!(record.status, "failed");
+        assert!(
+            record.detail.contains("不覆盖别的二进制"),
+            "{}",
+            record.detail
+        );
+        assert!(!driver.take_restart_requested());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 重启后的版本核对：`v` 前缀归一化；不一致 / 计划没带版本都算失败。
+    #[test]
+    fn self_update_settlement_compares_normalized_versions() {
+        assert_eq!(
+            self_update_settlement("v0.12.0-alpha", "0.12.0-alpha").0,
+            "done"
+        );
+        assert_eq!(self_update_settlement("0.12.0", "0.11.0").0, "failed");
+        assert_eq!(self_update_settlement("", "0.11.0").0, "failed");
+    }
+
+    /// 自更新摘要不符 → 落可读失败、旧二进制原封不动、**不请求退出**。
+    #[tokio::test]
+    async fn a_self_update_with_a_digest_mismatch_leaves_the_binary_intact() {
+        use std::collections::BTreeMap;
+
+        let dir = temp_dir("self-update-digest");
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin");
+        let target = write_exec(&bin_dir, "wist-gwlinkd", "OLD");
+        let artifact = dir.join("wist-gwlinkd.tar.gz");
+        std::fs::write(
+            &artifact,
+            tool_archive(
+                "wist-gwlinkd-0.12.0-aarch64-apple-darwin/wist-gwlinkd",
+                b"NEW",
+            ),
+        )
+        .expect("artifact");
+
+        let tools = ToolInstaller::new(BTreeMap::new(), &dir, reqwest::Client::new())
+            .with_host_target(HostTarget::new("aarch64", "macos", true));
+        let driver = UpgradeDriver::new(
+            GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string()),
+            &dir,
+        )
+        .with_tools(tools)
+        .with_self_update_target(SelfUpdateTarget::new(target.clone(), target.clone()));
+        driver
+            .start_with_digest(
+                "w-self",
+                "0.11.0",
+                "0.12.0",
+                Some(SELF_COMPONENT),
+                None,
+                Some(artifact.to_string_lossy().as_ref()),
+                // 与制品内容不符的完整摘要（形态合法）。
+                Some("sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+            )
+            .await
+            .expect("failure is recorded");
+
+        let record = wait_terminal(&dir).await;
+        assert_eq!(record.status, "failed");
+        assert!(record.detail.contains("摘要不符"), "{}", record.detail);
+        assert_eq!(std::fs::read(&target).expect("read"), b"OLD");
+        assert!(!driver.take_restart_requested());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 中心没派制品地址（只剩裸版本号）→ 发之前落可读失败，不覆盖、不退出。
+    #[tokio::test]
+    async fn a_self_update_without_an_artifact_url_fails_before_overwriting() {
+        use std::collections::BTreeMap;
+
+        let dir = temp_dir("self-update-no-url");
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin");
+        let target = write_exec(&bin_dir, "wist-gwlinkd", "OLD");
+
+        let tools = ToolInstaller::new(BTreeMap::new(), &dir, reqwest::Client::new());
+        let driver = UpgradeDriver::new(
+            GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string()),
+            &dir,
+        )
+        .with_tools(tools)
+        .with_self_update_target(SelfUpdateTarget::new(target.clone(), target.clone()));
+        driver
+            .start(
+                "w-self",
+                "0.11.0",
+                "0.12.0",
+                Some(SELF_COMPONENT),
+                None,
+                None,
+            )
+            .await
+            .expect("failure is recorded");
+
+        let record = wait_terminal(&dir).await;
+        assert_eq!(record.status, "failed");
+        assert!(
+            record.detail.contains("没有可取的制品地址"),
+            "{}",
+            record.detail
+        );
+        assert_eq!(std::fs::read(&target).expect("read"), b"OLD");
+        assert!(!driver.take_restart_requested());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 重启后收尾：回执必须读**身份目录**里的凭据（与 state_dir 不同），成功后落 `done`。
+    #[tokio::test]
+    async fn settle_pending_self_update_reports_done_using_the_identity_dir() {
+        let dir = temp_dir("settle-done");
+        let state_dir = dir.join("state");
+        let identity_dir = dir.join("identity");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        std::fs::create_dir_all(&identity_dir).expect("identity dir");
+        write_credential(&identity_dir, "gw-1");
+        state::write_upgrade_record(
+            &state_dir,
+            &UpgradeRecord {
+                work_id: "plan-1".into(),
+                from_version: "0.11.0".into(),
+                to_version: "v0.12.0".into(),
+                step: "restart".into(),
+                status: "restarting".into(),
+                detail: String::new(),
+            },
+        )
+        .expect("record");
+
+        let (endpoint, captured) = capture_one_request().await;
+        settle_pending_self_update(
+            &state_dir,
+            &identity_dir,
+            CenterClient::new(endpoint),
+            "0.12.0",
+        )
+        .await;
+
+        let request = captured.await.expect("captured request");
+        assert!(
+            request.starts_with("POST /api/v1/gateway/upgrade-result"),
+            "{request}"
+        );
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(body.contains("\"status\":\"done\""), "{body}");
+        assert!(body.contains("\"gateway_id\":\"gw-1\""), "{body}");
+        let record = state::read_upgrade_record(&state_dir).expect("record");
+        assert_eq!(record.status, "done");
+        assert_eq!(record.step, "verify");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 回执送不出去（无身份 / 网络失败）→ 保持 `restarting`，下一轮再试；不得提前落 `done`。
+    #[tokio::test]
+    async fn settle_pending_self_update_keeps_restarting_when_the_report_fails() {
+        let dir = temp_dir("settle-retry");
+        let state_dir = dir.join("state");
+        let identity_dir = dir.join("identity");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        std::fs::create_dir_all(&identity_dir).expect("identity dir");
+        state::write_upgrade_record(
+            &state_dir,
+            &UpgradeRecord {
+                work_id: "plan-2".into(),
+                from_version: "0.11.0".into(),
+                to_version: "0.12.0".into(),
+                step: "restart".into(),
+                status: "restarting".into(),
+                detail: String::new(),
+            },
+        )
+        .expect("record");
+
+        settle_pending_self_update(
+            &state_dir,
+            &identity_dir,
+            CenterClient::new("http://127.0.0.1:1"),
+            "0.12.0",
+        )
+        .await;
+
+        let record = state::read_upgrade_record(&state_dir).expect("record");
+        assert_eq!(record.status, "restarting");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 重启后版本不符 → 回执 `failed` 并落终态（不把“启动起来了”当成“升对了”）。
+    #[tokio::test]
+    async fn settle_pending_self_update_marks_failed_on_a_version_mismatch() {
+        let dir = temp_dir("settle-mismatch");
+        let state_dir = dir.join("state");
+        let identity_dir = dir.join("identity");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        std::fs::create_dir_all(&identity_dir).expect("identity dir");
+        write_credential(&identity_dir, "gw-1");
+        state::write_upgrade_record(
+            &state_dir,
+            &UpgradeRecord {
+                work_id: "plan-3".into(),
+                from_version: "0.11.0".into(),
+                to_version: "0.12.0".into(),
+                step: "restart".into(),
+                status: "restarting".into(),
+                detail: String::new(),
+            },
+        )
+        .expect("record");
+
+        let (endpoint, captured) = capture_one_request().await;
+        settle_pending_self_update(
+            &state_dir,
+            &identity_dir,
+            CenterClient::new(endpoint),
+            "0.11.0",
+        )
+        .await;
+
+        let request = captured.await.expect("captured request");
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(body.contains("\"status\":\"failed\""), "{body}");
+        let record = state::read_upgrade_record(&state_dir).expect("record");
+        assert_eq!(record.status, "failed");
+        assert!(record.detail.contains("版本不符"), "{}", record.detail);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 接收一次 HTTP 请求并把原文回传（用于断言回执的 path / body）。
+    async fn capture_one_request() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            // 小请求一次就读齐；随后等一个短超时确认没有更多字节（客户端在等响应）。
+            loop {
+                match tokio::time::timeout(Duration::from_millis(200), sock.read(&mut chunk)).await
+                {
+                    Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
+                    Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+            let body = "{}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        (format!("http://{addr}"), rx)
     }
 
     /// 起一个只回一份固定 JSON 的极简 HTTP 服务，返回其 base URL。
@@ -1189,6 +1922,7 @@ mod tests {
         UpgradeReporter {
             client: crate::center::CenterClient::new("http://127.0.0.1:1"),
             state_dir: dir.to_path_buf(),
+            identity_dir: dir.to_path_buf(),
             self_client: self_endpoint.map(crate::selfreport::SelfReportClient::new),
         }
     }

@@ -89,6 +89,10 @@ sudo wist-gwlinkd service install --system --run-as deploy \
 sudo wist-gwlinkd service install --system ...
 ```
 
+> 非 root 运行的部署要做**自更新**，真实二进制必须放在运行用户**可写**的目录（原子 `rename` 需要目录可写，
+> 只给文件写权限不够）：典型是 `/usr/local/lib/wist-gwlinkd/wist-gwlinkd`，而 `/usr/local/bin/wist-gwlinkd`
+> 只做指向它的**符号链接**。中心的 `install-all` / `install-linkd` 已按这个布局安装；手工装时也请照做。
+
 - `--system`（默认）= 系统级（开机即起；Linux `multi-user.target` / macOS `LaunchDaemons`）；
   `--user` = 登录后起（`~/.config/systemd/user` / `~/Library/LaunchAgents`）。
 - `--run-as <USER>`（配 `--run-as-group <GROUP>`，可选）：**系统级的非 root 运行身份** ——
@@ -173,12 +177,34 @@ x86_64 的 ELF 覆盖到 Darwin arm64 的 Mach-O 上**不会报错、只会让�
 不再当成 URL 去误取。`wist-gwlinkd diagnose` 的 `upgrade.tool` 一条会体检无状态工具组件（目录、`binary` 配置、
 `PATH` 命中与架构策略），联调时一眼看出「配置里有没有目录、会不会回退 gops」。
 
+**自身升级**（升级计划里的 `component = "wist-gwlinkd"`）走**自更新**，不经 gops、也不查组件目录：
+进程内取中心制品（摘要 / 架构护栏同上）→ 原子覆盖**服务定义指向的二进制** → 写 `restarting` 记录并退出；
+systemd `Restart=always` / launchd `KeepAlive` 拉起新版本，新进程启动时用**编译版本**核对计划的 `to_version`，
+再回执中心（`done` / `failed`）。前置不满足时**发请求前**就落可读失败：
+
+- **已装服务定义**：手动 `wist-gwlinkd run` 的进程退出后没人拉起；
+- **服务定义里的二进制 = 当前进程**（覆盖的是“自己”，不是别人的）；
+- **运行用户对二进制目录可写**：原子 `rename` 需要目录可写，只有文件可写不够。
+
+因此安装布局把**真实二进制**放在运行用户可写的目录（`/usr/local/lib/wist-gwlinkd/wist-gwlinkd`，
+**目录与文件都归运行用户**），`/usr/local/bin/wist-gwlinkd` 只是指向它的**符号链接**。
+
+> 自更新**不做自动回滚**：新二进制起不来时，旧版备份在 `state_dir/tool-backups/`，
+> 人工恢复后重启服务；中心会因收不到回执停在「已下发」，需人工重派。
+
 ## 交付与升级
 
-不单独发版通道：多平台**静态**制品（`{x86_64,aarch64}-unknown-linux-musl` +
-`{x86_64,aarch64}-apple-darwin`）**打包进网关镜像**当载体，栈的安装 / 升级阶段按宿主
-`uname -s`/`uname -m` 抽出对应件、用 `wist-gwlinkd service install --system --bin <抽出件> --config <配置>`
-装成 **systemd / launchd** 服务长期托管。**版本随栈**。
+多平台**静态**制品（`{x86_64,aarch64}-unknown-linux-musl` +
+`{x86_64,aarch64}-apple-darwin`）由中心「包管理」作为独立组件 `wist-gwlinkd` 发布；
+`install-all` / `install-linkd` 按宿主 `uname -s`/`uname -m` 取件，并用
+`wist-gwlinkd service install --system --bin <入口> --config <配置>` 装成 **systemd / launchd** 服务长期托管。
+网关镜像也可以带一份制品当载体，但**升级以中心发布为准**（即上面的自更新路径）。
+
+安装时创建：
+
+- 真实二进制 `/usr/local/lib/wist-gwlinkd/wist-gwlinkd`，**目录与文件都归运行用户**（原子 rename 需要目录可写）；
+- 入口 `/usr/local/bin/wist-gwlinkd` → 符号链接（`PATH` 上仍可直接敲命令）；
+- 服务定义里的 `--bin` 用入口路径；驱动覆盖前会解析到真身，符号链接不会被替换成普通文件。
 
 ## License
 

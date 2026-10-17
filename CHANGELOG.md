@@ -3,6 +3,25 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- **支持中心升级计划的「自更新」**：计划里的 `component = "wist-gwlinkd"` 不再落到 gops —— 进程内取
+  中心制品（同一套摘要 / 架构护栏）→ 原子覆盖服务定义指向的二进制 → 写 `restarting` 退出；服务管理器
+  拉起后用**编译版本**核对计划的 `to_version`，再回执中心。前置不满足（未装服务 / 目标不是当前进程 /
+  目录不可写）时**发请求前**就落可读失败。
+
+### 修复
+
+- **升级回执读错身份目录**：`UpgradeReporter` 增加 `identity_dir`，回执现读凭据不再只找 `state_dir` ——
+  网关栈的 `identity/gwlinkd` 与 `configs/gwlinkd/state` 分开时，旧实现会把回执静默跳过。
+
+### 升级注意
+
+- **首次启用自更新要先换本体**：旧版 gwlinkd 不认识 `component = "wist-gwlinkd"`，会把计划当 gops 升级
+  而失败。先重跑中心「只装 gwlinkd」命令装上新版（同时完成可写布局迁移），之后才能用升级计划。
+
 ## [0.11.0-alpha] - 2026-10-16
 
 ### 新增

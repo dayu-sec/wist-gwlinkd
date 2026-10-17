@@ -28,7 +28,10 @@ use wist_gwlinkd::service;
 use wist_gwlinkd::state::{self, CredentialStatus, UpgradeCursor, UpgradeRecord};
 use wist_gwlinkd::tool_install::ToolInstaller;
 use wist_gwlinkd::unlink::{self, UnlinkReport};
-use wist_gwlinkd::upgrade::{RECOVERY_VERIFY_TIMEOUT, UpgradeDriver, UpgradeReporter};
+use wist_gwlinkd::upgrade::{
+    RECOVERY_VERIFY_TIMEOUT, SelfUpdateTarget, UpgradeDriver, UpgradeReporter,
+    settle_pending_self_update,
+};
 
 /// 运行期状态上报周期（秒）。
 const STATUS_INTERVAL_SECS: u64 = 30;
@@ -423,16 +426,23 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
             )
         })
         .collect();
-    if !tool_binaries.is_empty() {
-        driver = driver.with_tools(
-            ToolInstaller::new(
-                tool_binaries,
-                config.state_dir.clone(),
-                client.artifact_http_client(),
-            )
-            // 缺省要求制品架构可校验且与本机一致（错架构会静默报废工具）。
-            .with_require_verified_arch(config.upgrade_tool_require_arch.unwrap_or(true)),
-        );
+    // 即便组件目录为空也要装配安装器：`wist-gwlinkd` 自身的自更新走同一套取件 / 摘要 / 架构护栏。
+    driver = driver.with_tools(
+        ToolInstaller::new(
+            tool_binaries,
+            config.state_dir.clone(),
+            client.artifact_http_client(),
+        )
+        // 缺省要求制品架构可校验且与本机一致（错架构会静默报废工具）。
+        .with_require_verified_arch(config.upgrade_tool_require_arch.unwrap_or(true)),
+    );
+    // 自更新目标：服务定义里登记的二进制 + 当前进程。没有服务定义 = 手动 run，自更新会被前置拒掉
+    // （覆盖后退出，没人再拉起）。
+    if let Some(definition) = service::any_installed_definition()
+        && let Some(service_bin) = definition.paths.bin
+        && let Ok(running_exe) = std::env::current_exe()
+    {
+        driver = driver.with_self_update_target(SelfUpdateTarget::new(service_bin, running_exe));
     }
 
     let mut ticker = tokio::time::interval(Duration::from_secs(STATUS_INTERVAL_SECS));
@@ -474,6 +484,16 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
 
     loop {
         ticker.tick().await;
+
+        // 上一次是**自更新**（记录停在 `restarting`）→ 用当前编译版本核对并回执；
+        // 回执失败保持 `restarting`，下一轮再试（不把“没送到”记成“已完成”）。
+        settle_pending_self_update(
+            &config.state_dir,
+            config.identity_dir(),
+            client.clone(),
+            wist_gwlinkd::VERSION,
+        )
+        .await;
 
         // 上一轮轮换若有收尾未完成（内存/磁盘/客户端未对齐），先自愈重试。
         if credential_dirty
@@ -620,6 +640,7 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                             let reporter = UpgradeReporter {
                                 client: client.clone(),
                                 state_dir: config.state_dir.clone(),
+                                identity_dir: config.identity_dir().to_path_buf(),
                                 self_client: self_client.clone(),
                             };
                             // **不**用 `?`：驱动失败（执行器缺失/架构不符…）绝不能把链路常驻整个拖死。
@@ -650,13 +671,22 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                                         &config.state_dir,
                                         &UpgradeCursor {
                                             last_plan_id: plan.plan_id.clone(),
-                                            last_to_version: to_version,
+                                            last_to_version: to_version.clone(),
                                         },
                                     ) {
                                         log::warn!(
                                             "event=CursorSaveFailed error={}",
                                             chain_one_line(&err)
                                         );
+                                    }
+                                    // 自更新已覆盖本进程的二进制：现在退出，由服务管理器拉起新版本；
+                                    // 新进程启动时核对版本并回执中心（`settle_pending_self_update`）。
+                                    if driver.take_restart_requested() {
+                                        log::info!(
+                                            "event=SelfUpdateExit plan_id={:?} to_version={to_version}",
+                                            plan.plan_id
+                                        );
+                                        return Ok(());
                                     }
                                 }
                                 Err(err) => log::error!(
