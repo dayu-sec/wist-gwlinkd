@@ -3,6 +3,21 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.12.1-alpha] - 2026-10-17
+
+### 修复
+
+- **作为系统服务运行时，升级执行器 `gops` 找不到**：launchd / systemd 的默认 PATH 只有系统目录，
+  而安装脚本把 `gops` / `gx` 装在运行用户的 `~/bin`。现在 `service install` 渲染的服务定义会把
+  运行身份的 `~/bin` 与 `~/.local/bin` 追加进 PATH（systemd 显式 `Environment=PATH=`），
+  升级计划不再以 `启动升级执行器 gops 失败: No such file or directory (os error 2)` 落失败。
+
+### 升级注意
+
+- **已有服务定义不会自动更新**：要拿到新 PATH，请用本版重新执行一次
+  `wist-gwlinkd service install --system --run-as <部署用户> ... --force`。
+  不重装也可以：把 `upgrader_program` 配成 `gops` 的**绝对路径**（如 `$HOME/bin/gops`）。
+
 ## [0.12.0-alpha] - 2026-10-17
 
 ### 新增
