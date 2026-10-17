@@ -224,6 +224,80 @@ pub fn home_dir() -> ServiceResult<PathBuf> {
         .ok_or_else(|| ServiceReason::MissingEnv.err("HOME 未设置；请显式给 --config / --bin"))
 }
 
+/// 服务进程的 PATH：系统目录 + 运行用户的 `~/bin` / `~/.local/bin`。
+///
+/// 为什么必须带后两者：安装脚本把 `gops` / `gx` 装到 `$HOME/bin`，而 launchd / systemd 的
+/// 默认 PATH 只有系统目录。gwlinkd 的升级执行器（`gops`）以及 gops 拉起的 gx 流程都靠 PATH
+/// 解析；不带就会在 spawn 时以 `os error 2` 失败（相对名 `gops` 配了也没用）。
+pub(crate) fn service_path(spec: &ServiceSpec) -> String {
+    let mut parts = vec![
+        // 与 systemd 的默认 PATH 保持同一组系统目录（launchd 旧版少了 sbin，补回来不丢东西）。
+        "/usr/local/sbin".to_string(),
+        "/usr/local/bin".to_string(),
+        "/usr/sbin".to_string(),
+        "/usr/bin".to_string(),
+        "/sbin".to_string(),
+        "/bin".to_string(),
+    ];
+    if let Some(home) = run_as_home(spec) {
+        parts.push(home.join("bin").display().to_string());
+        parts.push(home.join(".local/bin").display().to_string());
+    }
+    parts.join(":")
+}
+
+/// 服务实际运行身份的家目录：user 作用域 = 本人；system + `--run-as` = 目标用户；
+/// system 无 `--run-as` = root（不额外加用户目录）。
+fn run_as_home(spec: &ServiceSpec) -> Option<PathBuf> {
+    if spec.scope == ServiceScope::User {
+        return home_dir().ok();
+    }
+    spec.run_as.as_deref().and_then(user_home)
+}
+
+#[cfg(unix)]
+fn user_home(user: &str) -> Option<PathBuf> {
+    use std::ffi::{CStr, CString};
+
+    let user_c = CString::new(user).ok()?;
+    // 用重入版：`getpwnam` 返回静态缓冲，并行单测 / 多线程渲染会互相踩。
+    // `getpwnam_r` 把结果写进调用方提供的 `passwd` + 缓冲区，`pw_dir` 指向缓冲区，
+    // 所以下面必须先复制成 `PathBuf`，再让缓冲区离开作用域。
+    let mut buf = vec![0_u8; 16 * 1024];
+    loop {
+        let mut passwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwnam_r(
+                user_c.as_ptr(),
+                &mut passwd,
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < 1024 * 1024 {
+            let next = buf.len() * 2;
+            buf.resize(next, 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        let home = passwd.pw_dir;
+        if home.is_null() {
+            return None;
+        }
+        let home = unsafe { CStr::from_ptr(home) }.to_str().ok()?;
+        return (!home.is_empty()).then(|| PathBuf::from(home));
+    }
+}
+
+#[cfg(not(unix))]
+fn user_home(_user: &str) -> Option<PathBuf> {
+    None
+}
+
 /// 作用域的默认配置目录：system → `/etc/wist-gwlinkd`；user → `$HOME/.wist-gwlinkd`。
 pub fn default_config_dir(scope: ServiceScope) -> ServiceResult<PathBuf> {
     match scope {

@@ -117,7 +117,12 @@ pub fn plist_text(spec: &ServiceSpec, log_dir_override: Option<&Path>) -> String
     ));
     text.push_str("  <key>EnvironmentVariables</key>\n  <dict>\n");
     text.push_str("    <key>PATH</key>\n");
-    text.push_str("    <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>\n");
+    // 服务 PATH 带运行用户的 ~/bin 与 ~/.local/bin：gops / gx 由安装脚本装在那里，
+    // launchd 的默认 PATH 不含用户目录（否则升级执行器 spawn 时 ENOENT）。
+    text.push_str(&format!(
+        "    <string>{}</string>\n",
+        escape_xml(&super::service_path(spec))
+    ));
     text.push_str(&format!("    <key>{CONFIG_ENV}</key>\n"));
     text.push_str(&format!(
         "    <string>{}</string>\n",
@@ -287,6 +292,26 @@ mod tests {
         assert_eq!(
             plist_path(ServiceScope::System).expect("plist path"),
             PathBuf::from("/Library/LaunchDaemons/com.dayu-sec.wist-gwlinkd.plist")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plist_path_includes_the_run_as_users_bin_dirs() {
+        // gops / gx 由安装脚本装在 ~/bin；launchd 默认 PATH 不含用户目录，
+        // 不带就会在升级执行器 spawn 时 ENOENT（os error 2）。
+        let spec = ServiceSpec::new(
+            ServiceScope::System,
+            PathBuf::from("/usr/local/bin/wist-gwlinkd"),
+            PathBuf::from("/etc/wist-gwlinkd/gwlinkd.toml"),
+        )
+        .with_run_as(Some("root".to_string()), None);
+        let path = crate::service::service_path(&spec);
+        assert_eq!(path.split(':').count(), 8, "PATH 应含用户 bin：{path}");
+        let text = plist_text(&spec, None);
+        assert!(
+            text.contains(&escape_xml(&path)),
+            "plist PATH 未带上运行用户的 ~/bin：\n{text}"
         );
     }
 }

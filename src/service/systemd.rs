@@ -54,6 +54,12 @@ pub fn unit_text(spec: &ServiceSpec) -> String {
         "ExecStart={} run\n",
         systemd_arg(&spec.bin.display().to_string())
     ));
+    // 服务 PATH 带运行用户的 ~/bin 与 ~/.local/bin：gops / gx 由安装脚本装在那里，
+    // systemd 的默认 PATH 不含用户目录（否则升级执行器 spawn 时 ENOENT）。
+    text.push_str(&format!(
+        "Environment=PATH={}\n",
+        systemd_arg(&super::service_path(spec))
+    ));
     text.push_str(&format!(
         "Environment={}={}\n",
         CONFIG_ENV,
@@ -206,6 +212,26 @@ mod tests {
         assert_eq!(
             unit_path(ServiceScope::System).expect("unit path"),
             PathBuf::from("/etc/systemd/system/wist-gwlinkd.service")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit_path_includes_the_run_as_users_bin_dirs() {
+        // gops / gx 由安装脚本装在 ~/bin；systemd 默认 PATH 不含用户目录，
+        // 不带就会在升级执行器 spawn 时 ENOENT（os error 2）。
+        let spec = ServiceSpec::new(
+            ServiceScope::System,
+            PathBuf::from("/usr/local/bin/wist-gwlinkd"),
+            PathBuf::from("/etc/wist-gwlinkd/gwlinkd.toml"),
+        )
+        .with_run_as(Some("root".to_string()), None);
+        let path = crate::service::service_path(&spec);
+        assert_eq!(path.split(':').count(), 8, "PATH 应含用户 bin：{path}");
+        let text = unit_text(&spec);
+        assert!(
+            text.contains(&format!("Environment=PATH={}\n", systemd_arg(&path))),
+            "unit PATH 未带上运行用户的 ~/bin：\n{text}"
         );
     }
 
