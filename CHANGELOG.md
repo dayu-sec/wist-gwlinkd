@@ -3,6 +3,30 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.13.0-alpha] - 2026-10-18
+
+### 新增
+
+- **知识库包下发（`action = push-knowledge-package`）**：中心派下的计划由 gwlinkd 取包并环回交付
+  网关知识库管理 —— 与 Agent 包下发同一条通道（gwlinkd 持中心信任，网关只托管）。
+  - 取包时校验中心给的 `artifact_sha256`；**签名旁文件 `.sig` 一并落地**（配了验签公钥的
+    网关会按 `<本地包>.sig` 验签），取不到只告警不阻断。
+  - 投放目录复用 `agent_package_drop_dir` / `agent_package_container_dir`；
+    交付载荷 `{source, sha256, origin, activate}` 推进 `POST /api/v1/gateway/knowledge-package`。
+  - `activate` 来自计划（缺省 false）：知识库**录入 ≠ 生效**。
+
+### 变更
+
+- **未知计划动作不再回落成 `upgrade`**：只认 `upgrade` / `push-agent-package` /
+  `push-knowledge-package`；其余留痕（`event=UnknownPlanActionSkipped`）并跳过 ——
+  避免拿知识库 / 新类型包去跑 gops 把网关搞坏。
+- 依赖对齐 `wist-control 0.15`。
+
+### 升级顺序
+
+- **本版必须先于中心升级**：旧 gwlinkd 会把 `push-knowledge-package` 当 `upgrade` 执行。
+  完整顺序：网关 → **gwlinkd** → 中心 → 中心前端。
+
 ## [0.12.1-alpha] - 2026-10-17
 
 ### 修复
