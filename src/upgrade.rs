@@ -93,6 +93,12 @@ pub struct UpgradeDriver {
     pub tools: Option<Arc<ToolInstaller>>,
     /// 自更新目标：`Some` 才允许驱动 `wist-gwlinkd` 自己的升级。
     pub self_update: Option<SelfUpdateTarget>,
+    /// 取中心制品的 HTTP 客户端（带 CA-S / 客户端证书）。
+    ///
+    /// **为什么驱动需要它**：`gops` 不持中心信任，自己 HEAD 中心地址会报
+    /// `error sending request`（私有 CA）。所以 gwlinkd 先取包到本地，再给 gops 一个**路径**
+    /// （`gops prj upgrade --to <URL|PATH>` 两种都收）。
+    pub artifact_http: Option<reqwest::Client>,
     /// 自更新已落盘、等主循环退出后由服务管理器拉起（主循环取一次就清）。
     restart_requested: Arc<AtomicBool>,
 }
@@ -106,6 +112,7 @@ impl UpgradeDriver {
             verify_timeout: RECOVERY_VERIFY_TIMEOUT,
             tools: None,
             self_update: None,
+            artifact_http: None,
             restart_requested: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -113,6 +120,15 @@ impl UpgradeDriver {
     /// 设成功佐证的观测窗口（缺省 [`RECOVERY_VERIFY_TIMEOUT`]）。
     pub fn with_verify_timeout(mut self, timeout: Duration) -> Self {
         self.verify_timeout = timeout;
+        self
+    }
+
+    /// 装配**中心制品取件**客户端（带 CA-S / 客户端证书）。
+    ///
+    /// 装上后，`gops` 路径会先把 `artifact_url` 取到本地再交给执行器 ——
+    /// 执行器不持中心信任，直接拿中心地址会因私有 CA 失败。
+    pub fn with_artifact_client(mut self, client: reqwest::Client) -> Self {
+        self.artifact_http = Some(client);
         self
     }
 
@@ -210,6 +226,7 @@ impl UpgradeDriver {
             component,
             reporter,
             artifact_url,
+            expected_sha256,
         )
         .await
     }
@@ -413,6 +430,7 @@ impl UpgradeDriver {
     ///
     /// [`artifact_url`]：中心**派生**的制品下发地址。执行器取件的 `--to` 用它（`gops --to <url>`）；
     /// 为 `None`（无对应 release）才回落用 [`to_version`]。**台账与回执仍记 `to_version`**（版本）。
+    #[allow(clippy::too_many_arguments)]
     async fn start_gops(
         &self,
         work_id: &str,
@@ -421,6 +439,7 @@ impl UpgradeDriver {
         component: Option<&str>,
         reporter: Option<UpgradeReporter>,
         artifact_url: Option<&str>,
+        expected_sha256: Option<&str>,
     ) -> UpgradeResult<()> {
         let mut record = UpgradeRecord {
             work_id: work_id.to_string(),
@@ -451,6 +470,38 @@ impl UpgradeDriver {
             return Err(reason);
         }
 
+        // 取件下沉：**gops 不持中心信任**（私有 CA 下 HEAD/GET 中心地址直接 `error sending request`）。
+        //  gwlinkd 用自己的制品客户端（带 CA-S / 客户端证书）先取到本地，再给执行器一个本机路径。
+        //  （`gops prj upgrade --to <URL|PATH>` 两种都收；本地路径还能顺带按中心摘要校验。）
+        let staged = match (artifact_url, self.artifact_http.as_ref()) {
+            (Some(url), Some(client)) if is_http_url(url) => {
+                match stage_artifact(&self.state_dir, client, url, expected_sha256).await {
+                    Ok(path) => Some(path),
+                    Err(reason) => {
+                        record.step = "fetch".to_string();
+                        record.status = "failed".to_string();
+                        record.detail = reason.to_string();
+                        if let Err(werr) = state::write_upgrade_record(&self.state_dir, &record) {
+                            log::warn!(
+                                "event=UpgradeRecordWriteFailed error={}",
+                                chain_one_line(&werr)
+                            );
+                        }
+                        if let Some(reporter) = reporter {
+                            report_record(&reporter, &record).await;
+                        }
+                        return Err(reason);
+                    }
+                }
+            }
+            // 无客户端 / 非 HTTP 来源（本机路径 / 版本号）：交给执行器原处理。
+            _ => None,
+        };
+        // 本机路径必须活到 `command()` 构建完（`ExecutorInvocation` 借用它）。
+        let staged_to = staged
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string());
+
         // 执行器的 stdout/stderr 落日志文件（失败时运维要能看现场）。stderr 由驱动接管；
         // stdout 由适配器置为管道，供解读结局。
         let log_path = self.state_dir.join(UPGRADER_LOG_FILE);
@@ -472,8 +523,8 @@ impl UpgradeDriver {
         };
 
         let invocation = ExecutorInvocation {
-            // 执行器取件的 `--to`：优先用中心派生的制品地址，否则回落版本/路径。
-            to_version: artifact_url.unwrap_or(to_version),
+            // 执行器取件的 `--to`：优先用**已取到本地**的路径，其次中心地址，最后回落版本。
+            to_version: staged_to.as_deref().or(artifact_url).unwrap_or(to_version),
             component,
         };
         let mut command = self.executor.command(&invocation);
@@ -870,6 +921,110 @@ fn versions_match(expected: &str, current: &str) -> bool {
     }
 }
 
+fn is_http_url(value: &str) -> bool {
+    value.starts_with("https://") || value.starts_with("http://")
+}
+
+/// 取中心制品到 `<state>/artifacts/`（可选校验摘要），返回**本机路径**。
+///
+/// 为什么由 gwlinkd 取：`gops` 不持中心信任，把中心地址交给它会在 HEAD 阶段就
+/// `error sending request`（私有 CA）。取包下沉到持信任的组件是既定分层
+/// （见 `wist-design/doc/design/edge/center-content-delivery.md`）。
+async fn stage_artifact(
+    state_dir: &Path,
+    client: &reqwest::Client,
+    url: &str,
+    expected_sha256: Option<&str>,
+) -> UpgradeResult<PathBuf> {
+    let filename = artifact_filename(url)?;
+    let bytes = wist_artifact::source::read_source_with_client(
+        client,
+        url,
+        wist_artifact::source::MAX_ARTIFACT_BYTES,
+        wist_artifact::source::FETCH_TIMEOUT,
+    )
+    .await
+    .map_err(|err| UpgradeReason::Artifact.err(format!("取包失败 {url}: {err}")))?;
+
+    // 中心带摘要就核（① 升级目前不带，仅 gwlinkd 自更新 / ② 带）。
+    if let Some(expected) = expected_sha256
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let expected = wist_artifact::digest::parse_digest(expected).map_err(|err| {
+            UpgradeReason::Artifact.err(format!("期望摘要形态不对（{expected}）：{err}"))
+        })?;
+        let actual = wist_artifact::digest::sha256_hex_bytes(&bytes);
+        if actual != expected {
+            return Err(UpgradeReason::Artifact
+                .err(format!("制品摘要不符：期望 {expected}，实得 {actual}")));
+        }
+    }
+
+    let dir = state_dir.join("artifacts");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|err| UpgradeReason::Io.err(format!("建制品目录失败 {}: {err}", dir.display())))?;
+    let target = dir.join(&filename);
+    // 先写 `<name>.partial` 再改名：半截文件不会被执行器读到。
+    let partial = dir.join(format!("{filename}.partial"));
+    tokio::fs::write(&partial, &bytes)
+        .await
+        .map_err(|err| UpgradeReason::Io.err(format!("写制品失败 {}: {err}", partial.display())))?;
+    tokio::fs::rename(&partial, &target).await.map_err(|err| {
+        UpgradeReason::Io.err(format!("落盘制品失败 {}: {err}", target.display()))
+    })?;
+
+    prune_artifacts(&dir, 5).await;
+    Ok(target)
+}
+
+/// 从制品地址取**安全文件名**（末段，去 query / fragment）。
+fn artifact_filename(url: &str) -> UpgradeResult<String> {
+    let name = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('\\')
+        || name.chars().any(char::is_control)
+    {
+        return Err(UpgradeReason::Artifact.err(format!("从制品地址取不出安全文件名：{url}")));
+    }
+    Ok(name.to_string())
+}
+
+/// 制品目录是升级中转区：只留最新 `keep` 份（防止无界增长）。失败只告警。
+async fn prune_artifacts(dir: &Path, keep: usize) {
+    let dir = dir.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                let meta = entry.metadata().ok()?;
+                if !meta.is_file() {
+                    return None;
+                }
+                Some((meta.modified().unwrap_or(std::time::UNIX_EPOCH), path))
+            })
+            .collect();
+        files.sort_by_key(|(time, _)| std::cmp::Reverse(*time));
+        for (_, path) in files.into_iter().skip(keep) {
+            let _ = std::fs::remove_file(path);
+        }
+    })
+    .await;
+}
+
 /// 版本串归一化：去空白 + 去前导 `v` / `V`（中心 release 版本可能带 `v`，编译版本不带）。
 fn normalize_version(version: &str) -> String {
     version.trim().trim_start_matches(['v', 'V']).to_string()
@@ -1176,6 +1331,130 @@ mod tests {
         let record = state::read_upgrade_record(&dir).expect("record");
         assert_eq!(record.to_version, "0.1.27");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 极简制品桩：任意 GET 都回这段字节（用于「取件下沉」用例）。
+    async fn serve_bytes(bytes: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let bytes = bytes.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        bytes.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&bytes).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// ① 升级的取件也下沉到 gwlinkd：装上制品客户端后，执行器拿到的是**本机路径**而不是中心地址
+    /// （gops 不持中心信任，拿中心地址会在 HEAD 阶段 `error sending request`）。
+    #[tokio::test]
+    async fn start_stages_a_center_artifact_locally_before_calling_the_executor() {
+        let dir = temp_dir("args-staged");
+        let payload = b"fake-gateway-stack-package".to_vec();
+        let digest = wist_artifact::digest::sha256_hex_bytes(&payload);
+        let base = serve_bytes(payload.clone()).await;
+        let url = format!("{base}/wist-gateway-stack-v0.1.44-alpha.tar.gz");
+
+        let driver = UpgradeDriver::new(
+            GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string()),
+            &dir,
+        )
+        .with_artifact_client(reqwest::Client::new());
+        driver
+            .start_with_digest(
+                "w-stage",
+                "0.1.43",
+                "v0.1.44-alpha",
+                Some("wist-gateway-stack"),
+                None,
+                Some(&url),
+                Some(&digest),
+            )
+            .await
+            .expect("start");
+        let _ = wait_terminal(&dir).await;
+
+        let staged = dir.join("artifacts/wist-gateway-stack-v0.1.44-alpha.tar.gz");
+        assert_eq!(
+            std::fs::read(&staged).unwrap_or_else(|err| panic!("{}: {err}", staged.display())),
+            payload,
+            "制品要落成可读的本机文件"
+        );
+        let args = std::fs::read_to_string(dir.join("args.txt")).expect("args");
+        assert!(
+            !args.contains("http://"),
+            "执行器不该再拿到（它取不到的中心）地址：{args}"
+        );
+        assert!(
+            args.contains(&format!("--to {}", staged.display())),
+            "--to 应是本机路径：{args}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 摘要不符：**不发执行器**，落可读失败（否则 gops 会拿错包去升级）。
+    #[tokio::test]
+    async fn start_refuses_a_staged_artifact_with_the_wrong_digest() {
+        let dir = temp_dir("args-staged-digest");
+        let payload = b"actual-bytes".to_vec();
+        let base = serve_bytes(payload).await;
+        let url = format!("{base}/wist-gateway-stack-v0.1.44-alpha.tar.gz");
+        let wrong = "0".repeat(64);
+
+        let driver = UpgradeDriver::new(
+            GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string()),
+            &dir,
+        )
+        .with_artifact_client(reqwest::Client::new());
+        let err = driver
+            .start_with_digest(
+                "w-stage-bad",
+                "0.1.43",
+                "v0.1.44-alpha",
+                Some("wist-gateway-stack"),
+                None,
+                Some(&url),
+                Some(&wrong),
+            )
+            .await
+            .expect_err("digest mismatch must fail");
+        assert!(err.to_string().contains("摘要不符"), "{err}");
+
+        let record = wait_terminal(&dir).await;
+        assert_eq!(record.status, "failed");
+        assert!(record.detail.contains("摘要不符"), "{}", record.detail);
+        assert!(!dir.join("args.txt").exists(), "摘要不符时执行器不该被启动");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 从制品地址取安全文件名：去 query / fragment，拒空 / `.` / `..` / 分隔符 / 控制字符。
+    #[test]
+    fn artifact_filename_keeps_only_a_safe_last_segment() {
+        assert_eq!(
+            artifact_filename("https://c/a/wist-gateway-stack-v1.tar.gz?x=1").unwrap(),
+            "wist-gateway-stack-v1.tar.gz"
+        );
+        assert_eq!(
+            artifact_filename("https://c/a/p.tar.gz#frag").unwrap(),
+            "p.tar.gz"
+        );
+        for bad in ["https://c/", "https://c/..", "https://c/a\\b.tar.gz"] {
+            assert!(artifact_filename(bad).is_err(), "{bad}");
+        }
     }
 
     #[tokio::test]

@@ -414,7 +414,10 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
         config
             .upgrade_verify_timeout_seconds
             .unwrap_or(RECOVERY_VERIFY_TIMEOUT.as_secs()),
-    ));
+    ))
+    // ① 升级的取件也下沉到 gwlinkd：gops 不持中心信任，直接把中心地址交给它会在 HEAD 阶段
+    // 报 `error sending request`（私有 CA）。装上制品客户端后，驱动先取到本地再给 gops 路径。
+    .with_artifact_client(client.artifact_http_client());
     // 无状态工具目录（`[[upgrade.component]] install = "tool-copy"`）：装配进程内安装器。
     // 这类组件不经 gops 工程（也就绕开 `upgrade_project_dir` 前置），就地覆盖 `PATH` 上的二进制。
     let tool_binaries: BTreeMap<String, String> = config
