@@ -3,6 +3,22 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.13.3-alpha] - 2026-10-18
+
+### 修复
+
+- **① 升级（网关栈）取件下沉到 gwlinkd**：`gops` 不持中心信任（私有 CA），直接让它 HEAD 中心
+  制品地址会报 `检查目标包失败（HEAD）… error sending request`。
+  现在驱动先用 gwlinkd 的制品客户端（CA-S / 客户端证书）把包取到 `<state>/artifacts/`，
+  校验摘要（中心带了就核），再把**本机路径**交给 `gops prj upgrade --to <path>`。
+  取件 / 摘要不符会先落可读失败并回执，不再让 gops 报一串连接错误。
+- 制品中转目录只留最新 5 份（防止无界增长）。
+
+### 测试
+
+- 新增：中心制品先落本地再调用执行器（断言 `--to` 是本机路径、不再是 URL）；
+  摘要不符时**不启动**执行器；制品文件名安全化（去 query/fragment、拒 `..` / 分隔符）。
+
 ## [0.13.2-alpha] - 2026-10-18
 
 ### 修复
