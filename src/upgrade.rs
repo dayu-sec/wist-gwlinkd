@@ -832,7 +832,7 @@ fn self_update_settlement(to_version: &str, current_version: &str) -> (String, S
             "重启后无法核对版本：计划未带目标版本".to_string(),
         );
     }
-    if current == expected {
+    if versions_match(&expected, &current) {
         (
             "done".to_string(),
             "verify".to_string(),
@@ -846,6 +846,27 @@ fn self_update_settlement(to_version: &str, current_version: &str) -> (String, S
                 "重启后版本不符：当前 {current_version}，期望 {to_version}（未回到目标版本，请查看服务日志）"
             ),
         )
+    }
+}
+
+/// 两侧版本是不是**同一个版本**：先比归一后的整串，再比**数字核心**。
+///
+/// 为什么还要比核心：中心记的版本来自**制品文件名 / tag**（`v0.13.1-alpha`），而二进制自报的
+/// 是 `version.txt`（`0.13.1`）—— 通道后缀（`-alpha` / `-beta`）只存在于 tag，不在包版本里。
+/// 只比整串会把一次成功的自更新判成「版本不符」（实测：当前 0.13.1，期望 v0.13.1-alpha）。
+///
+/// 反过来 `0.13.1` 与 `0.13.2` 的核心不同，仍然判失败 —— 不放宽真实的版本差异；
+/// 认不出的版本串也不猜（回落到整串比较的结果）。
+fn versions_match(expected: &str, current: &str) -> bool {
+    if expected == current {
+        return true;
+    }
+    match (
+        wist_artifact::version::parse_version(expected),
+        wist_artifact::version::parse_version(current),
+    ) {
+        (Some(expected), Some(current)) => expected == current,
+        _ => false,
     }
 }
 
@@ -1315,6 +1336,37 @@ mod tests {
         );
         assert_eq!(self_update_settlement("0.12.0", "0.11.0").0, "failed");
         assert_eq!(self_update_settlement("", "0.11.0").0, "failed");
+    }
+
+    /// 回归：中心记的是 **tag**（`v0.13.1-alpha`），二进制自报的是 **`version.txt`**（`0.13.1`）。
+    /// 通道后缀只在 tag 上 —— 只比整串会把一次成功的自更新判成「版本不符」。
+    #[test]
+    fn self_update_settlement_treats_a_channel_suffix_as_the_same_version() {
+        for (target, current) in [
+            ("v0.13.1-alpha", "0.13.1"),
+            ("0.13.1-alpha", "0.13.1"),
+            ("v0.13.1-beta", "0.13.1"),
+            ("0.13.1", "0.13.1"),
+            ("  v0.13.1-alpha  ", "0.13.1"),
+        ] {
+            assert_eq!(
+                self_update_settlement(target, current).0,
+                "done",
+                "{target} vs {current} 应判为同一版本"
+            );
+        }
+        // 真实版本差异不能放宽：核心不同仍然失败。
+        for (target, current) in [
+            ("v0.13.2-alpha", "0.13.1"),
+            ("v0.13.1-alpha", "0.13.0"),
+            ("v0.14.0", "0.13.9"),
+        ] {
+            assert_eq!(
+                self_update_settlement(target, current).0,
+                "failed",
+                "{target} vs {current} 是真实差异，不能判成功"
+            );
+        }
     }
 
     /// 自更新摘要不符 → 落可读失败、旧二进制原封不动、**不请求退出**。
