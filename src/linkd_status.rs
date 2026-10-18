@@ -18,6 +18,11 @@ pub struct GwlinkdStatus {
     pub gateway_id: String,
     pub instance_id: String,
     pub version: String,
+    /// 宿主依赖工具版本（`$HOME/bin`；未安装 / 探测失败 → 跳过该键）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gops_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gx_version: Option<String>,
     pub center_endpoint: String,
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -48,6 +53,8 @@ mod tests {
             gateway_id: "gw-1".into(),
             instance_id: "gw-1/inst-1".into(),
             version: "0.4.0".into(),
+            gops_version: None,
+            gx_version: None,
             center_endpoint: "https://center.example".into(),
             state: STATE_LINKED.into(),
             credential_expires_at: None,
@@ -69,6 +76,11 @@ mod tests {
         }
         assert!(!object.contains_key("last_error"), "None 应被跳过: {value}");
         assert!(
+            !object.contains_key("gops_version"),
+            "None 应被跳过: {value}"
+        );
+        assert!(!object.contains_key("gx_version"), "None 应被跳过: {value}");
+        assert!(
             value["reported_at"].is_string(),
             "reported_at 应为 RFC3339 串: {value}"
         );
@@ -81,6 +93,8 @@ mod tests {
             gateway_id: "gw-1".into(),
             instance_id: "gw-1/inst-1".into(),
             version: "0.4.0".into(),
+            gops_version: Some("2.4.0".into()),
+            gx_version: Some("0.17.0".into()),
             center_endpoint: "https://center.example".into(),
             state: STATE_DEGRADED.into(),
             credential_expires_at: Some("2026-12-01T00:00:00Z".into()),
@@ -91,6 +105,8 @@ mod tests {
         let value = serde_json::to_value(&status).expect("serialize");
         assert_eq!(value["state"], "Degraded");
         assert_eq!(value["last_error"], "中心不可达");
+        assert_eq!(value["gops_version"], "2.4.0");
+        assert_eq!(value["gx_version"], "0.17.0");
         assert!(value["credential_expires_at"].is_string(), "{value}");
         assert!(value["last_center_report_at"].is_string(), "{value}");
     }

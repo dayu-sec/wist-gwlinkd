@@ -1441,6 +1441,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 非 HTTP 来源（本机路径 / 版本号）**不取件**，原样交给执行器。
+    ///
+    /// 这条钉住「下沉只针对中心地址」：有人在现场用本地包路径时，gwlinkd 不该去拉它。
+    #[tokio::test]
+    async fn start_passes_a_local_path_through_without_staging() {
+        let dir = temp_dir("args-local-path");
+        let local = dir.join("wist-gateway-stack-local.tar.gz");
+        std::fs::write(&local, b"local-package").expect("write local");
+
+        let driver = UpgradeDriver::new(
+            GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string()),
+            &dir,
+        )
+        // 即使装了取件客户端，非 HTTP 来源也不该走网络。
+        .with_artifact_client(reqwest::Client::new());
+        driver
+            .start_with_digest(
+                "w-local",
+                "0.1.43",
+                "v0.1.44-alpha",
+                Some("wist-gateway-stack"),
+                None,
+                Some(local.to_string_lossy().as_ref()),
+                None,
+            )
+            .await
+            .expect("start");
+        let _ = wait_terminal(&dir).await;
+
+        let args = std::fs::read_to_string(dir.join("args.txt")).expect("args");
+        assert!(
+            args.contains(&format!("--to {}", local.display())),
+            "本机路径应原样透传：{args}"
+        );
+        assert!(
+            !dir.join("artifacts").exists(),
+            "非 HTTP 来源不该产生制品中转文件"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// 从制品地址取安全文件名：去 query / fragment，拒空 / `.` / `..` / 分隔符 / 控制字符。
     #[test]
     fn artifact_filename_keeps_only_a_safe_last_segment() {

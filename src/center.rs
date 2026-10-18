@@ -506,6 +506,8 @@ mod tests {
             instance_id: "gw-1/boot-1".into(),
             public_base_url: Some("https://gw.example.com".into()),
             version: "0.1.15".into(),
+            gops_version: None,
+            gx_version: None,
             status: "online".into(),
             health: "ok".into(),
             memory_bytes: None,

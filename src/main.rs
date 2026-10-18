@@ -12,6 +12,7 @@ use wist_gwlinkd::center::{self, CenterClient};
 use wist_gwlinkd::config::{
     Config, UpgradeInstall, pub_config_path, remove_link_token, upsert_link_settings,
 };
+use wist_gwlinkd::deps::ToolVersions;
 use wist_gwlinkd::doctor::{self, Status};
 use wist_gwlinkd::error::{
     CenterError, CenterReason, CenterResult, GwlinkdError, GwlinkdReason, GwlinkdResult,
@@ -40,6 +41,9 @@ const STATUS_INTERVAL_SECS: u64 = 30;
 const BACKOFF_BASE_SECS: u64 = 60;
 /// 退避上限（秒）。
 const BACKOFF_MAX_SECS: u64 = 1800;
+
+/// 宿主依赖工具版本刷新间隔（秒）：安装 / 升级 gops、gx 后不必重启 gwlinkd。
+const TOOL_VERSION_REFRESH_SECS: u64 = 600;
 
 fn config_path() -> PathBuf {
     std::env::var("WIST_GWLINKD_CONFIG")
@@ -471,6 +475,9 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
     let mut linkd_state = STATE_LINKED.to_string();
     let mut linkd_last_error: Option<String> = None;
     let mut linkd_last_report_at: Option<String> = None;
+    // 宿主侧依赖工具（gops / gx，装在 `$HOME/bin`）版本：启动探一次，之后定期刷新。
+    let mut tool_versions = ToolVersions::detect(config.upgrader_program.as_deref()).await;
+    let mut next_tool_probe_at = Instant::now() + Duration::from_secs(TOOL_VERSION_REFRESH_SECS);
 
     // 启动收尾：上次运行留下的「被判死」升级（升级器被中断，机器可能停在中间态）。
     // 放在循环外只做一次（这是「上一次运行」的遗留态，不是运行中会反复出现的东西）。
@@ -496,6 +503,12 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
 
     loop {
         ticker.tick().await;
+
+        // 依赖工具版本变化很慢（安装 / 升级才变），不必每拍探测；定期刷新即可。
+        if Instant::now() >= next_tool_probe_at {
+            tool_versions = ToolVersions::detect(config.upgrader_program.as_deref()).await;
+            next_tool_probe_at = Instant::now() + Duration::from_secs(TOOL_VERSION_REFRESH_SECS);
+        }
 
         // 上一次是**自更新**（记录停在 `restarting`）→ 用当前编译版本核对并回执；
         // 回执失败保持 `restarting`，下一轮再试（不把“没送到”记成“已完成”）。
@@ -804,6 +817,8 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                     .and_then(|state| state.public_base_url.clone()),
                 // 报的是**网关（容器）版本**，不是 gwlinkd 自身版本 —— 这条状态描述的是网关。
                 version: gateway_version,
+                gops_version: tool_versions.gops.clone(),
+                gx_version: tool_versions.gx.clone(),
                 // 中心侧约定：`status` 是**在线/离线**（中心按 `== "online"` 计数与展示）。
                 // 之前误发 `"running"`（那是生命周期 `Running` 的概念）→ 中心把在跑的网关算成离线。
                 status: "online".to_string(),
@@ -885,6 +900,8 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                 gateway_id: config.gateway_id.clone(),
                 instance_id: instance_id.clone(),
                 version: wist_gwlinkd::VERSION.to_string(),
+                gops_version: tool_versions.gops.clone(),
+                gx_version: tool_versions.gx.clone(),
                 center_endpoint: config.control_center_endpoint.clone(),
                 state: linkd_state.clone(),
                 credential_expires_at: credential
@@ -1621,7 +1638,15 @@ async fn wait_for_gateway_request(
         "event=WaitingLinkRequest gateway_id={}（等待页面「链接上级」提交接入请求）",
         config.gateway_id
     );
+    // 接入前也把依赖工具版本带上：页面在「等待接入」状态下同样能看到宿主工具是否就绪。
+    let mut tool_versions = ToolVersions::detect(config.upgrader_program.as_deref()).await;
+    let mut next_tool_probe_at = Instant::now() + Duration::from_secs(TOOL_VERSION_REFRESH_SECS);
     loop {
+        // 等待接入可能持续很久（人去装 gops / 点页面）：定期刷新，不把启动时的快照一直挂到接入完成。
+        if Instant::now() >= next_tool_probe_at {
+            tool_versions = ToolVersions::detect(config.upgrader_program.as_deref()).await;
+            next_tool_probe_at = Instant::now() + Duration::from_secs(TOOL_VERSION_REFRESH_SECS);
+        }
         match retry_leftover_registration(config, trust, identity).await {
             Ok(true) => return Ok(()),
             Ok(false) => {}
@@ -1638,6 +1663,8 @@ async fn wait_for_gateway_request(
             instance_id: state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)
                 .unwrap_or_default(),
             version: wist_gwlinkd::VERSION.to_string(),
+            gops_version: tool_versions.gops.clone(),
+            gx_version: tool_versions.gx.clone(),
             center_endpoint: config.control_center_endpoint.clone(),
             state: STATE_WAITING_LINK_REQUEST.to_string(),
             credential_expires_at: None,
@@ -1922,10 +1949,13 @@ async fn announce_unlinked_to_gateway(config: &Config) {
             return;
         }
     };
+    let tool_versions = ToolVersions::detect(config.upgrader_program.as_deref()).await;
     let status = GwlinkdStatus {
         gateway_id: config.gateway_id.clone(),
         instance_id: String::new(),
         version: wist_gwlinkd::VERSION.to_string(),
+        gops_version: tool_versions.gops.clone(),
+        gx_version: tool_versions.gx.clone(),
         center_endpoint: config.control_center_endpoint.clone(),
         state: STATE_WAITING_LINK_REQUEST.to_string(),
         credential_expires_at: None,
