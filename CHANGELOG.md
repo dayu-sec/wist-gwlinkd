@@ -3,6 +3,18 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.14.1-alpha] - 2026-10-18
+
+### 修复
+
+- **空目标版本的升级计划不再「没有反馈」**：计划里没有 `target_version` 时，中心派生不出制品地址，
+  网关无事可做。之前只白打一行 warn（不写记录、不回执、不落游标），条目永远停在 `dispatched`，
+  而且每 30s 重取一次。现在回执 `failed` + 落游标 —— 中心能看到原因，也不再空转。
+
+### 测试 / 验证
+
+- 全量 `255 + 48 + 7` 通过，clippy / fmt 干净。
+
 ## [0.14.0-alpha] - 2026-10-18
 
 ### 新增
