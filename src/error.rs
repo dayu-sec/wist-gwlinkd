@@ -82,6 +82,9 @@ pub enum GwlinkdReason {
     /// 发布 ②：把中心派下的 agent 包环回推进网关包管理。
     #[orion_error(identity = "biz.warp.gwlinkd.agent_package")]
     AgentPackage,
+    /// 知识库包下发：把中心派下的 `wist-knowledge` 包落到投放目录并环回推进网关知识库。
+    #[orion_error(identity = "biz.warp.gwlinkd.knowledge_package")]
+    KnowledgePackage,
     /// 配置加载 / 校验（lift [`ConfigReason`]）。
     #[orion_error(identity = "biz.warp.gwlinkd.config")]
     Config,

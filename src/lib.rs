@@ -17,6 +17,7 @@ pub mod doctor;
 pub mod error;
 pub mod executor;
 pub mod identity;
+pub mod knowledge_package;
 pub mod link_request;
 pub mod linkd_status;
 // NOTE(hand-added): 运行日志（`[log]` 段）已抽到共享 crate `wist-log`。
