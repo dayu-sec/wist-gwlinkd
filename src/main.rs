@@ -699,11 +699,22 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                                 }
                             }
                         } else if intent == PlanIntent::Upgrade && to_version.is_empty() {
-                            // 升级没有目标版本：不落游标（中心补上版本后还能重派），下一轮再看。
+                            // 升级没有目标版本：**终态失败**并落游标。
+                            // 中心按版本反查制品，留空就派生不出地址 —— 网关无事可做；不落游标
+                            // 就会每 30s 重取一次，条目永远停在 dispatched（现场就是“没有反馈”）。
                             log::warn!(
                                 "event=UpgradePlanWithoutVersionSkipped plan_id={:?}",
                                 plan.plan_id
                             );
+                            finish_plan(
+                                config,
+                                &client,
+                                &plan,
+                                "failed",
+                                "计划未带目标版本：中心无法派生制品地址（请重新创建带版本的计划）"
+                                    .to_string(),
+                            )
+                            .await;
                         } else if intent == PlanIntent::Upgrade {
                             let reporter = UpgradeReporter {
                                 client: client.clone(),
