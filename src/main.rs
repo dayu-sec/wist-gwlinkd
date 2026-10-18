@@ -621,7 +621,10 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                         .action
                         .as_deref()
                         .unwrap_or(wist_control::ACTION_UPGRADE);
-                    if !already && !to_version.is_empty() {
+                    let intent = plan_intent(action);
+                    // **只有升级**必须有目标版本；包下发（agent / 知识库）与未识动作也要进来：
+                    // 否则空版本的计划会每轮重试且永远没有回执。
+                    if !already {
                         // 从版本取游标记的「上次目标」；不知道就 unknown（**不再拿 gwlinkd 自身版本硬比** —— 版本空间不同）。
                         let from_version = if cursor.last_to_version.is_empty() {
                             "unknown".to_string()
@@ -634,30 +637,58 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                             plan.component,
                             plan.artifact_sha256.is_some()
                         );
-                        if action == wist_control::ACTION_PUSH_AGENT_PACKAGE {
+                        if intent == PlanIntent::PushAgentPackage {
                             // ②「Agent 包下发」：环回把包写进网关包管理 —— **不重建网关**，升不升由网关决定。
                             match &agent_package_client {
                                 Some(pusher) => {
                                     drive_agent_package_push(config, &client, pusher, &plan).await
                                 }
-                                None => log::warn!(
-                                    "event=AgentPackagePushSkipped reason=no_gateway_self_endpoint plan_id={:?}",
-                                    plan.plan_id
-                                ),
+                                None => {
+                                    log::warn!(
+                                        "event=AgentPackagePushSkipped reason=no_gateway_self_endpoint plan_id={:?}",
+                                        plan.plan_id
+                                    );
+                                    finish_plan(
+                                        config,
+                                        &client,
+                                        &plan,
+                                        "failed",
+                                        "本机未配置 gateway_self_endpoint（无法环回交付网关）"
+                                            .to_string(),
+                                    )
+                                    .await;
+                                }
                             }
-                        } else if action == wist_control::ACTION_PUSH_KNOWLEDGE_PACKAGE {
+                        } else if intent == PlanIntent::PushKnowledgePackage {
                             // 「知识库包下发」：环回把包写进网关知识库管理（录入，可选激活）—— 不重建网关。
                             match &knowledge_package_client {
                                 Some(pusher) => {
                                     drive_knowledge_package_push(config, &client, pusher, &plan)
                                         .await
                                 }
-                                None => log::warn!(
-                                    "event=KnowledgePackagePushSkipped reason=no_gateway_self_endpoint plan_id={:?}",
-                                    plan.plan_id
-                                ),
+                                None => {
+                                    log::warn!(
+                                        "event=KnowledgePackagePushSkipped reason=no_gateway_self_endpoint plan_id={:?}",
+                                        plan.plan_id
+                                    );
+                                    finish_plan(
+                                        config,
+                                        &client,
+                                        &plan,
+                                        "failed",
+                                        "本机未配置 gateway_self_endpoint（无法环回交付网关）"
+                                            .to_string(),
+                                    )
+                                    .await;
+                                }
                             }
-                        } else if action == wist_control::ACTION_UPGRADE {
+                        } else if intent == PlanIntent::Upgrade && to_version.is_empty() {
+                            // 升级没有目标版本：不落游标（中心补上版本后还能重派），下一轮再看。
+                            log::warn!(
+                                "event=UpgradePlanWithoutVersionSkipped plan_id={:?}",
+                                plan.plan_id
+                            );
+                        } else if intent == PlanIntent::Upgrade {
                             let reporter = UpgradeReporter {
                                 client: client.clone(),
                                 state_dir: config.state_dir.clone(),
@@ -717,11 +748,21 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                             }
                         } else {
                             // 未知动作：**不**回落成 `upgrade` —— 拿知识库 / 新类型包去跑 gops 会直接搞坏
-                            // 网关。留痕并跳过；需要处理请先升 gwlinkd（见各下发特性的「升级顺序」）。
+                            // 网关。回执失败并落游标（不再每轮重试，也不再静默）。
                             log::warn!(
                                 "event=UnknownPlanActionSkipped plan_id={:?} action={action}",
                                 plan.plan_id
                             );
+                            finish_plan(
+                                config,
+                                &client,
+                                &plan,
+                                "failed",
+                                format!(
+                                    "wist-gwlinkd 不支持计划动作 `{action}`（先升级 gwlinkd 再重派）"
+                                ),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -859,6 +900,69 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
     }
 }
 
+/// 计划动作 → gwlinkd 的执行意图。
+///
+/// **未知动作绝不回落成升级**（2026-10-18 事故：旧版本把 `push-knowledge-package` 当 `upgrade` 跑 gops，
+/// 报「未知系统 wist-knowledge」）。这里把分派做成**纯函数**并单测钉住 —— 新增动作忘了加分支时，
+/// 结果是「拒绝并留痕」而不是「拿错包去装网关」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanIntent {
+    Upgrade,
+    PushAgentPackage,
+    PushKnowledgePackage,
+    Unsupported,
+}
+
+fn plan_intent(action: &str) -> PlanIntent {
+    match action {
+        wist_control::ACTION_UPGRADE => PlanIntent::Upgrade,
+        wist_control::ACTION_PUSH_AGENT_PACKAGE => PlanIntent::PushAgentPackage,
+        wist_control::ACTION_PUSH_KNOWLEDGE_PACKAGE => PlanIntent::PushKnowledgePackage,
+        _ => PlanIntent::Unsupported,
+    }
+}
+
+/// 「一份计划只驱一次」的收尾：回报中心（成败都报）+ 落游标（成败都落）。
+///
+/// 落游标是**幂等键**：不落就会被每轮轮询反复驱动（旧版本在失败分支不落，导致同一份计划
+/// 每 30s 重跑一次 gops）。回报失败只告警 —— 不能因为回执不通而让流程停摆。
+async fn finish_plan(
+    config: &Config,
+    client: &CenterClient,
+    plan: &wist_control::GatewayUpgradePlan,
+    status: &str,
+    detail: String,
+) {
+    let plan_id = plan.plan_id.clone().unwrap_or_else(|| "plan".to_string());
+    let to_version = plan.to_version.clone().unwrap_or_default();
+    let record = UpgradeRecord {
+        work_id: plan_id.clone(),
+        from_version: "unknown".to_string(),
+        to_version: to_version.clone(),
+        step: "fetch".to_string(),
+        status: status.to_string(),
+        detail,
+    };
+    if let Err(err) = client
+        .report_upgrade_result(&config.gateway_id, &record)
+        .await
+    {
+        log::warn!(
+            "event=PlanResultReportFailed plan_id={plan_id} status={status} error={}",
+            chain_one_line(&err)
+        );
+    }
+    if let Err(err) = state::save_upgrade_cursor(
+        &config.state_dir,
+        &UpgradeCursor {
+            last_plan_id: Some(plan_id),
+            last_to_version: to_version,
+        },
+    ) {
+        log::warn!("event=CursorSaveFailed error={}", chain_one_line(&err));
+    }
+}
+
 /// 驱动一次「Agent 包下发」（发布 ②）：把中心派下的 agentd 包**环回**推进同机网关的包管理，再回报中心。
 ///
 /// 与 ① 不同：**不重建网关** —— 只把包交给网关，升不升由网关决定。与 ① 同款「一份计划只驱一次」：
@@ -896,32 +1000,7 @@ async fn drive_agent_package_push(
         Err(message) => ("failed", message.to_string()),
     };
     // 回执中心：回填发布计划条目（状态折算在中心侧；`done → succeeded`）。
-    let record = UpgradeRecord {
-        work_id: plan_id.clone(),
-        from_version: "unknown".to_string(),
-        to_version: to_version.clone(),
-        step: "fetch".to_string(),
-        status: status.to_string(),
-        detail,
-    };
-    if let Err(err) = client
-        .report_upgrade_result(&config.gateway_id, &record)
-        .await
-    {
-        log::warn!(
-            "event=AgentPackageResultReportFailed plan_id={plan_id} error={}",
-            chain_one_line(&err)
-        );
-    }
-    if let Err(err) = state::save_upgrade_cursor(
-        &config.state_dir,
-        &UpgradeCursor {
-            last_plan_id: Some(plan_id),
-            last_to_version: to_version,
-        },
-    ) {
-        log::warn!("event=CursorSaveFailed error={}", chain_one_line(&err));
-    }
+    finish_plan(config, client, plan, status, detail).await;
 }
 
 /// 驱动一次「知识库包下发」：把中心派下的 `wist-knowledge` 包**环回**推进网关知识库管理，再回报中心。
@@ -954,32 +1033,7 @@ async fn drive_knowledge_package_push(
             ("failed", err.to_string())
         }
     };
-    let record = UpgradeRecord {
-        work_id: plan_id.clone(),
-        from_version: "unknown".to_string(),
-        to_version: to_version.clone(),
-        step: "fetch".to_string(),
-        status: status.to_string(),
-        detail,
-    };
-    if let Err(err) = client
-        .report_upgrade_result(&config.gateway_id, &record)
-        .await
-    {
-        log::warn!(
-            "event=KnowledgePackageResultReportFailed plan_id={plan_id} error={}",
-            chain_one_line(&err)
-        );
-    }
-    if let Err(err) = state::save_upgrade_cursor(
-        &config.state_dir,
-        &UpgradeCursor {
-            last_plan_id: Some(plan_id),
-            last_to_version: to_version,
-        },
-    ) {
-        log::warn!("event=CursorSaveFailed error={}", chain_one_line(&err));
-    }
+    finish_plan(config, client, plan, status, detail).await;
 }
 
 /// 取知识库包（gwlinkd 持中心信任）→ 落到投放目录（含 `.sig` 旁文件）→ 环回交付网关。
@@ -1015,98 +1069,102 @@ async fn deliver_knowledge_package(
             GwlinkdReason::KnowledgePackage
                 .err("未配置 agent_package_container_dir（网关容器路径前缀）")
         })?;
-
-    // 取包：gwlinkd 的制品客户端（带 CA-S / 客户端证书）。
-    let bytes = wist_artifact::source::read_source_with_client(
-        &client.artifact_http_client(),
-        &artifact_url,
-        wist_artifact::source::MAX_ARTIFACT_BYTES,
-        wist_artifact::source::FETCH_TIMEOUT,
-    )
-    .await
-    .map_err(|err| {
-        GwlinkdReason::KnowledgePackage.err(format!("取包失败 {artifact_url}: {err}"))
-    })?;
-
-    // 摘要校验：不符即拒，绝不把错内容交付网关。
-    let expected = wist_artifact::digest::parse_digest(&artifact_sha256).map_err(|err| {
-        GwlinkdReason::KnowledgePackage
-            .err(format!("中心给的摘要形态不对（{artifact_sha256}）：{err}"))
-    })?;
-    let actual = wist_artifact::digest::sha256_hex_bytes(&bytes);
-    if actual != expected {
-        return Err(GwlinkdReason::KnowledgePackage
-            .err(format!("制品摘要不符：期望 {expected}，实得 {actual}")));
+    // 网关只接受 `https://` 或**容器内绝对路径**；相对路径会被直接拒（且报错点在网关，不好定位）。
+    if !container_dir.starts_with('/') {
+        return Err(GwlinkdReason::KnowledgePackage.err(format!(
+            "agent_package_container_dir 必须是网关容器内的绝对路径（当前：{container_dir}）"
+        )));
     }
 
-    let filename = safe_artifact_filename_with(&artifact_url, GwlinkdReason::KnowledgePackage)?;
-    let drop_path = drop_dir.join(&filename);
-    let write_dir = drop_dir.to_path_buf();
-    let write_target = drop_path.clone();
-    tokio::task::spawn_blocking(move || -> GwlinkdResult<()> {
-        std::fs::create_dir_all(&write_dir).source_err(
-            GwlinkdReason::KnowledgePackage,
-            format!("建投放目录失败 {}", write_dir.display()),
-        )?;
-        let partial = partial_path(&write_target);
-        std::fs::write(&partial, &bytes).source_err(
-            GwlinkdReason::KnowledgePackage,
-            format!("写投放文件失败 {}", partial.display()),
-        )?;
-        std::fs::rename(&partial, &write_target).source_err(
-            GwlinkdReason::KnowledgePackage,
-            format!("落盘投放文件失败 {}", write_target.display()),
+    // 取包与交付：失败也要走到下面的清旧（投放目录是**中转区**，不能因反复失败而无界增长）。
+    let outcome: GwlinkdResult<()> = async {
+        // 取包：gwlinkd 的制品客户端（带 CA-S / 客户端证书）。
+        let bytes = wist_artifact::source::read_source_with_client(
+            &client.artifact_http_client(),
+            &artifact_url,
+            wist_artifact::source::MAX_ARTIFACT_BYTES,
+            wist_artifact::source::FETCH_TIMEOUT,
         )
-    })
-    .await
-    .map_err(|err| GwlinkdReason::KnowledgePackage.err(format!("投放任务异常: {err}")))??;
-
-    // 签名旁文件：`<来源>.sig`（发布侧同名）。取不到不阻断，只记日志。
-    let signature_url = format!("{artifact_url}.sig");
-    if let Ok(signature) = wist_artifact::source::read_source_with_client(
-        &client.artifact_http_client(),
-        &signature_url,
-        wist_artifact::source::MAX_ARTIFACT_BYTES,
-        wist_artifact::source::FETCH_TIMEOUT,
-    )
-    .await
-    {
-        let sig_path = drop_dir.join(format!("{filename}.sig"));
-        let write_dir = drop_dir.to_path_buf();
-        let write_target = sig_path.clone();
-        tokio::task::spawn_blocking(move || -> GwlinkdResult<()> {
-            std::fs::create_dir_all(&write_dir).source_err(
-                GwlinkdReason::KnowledgePackage,
-                format!("建投放目录失败 {}", write_dir.display()),
-            )?;
-            let partial = partial_path(&write_target);
-            std::fs::write(&partial, &signature).source_err(
-                GwlinkdReason::KnowledgePackage,
-                format!("写签名文件失败 {}", partial.display()),
-            )?;
-            std::fs::rename(&partial, &write_target).source_err(
-                GwlinkdReason::KnowledgePackage,
-                format!("落盘签名文件失败 {}", write_target.display()),
-            )
-        })
         .await
-        .map_err(|err| GwlinkdReason::KnowledgePackage.err(format!("签名投放任务异常: {err}")))??;
-    } else {
-        log::warn!("event=KnowledgePackageSignatureUnavailable url={signature_url}");
+        .map_err(|err| {
+            GwlinkdReason::KnowledgePackage.err(format!("取包失败 {artifact_url}: {err}"))
+        })?;
+
+        // 摘要校验：不符即拒，绝不把错内容交付网关。
+        let expected = wist_artifact::digest::parse_digest(&artifact_sha256).map_err(|err| {
+            GwlinkdReason::KnowledgePackage
+                .err(format!("中心给的摘要形态不对（{artifact_sha256}）：{err}"))
+        })?;
+        let actual = wist_artifact::digest::sha256_hex_bytes(&bytes);
+        if actual != expected {
+            return Err(GwlinkdReason::KnowledgePackage
+                .err(format!("制品摘要不符：期望 {expected}，实得 {actual}")));
+        }
+
+        let filename = safe_artifact_filename_with(&artifact_url, GwlinkdReason::KnowledgePackage)?;
+        write_drop_file(drop_dir, &filename, bytes).await?;
+
+        // 签名旁文件：`<来源>.sig`（发布侧同名）。取不到不阻断，只记日志。
+        let signature_url = format!("{artifact_url}.sig");
+        match wist_artifact::source::read_source_with_client(
+            &client.artifact_http_client(),
+            &signature_url,
+            wist_artifact::source::MAX_ARTIFACT_BYTES,
+            wist_artifact::source::FETCH_TIMEOUT,
+        )
+        .await
+        {
+            Ok(signature) => {
+                write_drop_file(drop_dir, &format!("{filename}.sig"), signature).await?;
+            }
+            // 已存在的旧 `.sig` 必须删掉：否则网关会拿上一版的签名去验这一版
+            // （验签失败的报错会指向签名，而不是「这次没取到签名」）。
+            Err(_) => {
+                log::warn!("event=KnowledgePackageSignatureUnavailable url={signature_url}");
+                let stale = drop_dir.join(format!("{filename}.sig"));
+                let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(stale)).await;
+            }
+        }
+
+        let container_path = format!("{}/{}", container_dir.trim_end_matches('/'), filename);
+        pusher
+            .push(&container_path, &artifact_sha256, &artifact_url, activate)
+            .await?;
+        Ok(())
     }
+    .await;
 
-    let container_path = format!("{}/{}", container_dir.trim_end_matches('/'), filename);
-    pusher
-        .push(&container_path, &artifact_sha256, &artifact_url, activate)
-        .await?;
-
-    // 投放目录是交付中转区：按数量清旧（保留数不低于本批目标数）。
+    // 投放目录是交付中转区：按数量清旧（保留数不低于本批目标数；失败也清）。
     let keep = match config.agent_package_drop_keep {
         Some(0) => Some(0),
         Some(keep) => Some(keep.max(2)),
         None => Some(DEFAULT_AGENT_PACKAGE_DROP_KEEP.max(2)),
     };
     prune_old_drops(drop_dir, keep).await;
+    outcome
+}
+
+/// 把一个交付文件落到投放目录：先写 `<name>.partial` 再改名，避免半截文件被网关读到。
+async fn write_drop_file(dir: &Path, filename: &str, bytes: Vec<u8>) -> GwlinkdResult<()> {
+    let write_dir = dir.to_path_buf();
+    let target = dir.join(filename);
+    tokio::task::spawn_blocking(move || -> GwlinkdResult<()> {
+        std::fs::create_dir_all(&write_dir).source_err(
+            GwlinkdReason::KnowledgePackage,
+            format!("建投放目录失败 {}", write_dir.display()),
+        )?;
+        let partial = partial_path(&target);
+        std::fs::write(&partial, &bytes).source_err(
+            GwlinkdReason::KnowledgePackage,
+            format!("写投放文件失败 {}", partial.display()),
+        )?;
+        std::fs::rename(&partial, &target).source_err(
+            GwlinkdReason::KnowledgePackage,
+            format!("落盘投放文件失败 {}", target.display()),
+        )
+    })
+    .await
+    .map_err(|err| GwlinkdReason::KnowledgePackage.err(format!("投放任务异常: {err}")))??;
     Ok(())
 }
 
@@ -1173,6 +1231,12 @@ async fn deliver_agent_package(
             GwlinkdReason::AgentPackage
                 .err("未配置 agent_package_container_dir（网关容器路径前缀）")
         })?;
+    // 网关只接受 `https://` 或**容器内绝对路径**；相对路径会被直接拒（且报错点在网关，不好定位）。
+    if !container_dir.starts_with('/') {
+        return Err(GwlinkdReason::AgentPackage.err(format!(
+            "agent_package_container_dir 必须是网关容器内的绝对路径（当前：{container_dir}）"
+        )));
+    }
 
     let outcome = async {
         // 逐平台：取包 → 校验 → 落盘 → 记下（本机路径，容器可见）。
@@ -2910,6 +2974,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 动作分派：**未知动作绝不回落成 `upgrade`**。
+    ///
+    /// 防的是 2026-10-18 的事故形态：旧版本把 `push-knowledge-package` 当成升级，拿知识库包跑 gops。
+    /// 新增动作忘了加分支时，期望结果是「拒绝并留痕」，而不是「拿错包去装网关」。
+    #[test]
+    fn unknown_plan_actions_never_fall_back_to_upgrade() {
+        assert_eq!(
+            plan_intent(wist_control::ACTION_UPGRADE),
+            PlanIntent::Upgrade
+        );
+        assert_eq!(
+            plan_intent(wist_control::ACTION_PUSH_AGENT_PACKAGE),
+            PlanIntent::PushAgentPackage
+        );
+        assert_eq!(
+            plan_intent(wist_control::ACTION_PUSH_KNOWLEDGE_PACKAGE),
+            PlanIntent::PushKnowledgePackage
+        );
+        for unknown in ["", "push-strategy-package", "upgrade ", "UPGRADE"] {
+            assert_eq!(
+                plan_intent(unknown),
+                PlanIntent::Unsupported,
+                "未知动作 {unknown:?} 必须落到 Unsupported（绝不升级）"
+            );
+        }
+    }
+
     /// 「知识库包下发」缺地址 / 切书 → 报可读原因，不落盘、不交付。
     #[tokio::test]
     async fn deliver_knowledge_package_requires_url_and_digest() {
@@ -3144,6 +3235,122 @@ mod tests {
         let config = test_config(&dir, "https://c".into());
         announce_unlinked_to_gateway(&config).await;
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 摘要不符 → 拒绝交付：不落盘、不推送（网关收到的字节必须与中心声明的一致）。
+    #[tokio::test]
+    async fn deliver_knowledge_package_refuses_a_digest_mismatch() {
+        let dir = temp_dir("knowledge-package-digest");
+        let payload = b"actual-bytes".to_vec();
+        let artifact_base = serve_artifact(payload).await;
+        let artifact_url = format!("{artifact_base}/wist-knowledge-0.3.0.tar.gz");
+        let (gw_base, _rx) = one_shot_gateway("200 OK", r#"{}"#).await;
+
+        let drop_dir = dir.join("packages");
+        let mut config = test_config(&dir, "http://127.0.0.1:9".to_string());
+        config.agent_package_drop_dir = Some(drop_dir.clone());
+        config.agent_package_container_dir = Some("/packages".into());
+        let client = CenterClient::new("http://127.0.0.1:9".to_string());
+        let pusher = KnowledgePackageClient::new(gw_base);
+
+        // 中心声明的摘要与制品字节不一致。
+        let wrong = "0".repeat(64);
+        let err = deliver_knowledge_package(
+            &config,
+            &client,
+            &pusher,
+            &knowledge_plan(Some(&artifact_url), Some(&wrong), false),
+            false,
+        )
+        .await
+        .expect_err("digest mismatch must fail");
+        assert!(err.to_string().contains("摘要不符"), "{err}");
+        assert!(
+            !drop_dir.join("wist-knowledge-0.3.0.tar.gz").exists(),
+            "摘要不符时不得落盘"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 取不到 `.sig` 不阻断交付，但要把**除旧的同名 `.sig`** 删掉
+    /// （否则网关会拿上一版的签名去验这一版）。
+    #[tokio::test]
+    async fn deliver_knowledge_package_without_a_signature_drops_the_stale_one() {
+        let dir = temp_dir("knowledge-package-no-sig");
+        let payload = b"knowledge-bytes".to_vec();
+        let digest = wist_artifact::digest::sha256_hex_bytes(&payload);
+        let artifact_base = serve_artifact_only("/wist-knowledge-0.3.0.tar.gz", payload).await;
+        let artifact_url = format!("{artifact_base}/wist-knowledge-0.3.0.tar.gz");
+        let (gw_base, rx) = one_shot_gateway("200 OK", r#"{"package_id":"kbp-a"}"#).await;
+
+        let drop_dir = dir.join("packages");
+        std::fs::create_dir_all(&drop_dir).expect("mkdir");
+        // 上一版遗留的签名：取不到新签名时必须被清掉。
+        let stale = drop_dir.join("wist-knowledge-0.3.0.tar.gz.sig");
+        std::fs::write(&stale, b"stale-signature").expect("write stale sig");
+
+        let mut config = test_config(&dir, "http://127.0.0.1:9".to_string());
+        config.agent_package_drop_dir = Some(drop_dir.clone());
+        config.agent_package_container_dir = Some("/packages".into());
+        let client = CenterClient::new("http://127.0.0.1:9".to_string());
+        let pusher = KnowledgePackageClient::new(gw_base);
+
+        deliver_knowledge_package(
+            &config,
+            &client,
+            &pusher,
+            &knowledge_plan(Some(&artifact_url), Some(&digest), false),
+            false,
+        )
+        .await
+        .expect("missing sig must not block delivery");
+
+        assert!(
+            drop_dir.join("wist-knowledge-0.3.0.tar.gz").is_file(),
+            "包本体要落盘"
+        );
+        assert!(!stale.exists(), "旧签名必须清掉（否则会拿旧签名验新包）");
+        let request = rx.await.expect("gateway captured");
+        assert!(request.contains("\"activate\":false"), "{request}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 只服务**一个**路径的制品桩：其余路径回 404。
+    ///
+    /// 用于「签名旁文件不存在」这类用例 —— 通用的 [`serve_artifact`] 对任何路径都回字节，
+    /// 无法模拟 404。
+    async fn serve_artifact_only(path: &'static str, bytes: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind artifact");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let bytes = bytes.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 4096];
+                    let read = sock.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]);
+                    if request.starts_with(&format!("GET {path} ")) {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            bytes.len()
+                        );
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(&bytes).await;
+                    } else {
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                            )
+                            .await;
+                    }
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}")
     }
 
     /// 极简制品桩：任意 GET 都回这段字节（`application/octet-stream`），可反复取。
