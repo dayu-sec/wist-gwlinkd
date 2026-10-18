@@ -3237,6 +3237,209 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 交付失败也要**回报 `failed` + 落游标**：否则同一份计划每轮重试（0.12.x 的行为）。
+    #[tokio::test]
+    async fn drive_knowledge_package_push_reports_failure_and_saves_the_cursor() {
+        let dir = temp_dir("knowledge-package-failure");
+        let payload = b"knowledge-bytes".to_vec();
+        let digest = wist_artifact::digest::sha256_hex_bytes(&payload);
+        let artifact_base = serve_artifact(payload).await;
+        let artifact_url = format!("{artifact_base}/wist-knowledge-0.3.0.tar.gz");
+
+        // 网关拒收（如旧网关没有 /knowledge-package 端点 → 404）。
+        let (gw_base, _rx) =
+            one_shot_gateway("404 Not Found", "knowledge-package is loopback-only").await;
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let client = CenterClient::new(serve_center(Arc::clone(&stub)).await);
+
+        let drop_dir = dir.join("packages");
+        let mut config = test_config(&dir, client.endpoint().to_string());
+        config.gateway_self_endpoint = Some(gw_base.clone());
+        config.agent_package_drop_dir = Some(drop_dir.clone());
+        config.agent_package_container_dir = Some("/packages".into());
+
+        let pusher = KnowledgePackageClient::new(gw_base);
+        let plan = knowledge_plan(Some(&artifact_url), Some(&digest), false);
+        drive_knowledge_package_push(&config, &client, &pusher, &plan).await;
+
+        // 中心收到 failed（而不是静默）。
+        let reports = stub.lock().unwrap().reports.clone();
+        assert_eq!(reports.len(), 1, "one upgrade-result report");
+        assert!(
+            reports[0].contains("\"status\":\"failed\""),
+            "{}",
+            reports[0]
+        );
+        assert!(
+            reports[0].contains("\"work_id\":\"plan-knowledge-1\""),
+            "{}",
+            reports[0]
+        );
+        assert!(
+            reports[0].contains("404") || reports[0].contains("knowledge-package"),
+            "失败回执要带上可诊断的原因：{}",
+            reports[0]
+        );
+
+        // 游标已落：同一计划不再重试。
+        let cursor = wist_gwlinkd::state::load_upgrade_cursor(&dir);
+        assert_eq!(cursor.last_plan_id.as_deref(), Some("plan-knowledge-1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 容器路径前缀必须是**绝对路径**：相对路径在网关侧会被当「不支持的来源」拒，
+    /// 但在 gwlinkd 侧就报清楚更好定位。
+    #[tokio::test]
+    async fn deliver_knowledge_package_rejects_a_relative_container_dir() {
+        let dir = temp_dir("knowledge-package-relative-container");
+        let mut config = test_config(&dir, "http://127.0.0.1:9".to_string());
+        config.agent_package_drop_dir = Some(dir.join("packages"));
+        config.agent_package_container_dir = Some("packages".into());
+        let client = CenterClient::new("http://127.0.0.1:9".to_string());
+        let pusher = KnowledgePackageClient::new("http://127.0.0.1:9");
+
+        let err = deliver_knowledge_package(
+            &config,
+            &client,
+            &pusher,
+            &knowledge_plan(
+                Some("http://127.0.0.1:9/k.tar.gz"),
+                Some(&"0".repeat(64)),
+                false,
+            ),
+            false,
+        )
+        .await
+        .expect_err("relative container dir must fail");
+        assert!(err.to_string().contains("绝对路径"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 没配投放目录 → 报出**配置键名**（而不是等到交付环节才发现）。
+    #[tokio::test]
+    async fn deliver_knowledge_package_requires_a_drop_dir() {
+        let dir = temp_dir("knowledge-package-no-drop");
+        let mut config = test_config(&dir, "http://127.0.0.1:9".to_string());
+        config.agent_package_drop_dir = None;
+        config.agent_package_container_dir = Some("/packages".into());
+        let client = CenterClient::new("http://127.0.0.1:9".to_string());
+        let pusher = KnowledgePackageClient::new("http://127.0.0.1:9");
+
+        let err = deliver_knowledge_package(
+            &config,
+            &client,
+            &pusher,
+            &knowledge_plan(
+                Some("http://127.0.0.1:9/k.tar.gz"),
+                Some(&"0".repeat(64)),
+                false,
+            ),
+            false,
+        )
+        .await
+        .expect_err("missing drop dir must fail");
+        assert!(err.to_string().contains("agent_package_drop_dir"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 交付**失败也清旧**：投放目录是中转区，不能因反复失败而无界增长。
+    #[tokio::test]
+    async fn deliver_knowledge_package_prunes_after_a_failed_delivery() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let dir = temp_dir("knowledge-package-prune");
+        let payload = b"knowledge-bytes".to_vec();
+        let digest = wist_artifact::digest::sha256_hex_bytes(&payload);
+        let artifact_base = serve_artifact(payload).await;
+        let artifact_url = format!("{artifact_base}/wist-knowledge-0.3.0.tar.gz");
+        let (gw_base, _rx) = one_shot_gateway("500 Internal Server Error", "boom").await;
+        let client = CenterClient::new("http://127.0.0.1:9".to_string());
+
+        let drop_dir = dir.join("packages");
+        std::fs::create_dir_all(&drop_dir).expect("mkdir");
+        // 旧交付：mtime 一律固定在很久以前，保证本次落盘的两份是「最新」。
+        for index in 0..20 {
+            let path = drop_dir.join(format!("old-{index}.tar.gz"));
+            std::fs::write(&path, b"old").expect("write old");
+            let file = std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open old");
+            file.set_modified(UNIX_EPOCH + Duration::from_secs(index as u64 * 10))
+                .expect("set mtime");
+        }
+
+        let mut config = test_config(&dir, client.endpoint().to_string());
+        config.agent_package_drop_dir = Some(drop_dir.clone());
+        config.agent_package_container_dir = Some("/packages".into());
+        config.agent_package_drop_keep = Some(2);
+        let pusher = KnowledgePackageClient::new(gw_base);
+
+        let _ = deliver_knowledge_package(
+            &config,
+            &client,
+            &pusher,
+            &knowledge_plan(Some(&artifact_url), Some(&digest), false),
+            false,
+        )
+        .await;
+
+        // keep=2：本次的包 + 签名（最新）保留，旧交付被清。
+        let remaining = std::fs::read_dir(&drop_dir)
+            .expect("read drop dir")
+            .filter_map(Result::ok)
+            .count();
+        assert!(
+            remaining <= 2,
+            "交付失败也要清旧（keep=2），实际剩 {remaining} 个文件"
+        );
+        assert!(
+            drop_dir.join("wist-knowledge-0.3.0.tar.gz").is_file(),
+            "本次的包不该被自己的清理误删"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `keep = 1` 也不能把本次交付的签名清掉：知识库一次交付是**两份文件**（包 + `.sig`），
+    /// 所以保留数会抬到 2 —— 否则网关验签时发现 `.sig` 自己没了。
+    #[tokio::test]
+    async fn knowledge_delivery_keeps_its_own_signature_even_with_keep_1() {
+        let dir = temp_dir("knowledge-package-keep1");
+        let payload = b"knowledge-bytes".to_vec();
+        let digest = wist_artifact::digest::sha256_hex_bytes(&payload);
+        let artifact_base = serve_artifact(payload).await;
+        let artifact_url = format!("{artifact_base}/wist-knowledge-0.3.0.tar.gz");
+        let (gw_base, _rx) = one_shot_gateway("200 OK", "{}").await;
+
+        let drop_dir = dir.join("packages");
+        let mut config = test_config(&dir, "http://127.0.0.1:9".to_string());
+        config.agent_package_drop_dir = Some(drop_dir.clone());
+        config.agent_package_container_dir = Some("/packages".into());
+        config.agent_package_drop_keep = Some(1);
+        let client = CenterClient::new("http://127.0.0.1:9".to_string());
+        let pusher = KnowledgePackageClient::new(gw_base);
+
+        deliver_knowledge_package(
+            &config,
+            &client,
+            &pusher,
+            &knowledge_plan(Some(&artifact_url), Some(&digest), false),
+            false,
+        )
+        .await
+        .expect("delivery ok");
+
+        assert!(
+            drop_dir.join("wist-knowledge-0.3.0.tar.gz").is_file(),
+            "包本体不能被自己清掉"
+        );
+        assert!(
+            drop_dir.join("wist-knowledge-0.3.0.tar.gz.sig").is_file(),
+            "签名不能被自己清掉（keep=1 也要抬到 2）"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// 摘要不符 → 拒绝交付：不落盘、不推送（网关收到的字节必须与中心声明的一致）。
     #[tokio::test]
     async fn deliver_knowledge_package_refuses_a_digest_mismatch() {
