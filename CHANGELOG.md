@@ -3,6 +3,25 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.15.0-alpha] - 2026-10-19
+
+### 新增
+
+- **`[wparse_relay]` 规则发布命令中继**：gwlinkd 按 1.5s 短轮询中心命令队列，
+  命中后用本机 HTTPS + admin token 调用 wparse 管理面，并把结果回传中心。
+  Gateway 仍然**不开放任何入站控制端口**，中心也不需要直连网关。
+- **双端白名单**：只放行 `/admin/v1/reloads/model` 与 `/admin/v1/runtime/status`；
+  gwlinkd 侧配置只能**收窄**，不会因为中心被攻破而变成通用代理。
+- **可用性**：admin token 每条命令重读（支持轮换）；CA 缺失时 fail-closed；
+  中心不可达时指数退避（上限 30s）；证书轮换后自动重建 mTLS 客户端。
+- **请求追踪**：把中心命令 id 作为 `X-Request-Id` 传给 wparse，发布会后可核对
+  `last_reload_request_id`。
+
+### 测试
+
+- 新增 8 个 relay/config 单测（白名单收窄、方法/路径精确匹配、UTF-8 截断、CA fail-closed）。
+  全量 266 + 48 + 7 passed。
+
 ## [0.14.1-alpha] - 2026-10-18
 
 ### 修复
