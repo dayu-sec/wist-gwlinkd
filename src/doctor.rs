@@ -846,6 +846,7 @@ mod tests {
             upgrade_retry_on_dead: None,
             upgrade_tool_require_arch: None,
             upgrade: Default::default(),
+            wparse_relay: Default::default(),
             log: Default::default(),
             pub_config_path: None,
         }

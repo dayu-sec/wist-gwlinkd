@@ -75,6 +75,18 @@ pub struct LinkUpstreamReturned {
     pub regist_token: Option<String>,
 }
 
+/// 一条从 Center 命令队列拉到的 wparse admin 命令。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WparseCommand {
+    pub command_id: String,
+    pub method: String,
+    pub path: String,
+    #[serde(default)]
+    pub body: Option<serde_json::Value>,
+    #[serde(default)]
+    pub lease_expires_at: String,
+}
+
 /// 中心客户端。
 #[derive(Debug, Clone)]
 pub struct CenterClient {
@@ -102,6 +114,62 @@ impl CenterClient {
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
             http,
         }
+    }
+
+    /// 规则发布命令：`GET /api/v1/gateway/commands?gateway_id=…&limit=1`。
+    ///
+    /// `204 No Content` = 当前没有待执行命令。
+    pub async fn poll_wparse_command(
+        &self,
+        gateway_id: &str,
+    ) -> CenterResult<Option<WparseCommand>> {
+        let url = format!("{}/api/v1/gateway/commands", self.endpoint);
+        let response = self
+            .http
+            .get(url)
+            .query(&[("gateway_id", gateway_id), ("limit", "1")])
+            .header("accept", "application/json")
+            .send()
+            .await
+            .source_raw_err(CenterReason::Http, "commands 请求失败")?;
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        decode(response, "commands").await.map(Some)
+    }
+
+    /// 规则发布命令结果：`POST /api/v1/gateway/commands/{id}/result`。
+    pub async fn report_wparse_command_result(
+        &self,
+        command_id: &str,
+        status_code: u16,
+        body: &str,
+        error: Option<&str>,
+    ) -> CenterResult<()> {
+        let url = format!(
+            "{}/api/v1/gateway/commands/{}/result",
+            self.endpoint, command_id
+        );
+        let response = self
+            .http
+            .post(url)
+            .json(&serde_json::json!({
+                "status_code": status_code,
+                "body": body,
+                "error": error,
+            }))
+            .send()
+            .await
+            .source_raw_err(CenterReason::Http, "command result 请求失败")?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        Err(CenterReason::Http.err(format!(
+            "command result 失败（{status}）：{}",
+            body_head(&text)
+        )))
     }
 
     /// 控制中心 endpoint（无尾斜杠）。
@@ -694,5 +762,67 @@ mod tests {
         assert_eq!(sent.gateway_id, "gw-1");
         assert_eq!(sent.work_id, "w-1");
         assert_eq!(sent.status, "done");
+    }
+
+    #[tokio::test]
+    async fn poll_wparse_command_returns_none_on_204() {
+        let base = one_shot_server("204 No Content", "").await;
+        let client = CenterClient::with_client(base, reqwest::Client::new());
+        let command = client
+            .poll_wparse_command("gw-1")
+            .await
+            .expect("poll succeeds");
+        assert!(command.is_none());
+    }
+
+    #[tokio::test]
+    async fn poll_wparse_command_parses_body_and_sends_gateway_id() {
+        let body = r#"{"command_id":"cmd_1","method":"POST","path":"/admin/v1/reloads/model","body":{"group":"models"},"lease_expires_at":"2026-10-19T00:00:00Z"}"#;
+        let (base, captured) = one_shot_server_capturing("200 OK", body).await;
+        let client = CenterClient::with_client(base, reqwest::Client::new());
+
+        let command = client
+            .poll_wparse_command("gw-1")
+            .await
+            .expect("poll succeeds")
+            .expect("one command");
+        assert_eq!(command.command_id, "cmd_1");
+        assert_eq!(command.method, "POST");
+        assert_eq!(command.path, "/admin/v1/reloads/model");
+        assert_eq!(
+            command.body.as_ref().and_then(|v| v.get("group")),
+            Some(&serde_json::json!("models"))
+        );
+
+        let request = captured.await.expect("captured");
+        assert!(
+            request.starts_with("GET /api/v1/gateway/commands?"),
+            "{request}"
+        );
+        assert!(request.contains("gateway_id=gw-1"), "{request}");
+        assert!(request.contains("limit=1"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn report_wparse_command_result_posts_status_body_and_error() {
+        let (base, captured) = one_shot_server_capturing("204 No Content", "").await;
+        let client = CenterClient::with_client(base, reqwest::Client::new());
+
+        client
+            .report_wparse_command_result("cmd_1", 200, r#"{"accepted":true}"#, None)
+            .await
+            .expect("report succeeds");
+
+        let request = captured.await.expect("captured");
+        assert!(
+            request.starts_with("POST /api/v1/gateway/commands/cmd_1/result "),
+            "{request}"
+        );
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let sent: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|err| panic!("body 不是合法 JSON: {err}; {body}"));
+        assert_eq!(sent["status_code"], 200);
+        assert_eq!(sent["body"], r#"{"accepted":true}"#);
+        assert!(sent["error"].is_null());
     }
 }

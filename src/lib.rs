@@ -29,6 +29,7 @@ pub mod target;
 pub mod tool_install;
 pub mod unlink;
 pub mod upgrade;
+pub mod wparse_relay;
 
 /// 当前版本（由 gx 同步 `Cargo.toml` / `version.txt`）。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

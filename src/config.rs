@@ -140,6 +140,9 @@ pub struct Config {
     /// `[upgrade]` 段：本机**组件目录**（其余扁平 `upgrade_*` 键保持原样）。
     #[serde(default, rename = "upgrade")]
     pub upgrade: UpgradeSection,
+    /// `[wparse_relay]` 段：规则发布命令中继（Center 命令队列 → 本机 wparse admin）。
+    #[serde(default, rename = "wparse_relay")]
+    pub wparse_relay: WparseRelaySection,
     /// `[log]` 段：**本进程自己**的运行日志（级别 / 格式 / 落点）。缺省 `info` / `text` / stderr。
     /// 与网关侧的 `[logs]`（被采集 agent 日志的落盘保留）无关。
     #[serde(default)]
@@ -156,6 +159,33 @@ pub struct UpgradeSection {
     /// 本机组件目录（`[[upgrade.component]]`）：计划里的组件名 → 本机安装机制。
     #[serde(default)]
     pub component: Vec<UpgradeComponentConfig>,
+}
+
+/// `[wparse_relay]` 段：规则发布命令中继。
+///
+/// 设计见 `wist-design/doc/design/center/warpstation-rule-publishing.md` §7：
+/// gwlinkd 短轮询 Center 命令队列，在本机用 admin token 调 wparse，再回传结果。
+/// Gateway **不开放入站端口**：`upstream` 固定指向宿主回环。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct WparseRelaySection {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 本机 wparse admin 地址（如 `https://127.0.0.1:19090`）。
+    #[serde(default)]
+    pub upstream: String,
+    /// 验证 wparse admin 证书的信任锚（Gateway CA）。
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// wparse admin bearer token（宿主侧 0600 文件）。
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
+    #[serde(default)]
+    pub poll_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+    /// 允许转发的 admin 路径（双端白名单；空 = 只允许两个内置路径）。
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
 }
 
 /// 一个本机组件的安装口径。
@@ -981,6 +1011,57 @@ mod tests {
         std::fs::write(&main, "state_dir = \"/s\"\nidentity_dir = \"/id\"\n").expect("write");
         let config = Config::load(&main).expect("load");
         assert_eq!(config.identity_dir(), std::path::Path::new("/id"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parses_wparse_relay_section() {
+        let dir = temp_dir("relay");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            r#"control_center_endpoint = "https://c"
+gateway_id = "gw-1"
+trust_bundle = "/ca.pem"
+state_dir = "/s"
+
+[wparse_relay]
+enabled = true
+upstream = "https://127.0.0.1:19090"
+ca_file = "/ca/gateway-ca.pem"
+token_file = "/run/admin_api.token"
+poll_interval_ms = 1500
+request_timeout_ms = 20000
+allowed_paths = ["/admin/v1/reloads/model", "/admin/v1/runtime/status"]
+"#,
+        )
+        .expect("write");
+
+        let config = Config::load(&path).expect("load");
+        assert!(config.wparse_relay.enabled);
+        assert_eq!(config.wparse_relay.upstream, "https://127.0.0.1:19090");
+        assert_eq!(
+            config.wparse_relay.ca_file.as_deref(),
+            Some(std::path::Path::new("/ca/gateway-ca.pem"))
+        );
+        assert_eq!(config.wparse_relay.poll_interval_ms, Some(1500));
+        assert_eq!(config.wparse_relay.allowed_paths.len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wparse_relay_defaults_to_disabled() {
+        let dir = temp_dir("relay-default");
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            "control_center_endpoint = \"https://c\"\ngateway_id = \"gw-1\"\ntrust_bundle = \"/ca.pem\"\nstate_dir = \"/s\"\n",
+        )
+        .expect("write");
+        let config = Config::load(&path).expect("load");
+        assert!(!config.wparse_relay.enabled);
+        assert!(config.wparse_relay.upstream.is_empty());
+        assert!(config.wparse_relay.allowed_paths.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

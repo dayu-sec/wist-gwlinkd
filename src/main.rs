@@ -356,6 +356,14 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
         .ok_or_else(|| GwlinkdReason::Identity.err("注册后仍无长期身份"))?;
     // 注册后所有网关面调用都走 **mTLS**（客户端证书认人）；续期后重建。
     let mut client = mtls_client(config, trust, &credential)?;
+    // 规则发布命令中继：独立任务，短轮询 Center 命令队列并调用本机 wparse admin。
+    // 任务内部自己重建 mTLS 客户端（证书轮换后旧客户端失效）。
+    if config.wparse_relay.enabled {
+        let relay_config = config.clone();
+        tokio::spawn(async move {
+            wist_gwlinkd::wparse_relay::run(relay_config).await;
+        });
+    }
     let instance_id = state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)
         .map_err(|err| GwlinkdReason::Identity.err(err))?;
 
@@ -2413,6 +2421,7 @@ mod tests {
             upgrade_retry_on_dead: None,
             upgrade_tool_require_arch: None,
             upgrade: Default::default(),
+            wparse_relay: Default::default(),
             log: Default::default(),
             pub_config_path: None,
         }
