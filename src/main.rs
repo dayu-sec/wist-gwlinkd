@@ -28,6 +28,7 @@ use wist_gwlinkd::linkd_status::{
 use wist_gwlinkd::selfreport::SelfReportClient;
 use wist_gwlinkd::service;
 use wist_gwlinkd::state::{self, CredentialStatus, UpgradeCursor, UpgradeRecord};
+use wist_gwlinkd::task_log::TaskLog;
 use wist_gwlinkd::tool_install::ToolInstaller;
 use wist_gwlinkd::unlink::{self, UnlinkReport};
 use wist_gwlinkd::upgrade::{
@@ -1015,7 +1016,21 @@ async fn drive_agent_package_push(
 ) {
     let plan_id = plan.plan_id.clone().unwrap_or_else(|| "plan".to_string());
     let to_version = plan.to_version.clone().unwrap_or_default();
-    let (status, detail) = match target_artifacts(plan) {
+    let task = TaskLog::create(
+        &config.state_dir,
+        "push-agent-package",
+        &plan_id,
+        serde_json::json!({
+            "to_version": to_version,
+            "artifact_url": plan.artifact_url,
+            "artifact_sha256": plan.artifact_sha256,
+            "action": plan.action,
+        }),
+    );
+    if let Some(task) = &task {
+        task.event("run.start", None);
+    }
+    let (status, mut detail) = match target_artifacts(plan) {
         Ok(targets) => match deliver_agent_package(config, client, pusher, &targets).await {
             Ok(()) => {
                 let platforms = targets
@@ -1038,8 +1053,33 @@ async fn drive_agent_package_push(
         },
         Err(message) => ("failed", message.to_string()),
     };
+    if let Some(path) = finish_task_log(&task, status, &detail) {
+        detail = append_log_dir(detail, &path);
+    }
     // 回执中心：回填发布计划条目（状态折算在中心侧；`done → succeeded`）。
     finish_plan(config, client, plan, status, detail).await;
+}
+
+/// 收尾任务日志并返回日志目录（`None` = 没有任务日志）。
+fn finish_task_log(
+    task: &Option<std::sync::Arc<TaskLog>>,
+    status: &str,
+    detail: &str,
+) -> Option<String> {
+    let task = task.as_ref()?;
+    if !detail.is_empty() {
+        task.output(&format!("{detail}\n"));
+    }
+    Some(task.finish(status, detail))
+}
+
+/// 把任务日志目录拼进回执说明（P0 借 `detail` 承载）。
+fn append_log_dir(detail: String, dir: &str) -> String {
+    if detail.is_empty() {
+        format!("日志: {dir}")
+    } else {
+        format!("{detail}；日志: {dir}")
+    }
 }
 
 /// 驱动一次「知识库包下发」：把中心派下的 `wist-knowledge` 包**环回**推进网关知识库管理，再回报中心。
@@ -1055,8 +1095,24 @@ async fn drive_knowledge_package_push(
     let plan_id = plan.plan_id.clone().unwrap_or_else(|| "plan".to_string());
     let to_version = plan.to_version.clone().unwrap_or_default();
     let activate = plan.activate.unwrap_or(false);
-    let (status, detail) = match deliver_knowledge_package(config, client, pusher, plan, activate)
-        .await
+    let task = TaskLog::create(
+        &config.state_dir,
+        "push-knowledge-package",
+        &plan_id,
+        serde_json::json!({
+            "to_version": to_version,
+            "artifact_url": plan.artifact_url,
+            "artifact_sha256": plan.artifact_sha256,
+            "activate": activate,
+        }),
+    );
+    if let Some(task) = &task {
+        task.event("run.start", None);
+    }
+    let (status, mut detail) = match deliver_knowledge_package(
+        config, client, pusher, plan, activate,
+    )
+    .await
     {
         Ok(()) => {
             log::info!(
@@ -1072,6 +1128,9 @@ async fn drive_knowledge_package_push(
             ("failed", err.to_string())
         }
     };
+    if let Some(path) = finish_task_log(&task, status, &detail) {
+        detail = append_log_dir(detail, &path);
+    }
     finish_plan(config, client, plan, status, detail).await;
 }
 
@@ -2923,6 +2982,24 @@ mod tests {
             "{}",
             reports[0]
         );
+
+        // 任务日志（P0）：回执 detail 带目录，目录里有 task.json / events.jsonl。
+        assert!(
+            reports[0].contains("日志: "),
+            "回执要带任务日志目录：{}",
+            reports[0]
+        );
+        let task_dirs: Vec<_> = std::fs::read_dir(dir.join("tasks"))
+            .expect("tasks dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(task_dirs.len(), 1, "{task_dirs:?}");
+        let task_dir = &task_dirs[0];
+        assert!(task_dir.join("task.json").exists());
+        let events = std::fs::read_to_string(task_dir.join("events.jsonl")).unwrap();
+        assert!(events.contains("run.start"), "{events}");
+        assert!(events.contains("\"phase\":\"done\""), "{events}");
 
         // 落游标：同一计划不再重复驱动。
         let cursor = wist_gwlinkd::state::load_upgrade_cursor(&dir);

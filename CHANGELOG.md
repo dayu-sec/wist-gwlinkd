@@ -3,6 +3,22 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.15.2-alpha] - 2026-10-20
+
+### 新增
+
+- **Agent 包 / 知识包下发也写任务执行记录**：`push-agent-package` / `push-knowledge-package`
+  各计划一个目录（`<state_dir>/tasks/<kind>-<plan_id>-<时间戳>/`）：
+  - `task.json`：to_version / artifact_url / sha256 / activate（知识包）/ action；
+  - `events.jsonl`：`run.start` / `done`（含耗时）；
+  - `output.log`：失败原因（已脱敏）。
+  回执 `detail` 末尾追加 `日志: <目录>`（与升级链路同口径）。
+
+### 测试
+
+- agent 包下发：回执带日志目录、`tasks/` 下建出 `task.json` / `events.jsonl`。
+  全量 `268 + 48 + 7` passed。
+
 ## [0.15.1-alpha] - 2026-10-20
 
 ### 新增
