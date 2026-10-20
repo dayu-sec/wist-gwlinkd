@@ -3,6 +3,34 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.15.4-alpha] - 2026-10-20
+
+### 新增
+
+- **规则发布（`wparse_relay`）也有了任务执行记录**：每条**变更类**命令一个目录
+  `<state_dir>/tasks/wparse-<command_id>-<时间戳>/`：
+  - `task.json`：gateway_id / method / path / upstream / 租约到期 / 请求字节数；
+  - `events.jsonl`：`run.start`、`config.error`（token 读不到）、`reject`（路径不在白名单）、
+    `upstream.failed`（传输层失败）、`report.failed`（命令跑了但回执没送到中心）、`done`；
+  - `output.log`：`> POST /admin/v1/reloads/model` + **请求原文**（当时到底发了什么）、
+    `< 200 (NN ms)` + **响应原文**。
+  失败时回执的 `error` 末尾追加 `日志: <目录>`（与升级 / 包下发同口径）；成功时不污染 body
+  —— 那是给 WarpStation 的机器载荷，目录只能从 journald 的 `log_dir=` 取。
+- 每条命令收尾都打一行 `event=WparseCommandDone|WparseCommandFailed`（含 command_id、
+  method、path、上游状态码、log_dir），`journalctl -u wist-gwlinkd | grep WparseCommand` 即可串起来。
+
+### 说明
+
+- **只给变更类命令（非 GET）落任务目录**：`GET /admin/v1/runtime/status` 是 WarpStation 的
+  高频轮询（几秒一次），全落盘会把真正的发布记录挤出 20 个的保留窗口
+  —— 那是升级链路踩过的坑。状态查询失败仍会在 journald 里报。
+
+### 测试
+
+`wparse_relay` 补 4 个用例（本地 HTTP 服务器）：请求/响应原文入日志且**admin token 绝不落盘**、
+白名单拒绝记 `reject` 且不发出请求、token 缺失记 `config.error`、传输层失败记 `upstream.failed`。
+全量 `280 + 48 + 7` passed。
+
 ## [0.15.3-alpha] - 2026-10-20
 
 ### 修复

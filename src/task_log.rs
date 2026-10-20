@@ -301,6 +301,7 @@ fn redact_authorization(input: &str) -> String {
     const MARKER: &str = "authorization:";
     const SCHEMES: [&str; 4] = ["bearer", "basic", "digest", "token"];
 
+    // 不手写逐字节滑窗：`to_ascii_lowercase` + `str::find`（Two-Way）快一个数量级。
     let lower = input.to_ascii_lowercase();
     let mut out = String::with_capacity(input.len());
     let mut cursor = 0;
@@ -347,7 +348,7 @@ fn redact_authorization(input: &str) -> String {
 ///
 /// 值被引号包着（`"password": "xxx"`）时保留引号本身，只抹引号里的内容。
 fn redact_after(input: &str, marker: &str) -> String {
-    // `to_ascii_lowercase` 只改 ASCII 大小写，字节长度不变，索引可直接复用。
+    // 同上：小写副本只多一次拷贝，换掉 O(n·m) 的自写搜。
     let lower = input.to_ascii_lowercase();
     let mut out = String::with_capacity(input.len());
     let mut cursor = 0;
