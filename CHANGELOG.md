@@ -3,6 +3,26 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.15.1-alpha] - 2026-10-20
+
+### 新增
+
+- **升级任务执行记录**（日志 P0）：每个中心派下的 plan 在
+  `<state_dir>/tasks/<kind>-<work_id>-<时间戳>/` 下落一份可定位的现场：
+  - `task.json`：component / from→to / artifact_url / sha256 / 执行器 / 开始时间；
+  - `events.jsonl`：`run.start` / `done`（含 `elapsed_ms`）；
+  - `output.log`：执行器 **stdout + stderr**（以前只落 stderr、且写到共享的
+    `wist-upgrader.log`），单文件 4 MiB 截断。
+  回执的 `detail` 末尾追加 `日志: <目录>`（P0 借 `detail` 承载，P1 再上结构化字段）。
+  建目录/写文件失败**只告警**，不影响升级；`tasks/` 只保留最近 20 个。
+- **写入时脱敏**：环境里 `*TOKEN*/*SECRET*/*PASSWORD*` 的值、`Bearer xxx`、
+  `token=xxx` 等模式，在写 `events.jsonl` / `output.log` / 回执前统一替换成 `***`。
+
+### 测试
+
+- 新增：任务目录/事件/脱敏、保留 20 个；升级回执带 `日志:` 与 `/tasks/` 的断言。
+  全量 `268 + 48 + 7` passed。
+
 ## [0.15.0-alpha] - 2026-10-19
 
 ### 新增

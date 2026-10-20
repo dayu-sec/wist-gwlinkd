@@ -26,6 +26,7 @@ pub mod selfreport;
 pub mod service;
 pub mod state;
 pub mod target;
+pub mod task_log;
 pub mod tool_install;
 pub mod unlink;
 pub mod upgrade;

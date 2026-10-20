@@ -20,6 +20,7 @@ use crate::error::{UpgradeReason, UpgradeResult, chain_one_line, logged_op};
 use crate::executor::{ExecutorInvocation, Outcome, UpgradeExecutor};
 use crate::selfreport::SelfReportClient;
 use crate::state::{self, UpgradeRecord};
+use crate::task_log;
 use crate::tool_install::ToolInstaller;
 
 /// 升级执行器日志文件（放状态目录，运维固定地方找）。
@@ -452,12 +453,32 @@ impl UpgradeDriver {
         state::write_upgrade_record(&self.state_dir, &record)?;
         state::touch_heartbeat(&self.state_dir)?;
 
+        // 任务执行记录（P0）：每个 plan 一个目录，落 task.json / events / 执行器输出。
+        // 建失败只告警，不影响升级。
+        let task = task_log::TaskLog::create(
+            &self.state_dir,
+            "upgrade",
+            work_id,
+            serde_json::json!({
+                "component": component,
+                "from_version": from_version,
+                "to_version": to_version,
+                "artifact_url": artifact_url,
+                "expected_sha256": expected_sha256,
+                "executor": self.executor.program(),
+            }),
+        );
+        if let Some(task) = &task {
+            task.event("run.start", None);
+        }
+
         // 前置校验：执行器缺必要配置（gops 的工程根）就**别发** —— 发出去也只会以退出码失败，
         // 回执读不出原因。这里前置成可读失败，并照常回执（否则中心条目会停在 dispatched）。
         if let Err(reason) = self.executor.preflight() {
             record.step = "preflight".to_string();
             record.status = "failed".to_string();
             record.detail = reason.to_string();
+            append_task_dir(&task, &mut record);
             if let Err(werr) = state::write_upgrade_record(&self.state_dir, &record) {
                 log::warn!(
                     "event=UpgradeRecordWriteFailed error={}",
@@ -537,6 +558,7 @@ impl UpgradeDriver {
                 record.step = "spawn".to_string();
                 record.status = "failed".to_string();
                 record.detail = detail.clone();
+                append_task_dir(&task, &mut record);
                 if let Err(werr) = state::write_upgrade_record(&self.state_dir, &record) {
                     log::warn!(
                         "event=UpgradeRecordWriteFailed error={}",
@@ -588,17 +610,14 @@ impl UpgradeDriver {
                 Some(handle) => handle.await.unwrap_or_default(),
                 None => String::new(),
             };
+            // 本次运行 stderr 的范围：**先读一次**，失败回执与任务日志共用。
+            let stderr_tail = read_run_stderr(&log_path, stderr_offset, 4096);
             // 失败时把**本次运行**的执行器 stderr（关键错误行）折进回执说明 ——
             // 只留退出码（255）等于让人去翻日志。
-            let fallback = if ok {
+            let fallback = if ok || stderr_tail.is_empty() {
                 detail
             } else {
-                let tail = read_run_stderr(&log_path, stderr_offset, 4096);
-                if tail.is_empty() {
-                    detail
-                } else {
-                    format!("{detail}; {}", oneline(&tail))
-                }
+                format!("{detail}; {}", oneline(&stderr_tail))
             };
             let mut outcome = executor.interpret(ok, &raw, fallback);
 
@@ -656,6 +675,12 @@ impl UpgradeDriver {
             record.status = outcome.status;
             record.step = outcome.step;
             record.detail = outcome.detail;
+            if let Some(task) = &task {
+                task.output(&format!(
+                    "--- stdout ---\n{raw}\n--- stderr ---\n{stderr_tail}\n"
+                ));
+            }
+            append_task_dir(&task, &mut record);
             if let Err(err) = state::write_upgrade_record(&state_dir, &record) {
                 log::warn!(
                     "event=UpgradeRecordWriteFailed error={}",
@@ -1087,6 +1112,17 @@ fn append_detail(detail: &mut String, extra: String) {
         detail.push('；');
     }
     detail.push_str(&extra);
+}
+
+/// 把任务日志目录拼进回执说明。
+///
+/// P0 阶段先用 `detail` 承载（中心原样展示）；P1 再把 `log_dir` 做成独立字段。
+fn append_task_dir(task: &Option<std::sync::Arc<task_log::TaskLog>>, record: &mut UpgradeRecord) {
+    let Some(task) = task else {
+        return;
+    };
+    let dir = task.finish(&record.status, &record.detail);
+    append_detail(&mut record.detail, format!("日志: {dir}"));
 }
 
 /// **升级成功佐证**：执行器报成后，独立观测**网关自述面**是否恢复且健康。
@@ -2030,7 +2066,17 @@ mod tests {
         let record = wait_terminal(&dir).await;
         assert_eq!(record.status, "done");
         assert_eq!(record.step, "custom");
-        assert_eq!(record.detail, "by custom executor");
+        // P0：回执说明会追加「日志: <任务目录>」。
+        assert!(
+            record.detail.starts_with("by custom executor"),
+            "{}",
+            record.detail
+        );
+        assert!(
+            record.detail.contains("日志: ") && record.detail.contains("/tasks/"),
+            "回执要带任务日志目录：{}",
+            record.detail
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
