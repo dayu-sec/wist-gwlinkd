@@ -204,6 +204,7 @@ pub async fn run(config: Config) {
                 result.status_code,
                 &result.body,
                 error.as_deref(),
+                task.as_ref().map(|task| task.task_id()),
                 log_dir.as_deref(),
                 log_excerpt.as_deref(),
             )

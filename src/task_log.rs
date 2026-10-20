@@ -41,6 +41,8 @@ const MAX_ID_CHARS: usize = 48;
 /// 一次任务运行的记录器（可在异步块里用 `Arc` 共享）。
 pub struct TaskLog {
     dir: PathBuf,
+    /// 任务 ID（目录名/`task.json` 里的那个；与中心回执里的 `task_id` 同一个值）。
+    task_id: String,
     started: Instant,
     finished: AtomicBool,
     events: Mutex<File>,
@@ -111,6 +113,7 @@ impl TaskLog {
         prune_old_tasks(&root, &dir);
         Some(std::sync::Arc::new(Self {
             dir,
+            task_id: task_id.to_string(),
             started: Instant::now(),
             finished: AtomicBool::new(false),
             events: Mutex::new(events),
@@ -120,6 +123,11 @@ impl TaskLog {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// 任务 ID（回执里带给中心，用来把日志和那一次执行对上）。
+    pub fn task_id(&self) -> &str {
+        &self.task_id
     }
 
     /// 记一个事件（`detail` 会脱敏）。

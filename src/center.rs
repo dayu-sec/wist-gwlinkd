@@ -147,6 +147,7 @@ impl CenterClient {
         status_code: u16,
         body: &str,
         error: Option<&str>,
+        task_id: Option<&str>,
         log_dir: Option<&str>,
         log_excerpt: Option<&str>,
     ) -> CenterResult<()> {
@@ -161,6 +162,7 @@ impl CenterClient {
                 "status_code": status_code,
                 "body": body,
                 "error": error,
+                "task_id": task_id,
                 "log_dir": log_dir,
                 "log_excerpt": log_excerpt,
             }))
@@ -338,6 +340,7 @@ impl CenterClient {
             step: record.step.clone(),
             status: record.status.clone(),
             detail: record.detail.clone(),
+            task_id: record.task_id.clone(),
             log_dir,
             log_excerpt,
             reported_at: wist_control::DateTime::now(),
@@ -762,6 +765,7 @@ mod tests {
             status: "done".into(),
             detail: "ok".into(),
             log_dir: None,
+            task_id: None,
         };
         client
             .report_upgrade_result("gw-1", &record)
@@ -806,6 +810,7 @@ mod tests {
             status: "failed".into(),
             detail: "executor exit status: 1".into(),
             log_dir: Some(dir.display().to_string()),
+            task_id: Some("upgrade-w-2-20261020-143000".into()),
         };
         client
             .report_upgrade_result("gw-1", &record)
@@ -817,6 +822,7 @@ mod tests {
         let sent: wist_control::ReportGatewayUpgradeResult = serde_json::from_str(body)
             .unwrap_or_else(|err| panic!("body 不是合法回执: {err}; {body}"));
         assert_eq!(sent.status, "failed");
+        assert_eq!(sent.task_id.as_deref(), Some("upgrade-w-2-20261020-143000"));
         assert_eq!(
             sent.log_dir.as_deref(),
             Some(dir.display().to_string().as_str())
@@ -872,7 +878,15 @@ mod tests {
         let client = CenterClient::with_client(base, reqwest::Client::new());
 
         client
-            .report_wparse_command_result("cmd_1", 200, r#"{"accepted":true}"#, None, None, None)
+            .report_wparse_command_result(
+                "cmd_1",
+                200,
+                r#"{"accepted":true}"#,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("report succeeds");
 
@@ -901,6 +915,7 @@ mod tests {
                 502,
                 "",
                 Some("wparse 上游返回 502"),
+                Some("wparse-cmd_2-20261020-143000"),
                 Some("/var/lib/gwlinkd/tasks/wparse-cmd_2-20261020"),
                 Some("# output\n< transport error (3 ms)"),
             )
@@ -911,6 +926,7 @@ mod tests {
         let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
         let sent: serde_json::Value = serde_json::from_str(body).expect("json");
         assert_eq!(sent["status_code"], 502);
+        assert_eq!(sent["task_id"], "wparse-cmd_2-20261020-143000");
         assert_eq!(
             sent["log_dir"],
             "/var/lib/gwlinkd/tasks/wparse-cmd_2-20261020"

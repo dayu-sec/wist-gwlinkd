@@ -1099,6 +1099,7 @@ mod tests {
                 status: "running".into(),
                 detail: String::new(),
                 log_dir: None,
+                task_id: None,
             },
         )
         .expect("record");
@@ -1123,6 +1124,7 @@ mod tests {
                 status: "done".into(),
                 detail: String::new(),
                 log_dir: None,
+                task_id: None,
             },
         )
         .expect("record");
@@ -1142,6 +1144,7 @@ mod tests {
                 status: "unverified".into(),
                 detail: String::new(),
                 log_dir: None,
+                task_id: None,
             },
         )
         .expect("record");

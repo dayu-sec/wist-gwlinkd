@@ -3,6 +3,16 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.15.7-alpha] - 2026-10-20
+
+### 新增
+
+- **失败回执带 `task_id`**（契约：`wist-control 0.16.2`）：把日志与**那一次执行**显式对上。
+  同一份计划重试会换一个 `tasks/<kind>-<task_id>-<ts>/`，光有目录得从路径反解，重试后容易看串。
+  - `TaskLog::task_id()`：任务 ID（目录名/`task.json` 里那个值）；
+  - `UpgradeRecord.task_id` 落盘，重启后的自更新回执也带得上；
+  - 升级 / Agent 包 / 知识包回执带 `task_id`；规则发布命令结果同样带。
+
 ## [0.15.6-alpha] - 2026-10-20
 
 ### 新增

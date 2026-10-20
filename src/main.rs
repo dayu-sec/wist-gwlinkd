@@ -681,6 +681,7 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                                         "本机未配置 gateway_self_endpoint（无法环回交付网关）"
                                             .to_string(),
                                         None,
+                                        None,
                                     )
                                     .await;
                                 }
@@ -705,6 +706,7 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                                         "本机未配置 gateway_self_endpoint（无法环回交付网关）"
                                             .to_string(),
                                         None,
+                                        None,
                                     )
                                     .await;
                                 }
@@ -724,6 +726,7 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                                 "failed",
                                 "计划未带目标版本：中心无法派生制品地址（请重新创建带版本的计划）"
                                     .to_string(),
+                                None,
                                 None,
                             )
                             .await;
@@ -800,6 +803,7 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                                 format!(
                                     "wist-gwlinkd 不支持计划动作 `{action}`（先升级 gwlinkd 再重派）"
                                 ),
+                                None,
                                 None,
                             )
                             .await;
@@ -977,6 +981,7 @@ async fn finish_plan(
     status: &str,
     detail: String,
     log_dir: Option<String>,
+    task_id: Option<String>,
 ) {
     let plan_id = plan.plan_id.clone().unwrap_or_else(|| "plan".to_string());
     let to_version = plan.to_version.clone().unwrap_or_default();
@@ -988,6 +993,7 @@ async fn finish_plan(
         status: status.to_string(),
         detail,
         log_dir,
+        task_id,
     };
     if let Err(err) = client
         .report_upgrade_result(&config.gateway_id, &record)
@@ -1059,25 +1065,29 @@ async fn drive_agent_package_push(
         },
         Err(message) => ("failed", message.to_string()),
     };
-    let log_dir = finish_task_log(&task, status, &detail);
-    if let Some(path) = &log_dir {
-        detail = append_log_dir(detail, path);
-    }
+    let finished = finish_task_log(&task, status, &detail);
+    let (log_dir, task_id) = match &finished {
+        Some((dir, id)) => {
+            detail = append_log_dir(detail, dir);
+            (Some(dir.clone()), Some(id.clone()))
+        }
+        None => (None, None),
+    };
     // 回执中心：回填发布计划条目（状态折算在中心侧；`done → succeeded`）。
-    finish_plan(config, client, plan, status, detail, log_dir).await;
+    finish_plan(config, client, plan, status, detail, log_dir, task_id).await;
 }
 
-/// 收尾任务日志并返回日志目录（`None` = 没有任务日志）。
+/// 收尾任务日志并返回 `(日志目录, 任务 ID)`（`None` = 没有任务日志）。
 fn finish_task_log(
     task: &Option<std::sync::Arc<TaskLog>>,
     status: &str,
     detail: &str,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let task = task.as_ref()?;
     if !detail.is_empty() {
         task.output(&format!("{detail}\n"));
     }
-    Some(task.finish(status, detail))
+    Some((task.finish(status, detail), task.task_id().to_string()))
 }
 
 /// 把任务日志目录拼进回执说明（P0 借 `detail` 承载）。
@@ -1135,11 +1145,15 @@ async fn drive_knowledge_package_push(
             ("failed", err.to_string())
         }
     };
-    let log_dir = finish_task_log(&task, status, &detail);
-    if let Some(path) = &log_dir {
-        detail = append_log_dir(detail, path);
-    }
-    finish_plan(config, client, plan, status, detail, log_dir).await;
+    let finished = finish_task_log(&task, status, &detail);
+    let (log_dir, task_id) = match &finished {
+        Some((dir, id)) => {
+            detail = append_log_dir(detail, dir);
+            (Some(dir.clone()), Some(id.clone()))
+        }
+        None => (None, None),
+    };
+    finish_plan(config, client, plan, status, detail, log_dir, task_id).await;
 }
 
 /// 取知识库包（gwlinkd 持中心信任）→ 落到投放目录（含 `.sig` 旁文件）→ 环回交付网关。

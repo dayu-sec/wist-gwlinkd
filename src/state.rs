@@ -55,6 +55,9 @@ pub struct UpgradeRecord {
     /// 仍能把上一次的现场一并回执。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_dir: Option<String>,
+    /// 本次任务 ID（`tasks/<kind>-<task_id>-<ts>/` 里的那个）；回执时一并上报。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 /// 升级游标：跨重启记住「已驱动的计划」，避免重启后重驱同一计划。
@@ -461,6 +464,7 @@ mod tests {
             status: "running".into(),
             detail: String::new(),
             log_dir: None,
+            task_id: None,
         }
     }
 
