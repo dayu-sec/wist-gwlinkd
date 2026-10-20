@@ -20,6 +20,11 @@ use crate::task_log::{self, TaskLog};
 const STATUS_PATH: &str = "/admin/v1/runtime/status";
 const RELOAD_PATH: &str = "/admin/v1/reloads/model";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// 请求体在日志里只留这么多字节的头部预览。
+///
+/// 发布命令的 body 是整套模型（可能几百 KB）：整段写盘会（1）把 `output.log` 的 4 MiB
+/// 预算吃光、（2）每写一次就跑一遍全量脱敏扫描。原文在中心 `gateway_commands.body` 里可取。
+const REQUEST_PREVIEW_BYTES: usize = 8 * 1024;
 
 struct UpstreamResult {
     status_code: u16,
@@ -134,22 +139,15 @@ pub async fn run(config: Config) {
         // 只给**变更**类命令落任务目录：`GET /runtime/status` 是 WarpStation 的高频轮询
         // （几秒一次），全落盘会把真正的发布记录挤出保留窗口（20 个）。
         // 状态查询失败仍会在下面 journald 的 `WparseCommandFailed` 里报出来。
-        let task = if command.method.eq_ignore_ascii_case("GET") {
-            None
-        } else {
+        let task = if should_record(&command) {
             task_log::TaskLog::create(
                 &config.state_dir,
                 "wparse",
                 &command.command_id,
-                json!({
-                    "gateway_id": &config.gateway_id,
-                    "method": &command.method,
-                    "path": &command.path,
-                    "upstream": &upstream,
-                    "lease_expires_at": &command.lease_expires_at,
-                    "request_bytes": command.body.as_ref().map(|body| body.to_string().len()),
-                }),
+                task_meta(&config.gateway_id, &upstream, &command),
             )
+        } else {
+            None
         };
         if let Some(task) = &task {
             task.event(
@@ -167,12 +165,11 @@ pub async fn run(config: Config) {
             task.as_deref(),
         )
         .await;
-        let ok = result.error.is_none() && result.status_code < 400;
-        let status = if ok { "ok" } else { "failed" };
+        let (ok, status, mut error) = outcome(&result);
         // 收尾在回执**之前**：失败时要把日志目录带回中心（升级链路同口径）。
         let log_dir = task
             .as_ref()
-            .map(|task| task.finish(status, result.error.as_deref().unwrap_or("")));
+            .map(|task| task.finish(status, error.as_deref().unwrap_or("")));
         if ok {
             log::info!(
                 "event=WparseCommandDone command_id={} method={} path={} upstream_status={} log_dir={}",
@@ -190,15 +187,10 @@ pub async fn run(config: Config) {
                 command.path,
                 result.status_code,
                 log_dir.as_deref().unwrap_or("-"),
-                result.error.as_deref().unwrap_or("-")
+                error.as_deref().unwrap_or("-")
             );
         }
-        // 日志目录借 `error` 带回中心：成功的 `body` 是给 WarpStation 的机器载荷，不能污染。
-        let error = match (result.error.as_deref(), log_dir.as_deref()) {
-            (Some(err), Some(dir)) => Some(format!("{err}；日志: {dir}")),
-            (Some(err), None) => Some(err.to_string()),
-            (None, _) => None,
-        };
+        error = with_log_dir(error, log_dir.as_deref());
         if let Err(err) = client
             .report_wparse_command_result(
                 &command.command_id,
@@ -218,6 +210,60 @@ pub async fn run(config: Config) {
                 task.event("report.failed", Some(&err.to_string()));
             }
         }
+    }
+}
+
+/// `task.json` 的内容：命令身份 + 发布体里的模型标识。
+fn task_meta(gateway_id: &str, upstream: &str, command: &WparseCommand) -> serde_json::Value {
+    json!({
+        "gateway_id": gateway_id,
+        "method": &command.method,
+        "path": &command.path,
+        "upstream": upstream,
+        "lease_expires_at": &command.lease_expires_at,
+        "request_bytes": command.body.as_ref().map(|body| body.to_string().len()),
+        // 排障最常问的就是“当时发的是哪个模型版本”：直接摘出来，不用读 body 预览。
+        "model_version": body_field(&command.body, "version"),
+        "model_group": body_field(&command.body, "group"),
+        "reason": body_field(&command.body, "reason"),
+    })
+}
+
+/// 是否给这条命令落任务目录（只有状态轮询不落）。
+fn should_record(command: &WparseCommand) -> bool {
+    !command.method.eq_ignore_ascii_case("GET")
+}
+
+/// 从发布体里摘一个字符串字段（缺失 / 非字符串 → `null`）。
+fn body_field(body: &Option<serde_json::Value>, key: &str) -> Option<String> {
+    body.as_ref()?.get(key)?.as_str().map(str::to_string)
+}
+
+/// 由执行结果推出「是否成功 + 终态标签 + 回执用的 error」（**不含**日志目录）。
+///
+/// 中心只按 `error` 是否为 Some 判 done / failed，**不看状态码**：wparse 回 422 时若不补一句
+/// error，这条命令会在中心库里记成“成功”（WarpStation 侧却看到 422，两边对不上）。
+fn outcome(result: &UpstreamResult) -> (bool, &'static str, Option<String>) {
+    let rejected = result.status_code >= 400;
+    let ok = result.error.is_none() && !rejected;
+    let error = result
+        .error
+        .clone()
+        .or_else(|| rejected.then(|| format!("wparse 上游返回 {}", result.status_code)));
+    (ok, if ok { "ok" } else { "failed" }, error)
+}
+
+/// 把日志目录拼进回执错误。
+///
+/// 只能拼在 `error` 上：成功的 `body` 是给 WarpStation 的机器载荷（拼了就破 JSON），
+/// 而成功时 `error` 必须保持 `None`（否则中心会把命令判成 failed）。
+fn with_log_dir(error: Option<String>, log_dir: Option<&str>) -> Option<String> {
+    match (error, log_dir) {
+        (Some(mut err), Some(dir)) => {
+            err.push_str(&format!("；日志: {dir}"));
+            Some(err)
+        }
+        (error, _) => error,
     }
 }
 
@@ -336,9 +382,23 @@ fn record_request(task: Option<&TaskLog>, command: &WparseCommand, body: Option<
         return;
     };
     task.output(&format!("> {} {}\n", command.method, command.path));
-    if let Some(body) = body {
-        task.output(&format!("> body ({} bytes):\n{body}\n", body.len()));
+    let Some(body) = body else {
+        return;
+    };
+    let total = body.len();
+    if total <= REQUEST_PREVIEW_BYTES {
+        task.output(&format!("> body ({total} bytes):\n{body}\n"));
+        return;
     }
+    // 切在字符边界：半个 UTF-8 字会让日志不可读。
+    let mut cut = REQUEST_PREVIEW_BYTES;
+    while cut > 0 && !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    task.output(&format!(
+        "> body ({total} bytes, 只记前 {cut} 字节):\n{}\n> …\n",
+        &body[..cut]
+    ));
 }
 
 /// 把 wparse 的回应写进 `output.log`（`<` 前缀 = 入站）。
@@ -490,7 +550,7 @@ mod tests {
             state,
             "wparse",
             &command.command_id,
-            json!({"path": &command.path}),
+            task_meta("gw-test", "https://127.0.0.1:19090", command),
         )
         .expect("task log")
     }
@@ -533,6 +593,117 @@ mod tests {
             let _ = sock.shutdown().await;
         });
         (format!("http://{addr}"), rx)
+    }
+
+    #[test]
+    fn task_json_carries_the_model_identity() {
+        let state = temp_state("identity");
+        let mut command = command("POST", RELOAD_PATH);
+        command.body = Some(json!({
+            "version": "v2026.10.20-1",
+            "group": "wist-dev-gateway",
+            "reason": "warpstation publish",
+            "wait": true,
+        }));
+        let task = new_task(&state, &command);
+
+        let raw = std::fs::read_to_string(task.dir().join("task.json")).unwrap();
+        assert!(raw.contains("v2026.10.20-1"), "{raw}");
+        assert!(raw.contains("wist-dev-gateway"), "{raw}");
+        assert!(raw.contains("warpstation publish"), "{raw}");
+        assert!(raw.contains("\"method\": \"POST\""), "{raw}");
+        assert!(raw.contains("gw-test"), "{raw}");
+        assert!(raw.contains("127.0.0.1:19090"), "{raw}");
+    }
+
+    #[test]
+    fn body_fields_are_optional() {
+        assert_eq!(body_field(&None, "version"), None);
+        assert_eq!(body_field(&Some(json!({})), "version"), None);
+        assert_eq!(body_field(&Some(json!({"version": 3})), "version"), None);
+        assert_eq!(
+            body_field(&Some(json!({"version": "v1"})), "version").as_deref(),
+            Some("v1")
+        );
+    }
+
+    #[test]
+    fn should_record_skips_status_polls() {
+        assert!(!should_record(&command("GET", STATUS_PATH)));
+        assert!(should_record(&command("POST", RELOAD_PATH)));
+        // 方法大小写不作为“要不要落盘”的依据。
+        assert!(!should_record(&command("get", STATUS_PATH)));
+        assert!(should_record(&command("post", RELOAD_PATH)));
+    }
+
+    #[test]
+    fn http_4xx_is_a_failure_not_a_success() {
+        // 中心只看 error：4xx 没有传输错误，但必须被当成失败。
+        let result = UpstreamResult {
+            status_code: 422,
+            body: r#"{"error":"invalid model"}"#.to_string(),
+            error: None,
+        };
+        let (ok, status, error) = outcome(&result);
+        assert!(!ok);
+        assert_eq!(status, "failed");
+        assert_eq!(error.as_deref(), Some("wparse 上游返回 422"));
+
+        let ok_result = UpstreamResult {
+            status_code: 200,
+            body: r#"{"accepted":true}"#.to_string(),
+            error: None,
+        };
+        assert_eq!(outcome(&ok_result), (true, "ok", None));
+
+        let transport = UpstreamResult {
+            status_code: 502,
+            body: String::new(),
+            error: Some("wparse admin request failed: refused".to_string()),
+        };
+        let (ok, status, error) = outcome(&transport);
+        assert!(!ok);
+        assert_eq!(status, "failed");
+        assert!(error.unwrap().contains("refused"));
+    }
+
+    #[test]
+    fn log_dir_is_only_attached_to_failures() {
+        assert_eq!(
+            with_log_dir(None, Some("/tmp/x")),
+            None,
+            "成功时不能带 error"
+        );
+        assert_eq!(
+            with_log_dir(Some("boom".to_string()), Some("/tmp/x")).as_deref(),
+            Some("boom；日志: /tmp/x")
+        );
+        assert_eq!(
+            with_log_dir(Some("boom".to_string()), None).as_deref(),
+            Some("boom")
+        );
+    }
+
+    #[test]
+    fn request_body_preview_is_bounded_and_utf8_safe() {
+        let state = temp_state("preview");
+        let command = command("POST", RELOAD_PATH);
+        let task = new_task(&state, &command);
+        // `字` 占 3 字节，8 KiB 不是 3 的倍数 —— 正好落在字符中间。
+        let body = "字".repeat(4000);
+        record_request(Some(task.as_ref()), &command, Some(&body));
+
+        let (_, output) = read_logs(&task);
+        assert!(output.contains("只记前"), "{output}");
+        let preview = output
+            .split("只记前")
+            .nth(1)
+            .and_then(|rest| rest.split(" 字节):\n").nth(1))
+            .and_then(|rest| rest.split("\n> …").next())
+            .expect("preview block");
+        assert!(preview.len() <= REQUEST_PREVIEW_BYTES, "{}", preview.len());
+        assert!(preview.is_char_boundary(preview.len()));
+        assert!(!preview.contains('\u{fffd}'), "不能写出半个 UTF-8 字");
     }
 
     #[tokio::test]

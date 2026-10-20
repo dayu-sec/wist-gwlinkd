@@ -3,6 +3,31 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.15.5-alpha] - 2026-10-20
+
+### 修复
+
+- **4xx/5xx 不再被记成“成功”**：中心只按回执的 `error` 是否为 `Some` 判 `done` / `failed`，
+  **不看状态码**。wparse 回 422（模型不合法）时旧实现 `error=None`，中心库里这条命令是 `done`，
+  而 WarpStation 看到的是 422 —— 两边对不上。现在上游 `status >= 400` 一定合成
+  `wparse 上游返回 <code>` 再回执（WarpStation 拿到的 body / 状态码不变）。
+- **请求体不再整段落盘**：发布体是整套模型（可能几百 KB），整段写盘会吃光 `output.log`
+  的 4 MiB 预算，并且每写一次都要跑一遍全量脱敏。改为记录 `字节数 + 前 8 KiB`（按字符边界切），
+  原文在中心 `gateway_commands.body` 里可取。
+- **写满之后不再脱敏**：`TaskLog::output` 原来先脱敏再判断额度，文件满了仍白扫几 MB；
+  现在先看额度。
+
+### 新增
+
+- `task.json` 多三个字段：`model_version` / `model_group` / `reason`，直接摘自发布体
+  —— 排障不用再翻 body 预览就知道“当时发的是哪个模型版本”。
+
+### 测试
+
+`wparse_relay` 补到 18 个用例（新增：`should_record` 三条、4xx 判失败、日志目录只拼在失败上、
+请求体预览有界且不切坏 UTF-8、`task.json` 带模型身份、`body_field` 容错）；
+`task_log` 补“`tasks` 被文件占用时返回 `None` 而不 panic”。全量 `287 + 48 + 7` passed。
+
 ## [0.15.4-alpha] - 2026-10-20
 
 ### 新增

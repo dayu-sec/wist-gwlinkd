@@ -139,12 +139,13 @@ impl TaskLog {
         if text.is_empty() {
             return;
         }
-        let payload = redact(text);
         let mut guard = self.output.lock().unwrap_or_else(|e| e.into_inner());
         let (file, written) = &mut *guard;
+        // 先看额度再脱敏：文件已满时不必白扫一遍（几 MB 的 body 也要跑几十个 marker）。
         if *written >= OUTPUT_LIMIT {
             return;
         }
+        let payload = redact(text);
         let bytes = payload.as_bytes();
         let remaining = (OUTPUT_LIMIT - *written) as usize;
         if bytes.len() > remaining {
@@ -612,6 +613,14 @@ mod tests {
         assert!(raw.len() as u64 <= OUTPUT_LIMIT + 64, "len={}", raw.len());
         let text = String::from_utf8(raw).expect("截断后仍是合法 UTF-8");
         assert!(text.contains("truncated"), "{text}");
+    }
+
+    #[test]
+    fn unavailable_state_dir_returns_none_without_panicking() {
+        // `tasks` 被一个普通文件占着：建目录必失败，但**不能影响主流程**。
+        let tmp = tmp("unavailable");
+        std::fs::write(tmp.join("tasks"), b"not a directory").unwrap();
+        assert!(TaskLog::create(&tmp, "upgrade", "plan-6", json!({})).is_none());
     }
 
     #[cfg(unix)]
