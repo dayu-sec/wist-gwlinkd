@@ -191,12 +191,21 @@ pub async fn run(config: Config) {
             );
         }
         error = with_log_dir(error, log_dir.as_deref());
+        // 失败时把日志摘要一并回传：中心落库后可直接展示（目录仍留在本机）。
+        let log_excerpt = if ok {
+            None
+        } else {
+            task.as_ref()
+                .and_then(|task| task.excerpt(task_log::EXCERPT_LIMIT))
+        };
         if let Err(err) = client
             .report_wparse_command_result(
                 &command.command_id,
                 result.status_code,
                 &result.body,
                 error.as_deref(),
+                log_dir.as_deref(),
+                log_excerpt.as_deref(),
             )
             .await
         {

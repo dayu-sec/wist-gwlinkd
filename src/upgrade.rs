@@ -260,6 +260,7 @@ impl UpgradeDriver {
             step: "preflight".to_string(),
             status: "running".to_string(),
             detail: String::new(),
+            log_dir: None,
         };
 
         let Some(target) = self.self_update.as_ref() else {
@@ -449,6 +450,7 @@ impl UpgradeDriver {
             step: "fetch".to_string(),
             status: "running".to_string(),
             detail: String::new(),
+            log_dir: None,
         };
         state::write_upgrade_record(&self.state_dir, &record)?;
         state::touch_heartbeat(&self.state_dir)?;
@@ -724,6 +726,7 @@ impl UpgradeDriver {
             step: "fetch".to_string(),
             status: "running".to_string(),
             detail: String::new(),
+            log_dir: None,
         };
         state::write_upgrade_record(&self.state_dir, &record)?;
         state::touch_heartbeat(&self.state_dir)?;
@@ -1122,6 +1125,7 @@ fn append_task_dir(task: &Option<std::sync::Arc<task_log::TaskLog>>, record: &mu
         return;
     };
     let dir = task.finish(&record.status, &record.detail);
+    record.log_dir = Some(dir.clone());
     append_detail(&mut record.detail, format!("日志: {dir}"));
 }
 
@@ -1833,6 +1837,7 @@ mod tests {
                 step: "restart".into(),
                 status: "restarting".into(),
                 detail: String::new(),
+                log_dir: None,
             },
         )
         .expect("record");
@@ -1877,6 +1882,7 @@ mod tests {
                 step: "restart".into(),
                 status: "restarting".into(),
                 detail: String::new(),
+                log_dir: None,
             },
         )
         .expect("record");
@@ -1912,6 +1918,7 @@ mod tests {
                 step: "restart".into(),
                 status: "restarting".into(),
                 detail: String::new(),
+                log_dir: None,
             },
         )
         .expect("record");

@@ -139,12 +139,16 @@ impl CenterClient {
     }
 
     /// 规则发布命令结果：`POST /api/v1/gateway/commands/{id}/result`。
+    ///
+    /// 失败时带上任务日志目录 + 摘要（有界、写入时已脱敏），中心落库后可回给调用方。
     pub async fn report_wparse_command_result(
         &self,
         command_id: &str,
         status_code: u16,
         body: &str,
         error: Option<&str>,
+        log_dir: Option<&str>,
+        log_excerpt: Option<&str>,
     ) -> CenterResult<()> {
         let url = format!(
             "{}/api/v1/gateway/commands/{}/result",
@@ -157,6 +161,8 @@ impl CenterClient {
                 "status_code": status_code,
                 "body": body,
                 "error": error,
+                "log_dir": log_dir,
+                "log_excerpt": log_excerpt,
             }))
             .send()
             .await
@@ -307,12 +313,23 @@ impl CenterClient {
     ///
     /// body 是中心侧 `ReportGatewayUpgradeResult`（**含必填 `gateway_id` / `reported_at`**，
     /// 不能直接发本地 `UpgradeRecord` —— 否则中心反序列化失败）。
+    ///
+    /// **失败时**带上任务日志摘要（有界、写入时已脱敏），中心落库后管理面可直接展开看；
+    /// 成功时不带 —— 没必要为一次正常升级传 8 KiB 现场。
     pub async fn report_upgrade_result(
         &self,
         gateway_id: &str,
         record: &crate::state::UpgradeRecord,
     ) -> CenterResult<()> {
         let url = format!("{}/api/v1/gateway/upgrade-result", self.endpoint);
+        let log_dir = record.log_dir.clone();
+        let log_excerpt = match (record.status.as_str(), log_dir.as_deref()) {
+            ("failed", Some(dir)) => crate::task_log::excerpt_from_dir(
+                std::path::Path::new(dir),
+                crate::task_log::EXCERPT_LIMIT,
+            ),
+            _ => None,
+        };
         let payload = ReportGatewayUpgradeResult {
             gateway_id: gateway_id.to_string(),
             work_id: record.work_id.clone(),
@@ -321,6 +338,8 @@ impl CenterClient {
             step: record.step.clone(),
             status: record.status.clone(),
             detail: record.detail.clone(),
+            log_dir,
+            log_excerpt,
             reported_at: wist_control::DateTime::now(),
         };
         let response = self
@@ -742,6 +761,7 @@ mod tests {
             step: "verify".into(),
             status: "done".into(),
             detail: "ok".into(),
+            log_dir: None,
         };
         client
             .report_upgrade_result("gw-1", &record)
@@ -762,6 +782,49 @@ mod tests {
         assert_eq!(sent.gateway_id, "gw-1");
         assert_eq!(sent.work_id, "w-1");
         assert_eq!(sent.status, "done");
+        // 成功回执不带现场（不浪费 8 KiB 带宽）。
+        assert!(sent.log_dir.is_none());
+        assert!(sent.log_excerpt.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_upgrade_result_carries_the_log_excerpt() {
+        let dir =
+            std::env::temp_dir().join(format!("wist-gwlinkd-report-{}-failed", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("events.jsonl"), "{\"phase\":\"done\"}\n").unwrap();
+        std::fs::write(dir.join("output.log"), "executor exit status: 1\n").unwrap();
+
+        let (endpoint, captured) = capture_server("200 OK", r#"{}"#).await;
+        let client = CenterClient::new(endpoint);
+        let record = crate::state::UpgradeRecord {
+            work_id: "w-2".into(),
+            from_version: "0.1.0".into(),
+            to_version: "0.1.16".into(),
+            step: "install".into(),
+            status: "failed".into(),
+            detail: "executor exit status: 1".into(),
+            log_dir: Some(dir.display().to_string()),
+        };
+        client
+            .report_upgrade_result("gw-1", &record)
+            .await
+            .expect("ok");
+
+        let request = captured.await.expect("request");
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let sent: wist_control::ReportGatewayUpgradeResult = serde_json::from_str(body)
+            .unwrap_or_else(|err| panic!("body 不是合法回执: {err}; {body}"));
+        assert_eq!(sent.status, "failed");
+        assert_eq!(
+            sent.log_dir.as_deref(),
+            Some(dir.display().to_string().as_str())
+        );
+        let excerpt = sent.log_excerpt.unwrap_or_default();
+        assert!(excerpt.contains("executor exit status: 1"), "{excerpt}");
+        assert!(excerpt.contains("# events"), "{excerpt}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -809,7 +872,7 @@ mod tests {
         let client = CenterClient::with_client(base, reqwest::Client::new());
 
         client
-            .report_wparse_command_result("cmd_1", 200, r#"{"accepted":true}"#, None)
+            .report_wparse_command_result("cmd_1", 200, r#"{"accepted":true}"#, None, None, None)
             .await
             .expect("report succeeds");
 
@@ -824,5 +887,40 @@ mod tests {
         assert_eq!(sent["status_code"], 200);
         assert_eq!(sent["body"], r#"{"accepted":true}"#);
         assert!(sent["error"].is_null());
+        assert!(sent["log_excerpt"].is_null());
+    }
+
+    #[tokio::test]
+    async fn failed_wparse_result_carries_the_log_pointer_and_excerpt() {
+        let (base, captured) = one_shot_server_capturing("204 No Content", "").await;
+        let client = CenterClient::with_client(base, reqwest::Client::new());
+
+        client
+            .report_wparse_command_result(
+                "cmd_2",
+                502,
+                "",
+                Some("wparse 上游返回 502"),
+                Some("/var/lib/gwlinkd/tasks/wparse-cmd_2-20261020"),
+                Some("# output\n< transport error (3 ms)"),
+            )
+            .await
+            .expect("report succeeds");
+
+        let request = captured.await.expect("captured");
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let sent: serde_json::Value = serde_json::from_str(body).expect("json");
+        assert_eq!(sent["status_code"], 502);
+        assert_eq!(
+            sent["log_dir"],
+            "/var/lib/gwlinkd/tasks/wparse-cmd_2-20261020"
+        );
+        assert!(
+            sent["log_excerpt"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("transport error"),
+            "{sent}"
+        );
     }
 }

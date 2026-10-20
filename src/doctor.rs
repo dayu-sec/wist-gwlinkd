@@ -1098,6 +1098,7 @@ mod tests {
                 step: "restart".into(),
                 status: "running".into(),
                 detail: String::new(),
+                log_dir: None,
             },
         )
         .expect("record");
@@ -1121,6 +1122,7 @@ mod tests {
                 step: "verify".into(),
                 status: "done".into(),
                 detail: String::new(),
+                log_dir: None,
             },
         )
         .expect("record");
@@ -1139,6 +1141,7 @@ mod tests {
                 step: "verify".into(),
                 status: "unverified".into(),
                 detail: String::new(),
+                log_dir: None,
             },
         )
         .expect("record");

@@ -680,6 +680,7 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                                         "failed",
                                         "本机未配置 gateway_self_endpoint（无法环回交付网关）"
                                             .to_string(),
+                                        None,
                                     )
                                     .await;
                                 }
@@ -703,6 +704,7 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                                         "failed",
                                         "本机未配置 gateway_self_endpoint（无法环回交付网关）"
                                             .to_string(),
+                                        None,
                                     )
                                     .await;
                                 }
@@ -722,6 +724,7 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                                 "failed",
                                 "计划未带目标版本：中心无法派生制品地址（请重新创建带版本的计划）"
                                     .to_string(),
+                                None,
                             )
                             .await;
                         } else if intent == PlanIntent::Upgrade {
@@ -797,6 +800,7 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
                                 format!(
                                     "wist-gwlinkd 不支持计划动作 `{action}`（先升级 gwlinkd 再重派）"
                                 ),
+                                None,
                             )
                             .await;
                         }
@@ -972,6 +976,7 @@ async fn finish_plan(
     plan: &wist_control::GatewayUpgradePlan,
     status: &str,
     detail: String,
+    log_dir: Option<String>,
 ) {
     let plan_id = plan.plan_id.clone().unwrap_or_else(|| "plan".to_string());
     let to_version = plan.to_version.clone().unwrap_or_default();
@@ -982,6 +987,7 @@ async fn finish_plan(
         step: "fetch".to_string(),
         status: status.to_string(),
         detail,
+        log_dir,
     };
     if let Err(err) = client
         .report_upgrade_result(&config.gateway_id, &record)
@@ -1053,11 +1059,12 @@ async fn drive_agent_package_push(
         },
         Err(message) => ("failed", message.to_string()),
     };
-    if let Some(path) = finish_task_log(&task, status, &detail) {
-        detail = append_log_dir(detail, &path);
+    let log_dir = finish_task_log(&task, status, &detail);
+    if let Some(path) = &log_dir {
+        detail = append_log_dir(detail, path);
     }
     // 回执中心：回填发布计划条目（状态折算在中心侧；`done → succeeded`）。
-    finish_plan(config, client, plan, status, detail).await;
+    finish_plan(config, client, plan, status, detail, log_dir).await;
 }
 
 /// 收尾任务日志并返回日志目录（`None` = 没有任务日志）。
@@ -1128,10 +1135,11 @@ async fn drive_knowledge_package_push(
             ("failed", err.to_string())
         }
     };
-    if let Some(path) = finish_task_log(&task, status, &detail) {
-        detail = append_log_dir(detail, &path);
+    let log_dir = finish_task_log(&task, status, &detail);
+    if let Some(path) = &log_dir {
+        detail = append_log_dir(detail, path);
     }
-    finish_plan(config, client, plan, status, detail).await;
+    finish_plan(config, client, plan, status, detail, log_dir).await;
 }
 
 /// 取知识库包（gwlinkd 持中心信任）→ 落到投放目录（含 `.sig` 旁文件）→ 环回交付网关。

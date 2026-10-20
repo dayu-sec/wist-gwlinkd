@@ -49,6 +49,12 @@ pub struct UpgradeRecord {
     pub status: String,
     #[serde(default)]
     pub detail: String,
+    /// 本次任务执行记录的目录（`state_dir/tasks/<kind>-<id>-<ts>`）。
+    ///
+    /// 回执时从这里读日志摘要（失败回执才带）；落盘是为了**重启后**（自更新）
+    /// 仍能把上一次的现场一并回执。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_dir: Option<String>,
 }
 
 /// 升级游标：跨重启记住「已驱动的计划」，避免重启后重驱同一计划。
@@ -454,6 +460,7 @@ mod tests {
             step: "restart".into(),
             status: "running".into(),
             detail: String::new(),
+            log_dir: None,
         }
     }
 

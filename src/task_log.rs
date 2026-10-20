@@ -30,6 +30,10 @@ use serde_json::json;
 const KEEP_TASKS: usize = 20;
 /// 单个 `output.log` 上限。
 const OUTPUT_LIMIT: u64 = 4 * 1024 * 1024;
+/// 失败回执带给中心的日志摘要上限（中心落库 + 前端展示）。
+///
+/// 目录（完整日志）留在本机，中心只收一段现场片段 —— 两条都能追到同一次任务。
+pub const EXCERPT_LIMIT: usize = 8 * 1024;
 /// 目录名里 `kind` / `task_id` 的最大字符数（留够余量，别撞文件名长度上限）。
 const MAX_KIND_CHARS: usize = 24;
 const MAX_ID_CHARS: usize = 48;
@@ -179,6 +183,91 @@ impl TaskLog {
         }
         self.dir.display().to_string()
     }
+
+    /// 有界摘要：`events.jsonl` 尾 + `output.log` 尾（写入时已脱敏）。
+    pub fn excerpt(&self, limit: usize) -> Option<String> {
+        excerpt_from_dir(&self.dir, limit)
+    }
+}
+
+/// 从任务目录读一段有界摘要。
+///
+/// 单独的入口：回执可能发生在**进程重启之后**（`settle_pending_self_update`），
+/// 那时手上只有目录路径，没有活的 `TaskLog`。
+///
+/// 格式：
+///
+/// ```text
+/// # events
+/// {"phase":"run.start",...}
+/// {"phase":"done",...}
+/// # output
+/// > POST /admin/v1/reloads/model
+/// < 422 (12 ms)
+/// {"error":"invalid model"}
+/// ```
+///
+/// 取**尾部**：失败原因总在最后几行，开头那些（拉上一个阶段）对定位问题没用。
+pub fn excerpt_from_dir(dir: &Path, limit: usize) -> Option<String> {
+    if limit == 0 {
+        return None;
+    }
+    // 事件行短、信息密度高（阶段 / 耗时 / 错误），先给它一份固定额度。
+    let events = tail(&dir.join("events.jsonl"), limit / 4);
+    let used = events.as_ref().map(|text| text.len() + 16).unwrap_or(0);
+    let output = tail(&dir.join("output.log"), limit.saturating_sub(used));
+
+    let mut out = String::new();
+    if let Some(events) = events {
+        out.push_str("# events\n");
+        out.push_str(&events);
+        out.push('\n');
+    }
+    if let Some(output) = output {
+        out.push_str("# output\n");
+        out.push_str(&output);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    // 头部标记会让总长比 limit 多十几个字节；硬性截一次，仍然切在字符边界上。
+    if out.len() > limit {
+        let mut cut = limit;
+        while cut > 0 && !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str("\n…\n");
+    }
+    Some(out)
+}
+
+/// 读文件**末尾**不超过 `limit` 字节；从中间切进来时丢掉那半行。
+fn tail(path: &Path, limit: usize) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    if limit == 0 {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(limit as u64);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start)).ok()?;
+    }
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    if buf.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    // 从中间切进来时首行可能是半行（甚至是半个字），整行丢掉。
+    let text = if start == 0 {
+        text
+    } else {
+        text.split_once('\n').map(|(_, rest)| rest)?.into()
+    };
+    let text = text.trim_end_matches('\n');
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// 目录名片段消毒：只留 `[A-Za-z0-9_-]`，并限制长度（防超长 id 撞文件名上限）。
@@ -613,6 +702,73 @@ mod tests {
         assert!(raw.len() as u64 <= OUTPUT_LIMIT + 64, "len={}", raw.len());
         let text = String::from_utf8(raw).expect("截断后仍是合法 UTF-8");
         assert!(text.contains("truncated"), "{text}");
+    }
+
+    #[test]
+    fn excerpt_keeps_the_tail_of_both_files() {
+        let tmp = tmp("excerpt");
+        let task = TaskLog::create(&tmp, "upgrade", "plan-7", json!({})).expect("task");
+        task.event("run.start", Some("component=wist-gwlinkd"));
+        for i in 0..200 {
+            task.output(&format!("line-{i}\n"));
+        }
+        task.finish("failed", "executor exit status: 1");
+
+        let excerpt = task.excerpt(EXCERPT_LIMIT).expect("excerpt");
+        assert!(excerpt.starts_with("# events"), "{excerpt}");
+        assert!(excerpt.contains("# output"), "{excerpt}");
+        assert!(excerpt.contains("line-199"), "尾部要留着：{excerpt}");
+        assert!(excerpt.contains("executor exit status: 1"), "{excerpt}");
+        assert!(excerpt.len() <= EXCERPT_LIMIT + 4, "len={}", excerpt.len());
+    }
+
+    #[test]
+    fn excerpt_is_bounded_and_line_aligned() {
+        let tmp = tmp("excerpt-bound");
+        let task = TaskLog::create(&tmp, "upgrade", "plan-8", json!({})).expect("task");
+        // 每行 3 字节字 + 换行；600 字节的额度一定落在行中间。
+        for _ in 0..300 {
+            task.output("中文行\n");
+        }
+
+        let excerpt = task.excerpt(600).expect("excerpt");
+        assert!(excerpt.len() <= 604, "len={}", excerpt.len());
+        assert!(excerpt.contains("# output"), "{excerpt}");
+        for line in excerpt.lines().skip(1) {
+            assert!(
+                line == "中文行" || line == "# output" || line.starts_with('#'),
+                "半行：{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn excerpt_of_an_empty_task_is_none() {
+        let tmp = tmp("excerpt-empty");
+        let task = TaskLog::create(&tmp, "upgrade", "plan-9", json!({})).expect("task");
+        assert!(task.excerpt(EXCERPT_LIMIT).is_none());
+    }
+
+    #[test]
+    fn excerpt_from_dir_survives_a_restart() {
+        let tmp = tmp("excerpt-dir");
+        let dir = {
+            let task = TaskLog::create(&tmp, "upgrade", "plan-10", json!({})).expect("task");
+            task.event("run.start", Some("component=wist-gwlinkd"));
+            task.output("boom\n");
+            task.finish("failed", "boom");
+            task.dir().to_path_buf()
+        };
+        // 模拟重启：手上只有目录。
+        let excerpt = excerpt_from_dir(&dir, EXCERPT_LIMIT).expect("excerpt");
+        assert!(excerpt.contains("boom"), "{excerpt}");
+        assert!(excerpt.contains("# events"), "{excerpt}");
+    }
+
+    #[test]
+    fn excerpt_is_none_for_a_missing_dir() {
+        assert!(excerpt_from_dir(Path::new("/definitely/missing/task-dir"), 1024).is_none());
+        assert!(excerpt_from_dir(Path::new("/tmp"), 0).is_none());
     }
 
     #[test]
