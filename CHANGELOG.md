@@ -3,6 +3,24 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.16.2-alpha] - 2026-10-21
+
+### 新增
+
+- **控制命令通道**：中心命令队列的 `kind` 不再只有 `proxy`，gwlinkd 现在会执行三类本机操作：
+  - `diagnose`：在网关栈根（`upgrade_project_dir`）跑 `gops run diagnose --json`，把报告原样回执；
+    **exit 0 / 1 都算命令成功**（发现问题时 gops 本就退 1，报告里带 `summary.exit_code`）。
+  - `restart-gateway`：`gops run stop` → `run start`（逐步超时；`start` 失败时明确提示网关可能停在停止态）。
+  - `restart-gwlinkd`：**先回执再重启自己**（202 + `scheduled`），延迟 2s 调 `systemctl restart` /
+    `launchctl kickstart -k`；没装服务定义（手动 `run`）时回 409，不杀进程。
+- 配置项：`diagnose_program`（缺省 = `upgrader_program`）、`diagnose_timeout_seconds`（120，上限 300）、
+  `restart_timeout_seconds`（120，上限 300）。
+
+### 修复
+
+- 未知 `kind` 一律**明确回失败**（400 “先升级 gwlinkd 再重派”），不再静默当成功。
+- 控制类命令回执带 `kind`，任务目录与 `task.json` 也能看出是哪类命令。
+
 ## [0.16.1-alpha] - 2026-10-21
 
 ### 新增
