@@ -50,6 +50,9 @@ pub fn unit_text(spec: &ServiceSpec) -> String {
         }
     }
     text.push_str("Type=simple\n");
+    // 单实例闸门是**机器级**的：锁文件在宿主 `/tmp/wist-gwlinkd.lock`。`PrivateTmp=yes` 会把
+    // `/tmp` 变成服务私有命名空间，闸门就退化成「按服务实例」—— 别加（测试会管着）。
+    text.push_str("# 不要加 PrivateTmp=yes：/tmp/wist-gwlinkd.lock 是机器级单实例闸门。\n");
     text.push_str(&format!(
         "ExecStart={} run\n",
         systemd_arg(&spec.bin.display().to_string())
@@ -232,6 +235,24 @@ mod tests {
         assert!(
             text.contains(&format!("Environment=PATH={}\n", systemd_arg(&path))),
             "unit PATH 未带上运行用户的 ~/bin：\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_unit_keeps_the_host_wide_tmp_visible() {
+        // 机器级单实例闸门靠宿主 `/tmp/wist-gwlinkd.lock`：`PrivateTmp=yes` 会让每个服务实例
+        // 看到自己的 `/tmp`，闸门就失效了。这里把这条红线钉住。
+        let spec = ServiceSpec::new(
+            ServiceScope::System,
+            PathBuf::from("/usr/local/bin/wist-gwlinkd"),
+            PathBuf::from("/etc/wist-gwlinkd/gwlinkd.toml"),
+        );
+        let text = unit_text(&spec);
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.trim_start().starts_with("PrivateTmp=")),
+            "unit 不能把 /tmp 私有化（单实例闸门在 /tmp）：\n{text}"
         );
     }
 

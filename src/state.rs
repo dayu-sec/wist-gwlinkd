@@ -36,7 +36,8 @@ pub const LINK_CONFIG_FILE: &str = "link-config.json";
 /// 首跑置备遗留的**注册 token**：link-upstream 已签发、register 尚未消费时落盘，
 /// 使 register 失败（网络）后下次可**免接入券**重试。
 pub const REGIST_TOKEN_FILE: &str = "regist-token";
-/// 单实例锁文件。
+/// **部署级**单实例锁文件（`state_dir` 下）：回答「**这份部署**在跑吗」。
+/// 「同机只能有一个 gwlinkd」由机器级闸门 [`crate::single_instance`] 负责（与配置无关）。
 pub const LOCK_FILE: &str = "gwlinkd.lock";
 
 /// 一次升级的记录。
@@ -137,7 +138,9 @@ fn write_secret(path: &Path, content: &str) -> StateResult<()> {
         .map_err(StateError::from)
 }
 
-/// 单实例锁：拿不到即说明本机已有常驻在跑。进程退出时由内核释放（无陈旧锁问题）。
+/// 部署级单实例锁：拿不到即说明**这份部署**已有常驻在跑。进程退出时由内核释放（无陈旧锁问题）。
+///
+/// 只管 `state_dir` 这一份部署；与配置无关的「同机一个」由 [`crate::single_instance`] 兑现。
 pub struct LockGuard {
     _file: std::fs::File,
 }

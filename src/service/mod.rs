@@ -4,8 +4,10 @@
 //! - macOS：launchd plist（`KeepAlive`，日志进 `/var/log/wist-gwlinkd` 或 `~/Library/Logs/wist-gwlinkd`）。
 //!
 //! gwlinkd 自身**只前台运行**（不 fork / 不 daemonize）；自启、拉起、重启全部交给服务管理器，
-//! 重复实例由 state 目录下的 flock（[`crate::state::acquire_single_instance_lock`]）兜底 ——
-//! 服务管理器重启期间若前任未退出，新进程会以「已有网关常驻在跑」快速失败，再由 `Restart` /
+//! 重复实例由两道闸门兜底：**机器级** `flock`（`/tmp/wist-gwlinkd.lock`，与配置无关 ——
+//! 一个操作系统上只允许一个 gwlinkd，见 [`crate::single_instance`]）与 **部署级** `flock`
+//! （`state_dir/gwlinkd.lock`，[`crate::state::acquire_single_instance_lock`]）。
+//! 服务管理器重启期间若前任未退出，新进程会以「已有实例在跑」快速失败，再由 `Restart` /
 //! `KeepAlive` 重试。
 //!
 //! 与 `wist-agentd/src/service` **有意同形**（便于两处对照）。差异：gwlinkd 无 sibling 执行器，

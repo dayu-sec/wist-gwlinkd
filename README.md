@@ -141,7 +141,8 @@ install = "tool-copy"
 binary = "gx"
 ```
 
-环境变量：`WIST_GWLINKD_CONFIG`（配置文件路径）、`WIST_GWLINKD_LINK_TOKEN`（首跑置备用的一次性接入 token）。
+环境变量：`WIST_GWLINKD_CONFIG`（配置文件路径）、`WIST_GWLINKD_LINK_TOKEN`（首跑置备用的一次性接入 token）、
+`WIST_GWLINKD_LOCK_FILE`（单实例锁文件路径；缺省 `/tmp/wist-gwlinkd.lock`，只在本机确实要并行两套时才改）。
 也可以用命令行全局选项 `--conf <path>` / `-c <path>` / `--pub <path>` / `-p <path>` 代替前两者的**路径**部分（见上文「用法」）。
 
 升级由常驻周期从中心 `GET /api/v1/gateway/upgrade-plan` 拉 desired 驱动（按 `plan_id` 幂等，游标落盘跨重启）。
@@ -152,8 +153,12 @@ gops 调用契约（2.2.x）：`gops prj upgrade --to <版本|URL|路径> --on-f
 `state_dir/wist-upgrader.log`。**成功要佐证**：执行器报成后，若配了 `gateway_self_endpoint`，还会独立观测网关
 自述面是否恢复且健康，观测不到则记 `unverified`（不认 `done`）；没配自述面则回执细节里标注「未佐证」。
 **常驻退出时会收走执行器**（`kill_on_drop` + Linux `PR_SET_PDEATHSIG`），
-不留孤儿执行器继续动现场。其余：同机**单实例**（`flock` 锁）、HTTP 带**超时**、`trust_bundle` 作为**自定义信任锚**、
+不留孤儿执行器继续动现场。其余：同机**只允许一个** gwlinkd（机器级 `flock` 闸门 `/tmp/wist-gwlinkd.lock`，
+与配置无关；`WIST_GWLINKD_LOCK_FILE` 可覆盖）、HTTP 带**超时**、`trust_bundle` 作为**自定义信任锚**、
 凭据**原子落盘**。
+
+> 闸门是**按机器**的：同一台机器上的 dev 实例与发布态实例（两份配置、两个 state 目录）**不能并存** ——
+> 先停一个；确实要并行两套时，给其中一套显式指定 `WIST_GWLINKD_LOCK_FILE`（两套各自一个锁文件）。
 
 **无状态工具**（`galaxy-ops` / `galaxy-flow`）不走 gops 工程：`[[upgrade.component]]` 里标 `install = "tool-copy"`
 后，驱动改为**进程内**取制品（带信任锚的客户端）→ gzip+tar 解包 → 把 `binary` **就地覆盖**到它在 `PATH` 上的**原位置**

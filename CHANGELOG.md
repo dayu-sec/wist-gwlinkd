@@ -3,6 +3,38 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 变更
+
+- **同机只允许一个实例（机器级）**：`run` 启动时先拿 `/tmp/wist-gwlinkd.lock`（`flock`，**与配置 /
+  `state_dir` 无关**），再拿 `state_dir/gwlinkd.lock`。此前只锁 `state_dir`，两份配置（或相对
+  `state_dir` 从不同 cwd 启动）会各跑一份。逃生口：`WIST_GWLINKD_LOCK_FILE`（确实要并行两套时）。
+- **锁持有到进程退出**：闸门在 `main` 取好并 `mem::forget`，不再随 `run()` 返回就释放 ——
+  自更新退出时运行时还要收尾（阻塞任务 / 子进程），提前放锁会给「手动再起一个」留重叠窗口。
+- **`/tmp` 按龄清理不再漏闸门**：常驻每拍给锁文件续 mtime；被删 / 被换就重开重锁，重锁拿不到
+  即判闸门失效并退出（不假装自己还是唯一实例）。锁文件以 `O_NOFOLLOW` 打开（`/tmp` 路径可预测）。
+- **闸门失败分两类**：`LockError::{Held, Unavailable}` —— 「已有实例」落 `already running`（正常结局），
+  「锁文件打不开 / 被换成符号链接」落 `state`（环境问题）。混成一类会让人拿着 `already running`
+  去找一个不存在的进程。
+- **服务定义加红线注释**：systemd unit **不得**设 `PrivateTmp=yes`（会把 `/tmp` 变成服务私有命名空间，
+  机器级闸门退化为按服务）；单测盯住这条。
+
+### 升级注意
+
+- **行为变化（可能影响开发机）**：以前只有 `state_dir` 里的锁，开发机上的 dev 实例可以和发布态实例
+  （两份配置）并存；现在**同机只能有一个**，后来者会以“已经有另一个 wist-gwlinkd”退 1。
+  先停一个；确实要并行两套时给其中一套设 `WIST_GWLINKD_LOCK_FILE`（两套各自一个锁文件）。
+- 服务定义**不要**加 `PrivateTmp=yes`（会把 `/tmp` 私有化，闸门退化为按服务）。
+
+### 测试
+
+新增 `single_instance` 单测 10 个（第二个被拒且报出持有者 pid / 释放后可再拿 / 默认路径按机器而非
+按用户 / pid 记账 / 只读锁文件仍互斥 / 父目录不存在归 `Unavailable` / 符号链接被拒且不跟写 /
+不同锁文件互不挤 / 清理后重建 / 被接管时报错）与 `tests/run_cli.rs` 的 bin 层跨进程用例 7 个
+（同部署第二实例被拒 / **另一份配置占着机器级闸门也被拒** / 没人持锁时不误判 / 释放后可启 /
+机器级闸门不可用归 `state` / 状态目录不可用归 `state` / **真双进程：一真常驻 + 另一份配置被拒 + `kill -9` 后闸门无需人工清理**）。
+
 ## [0.15.7-alpha] - 2026-10-20
 
 ### 新增

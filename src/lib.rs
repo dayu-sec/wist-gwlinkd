@@ -24,6 +24,7 @@ pub mod linkd_status;
 // NOTE(hand-added): 运行日志（`[log]` 段）已抽到共享 crate `wist-log`。
 pub mod selfreport;
 pub mod service;
+pub mod single_instance;
 pub mod state;
 pub mod target;
 pub mod task_log;

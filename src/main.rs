@@ -16,7 +16,7 @@ use wist_gwlinkd::deps::ToolVersions;
 use wist_gwlinkd::doctor::{self, Status};
 use wist_gwlinkd::error::{
     CenterError, CenterReason, CenterResult, GwlinkdError, GwlinkdReason, GwlinkdResult,
-    OpLoggable, chain_one_line, logged_op,
+    OpLoggable, StateReason, chain_one_line, logged_op,
 };
 use wist_gwlinkd::executor::{DEFAULT_ON_FAILURE, DEFAULT_UPGRADER_PROGRAM, GopsExecutor};
 use wist_gwlinkd::identity;
@@ -27,6 +27,7 @@ use wist_gwlinkd::linkd_status::{
 };
 use wist_gwlinkd::selfreport::SelfReportClient;
 use wist_gwlinkd::service;
+use wist_gwlinkd::single_instance;
 use wist_gwlinkd::state::{self, CredentialStatus, UpgradeCursor, UpgradeRecord};
 use wist_gwlinkd::task_log::TaskLog;
 use wist_gwlinkd::tool_install::ToolInstaller;
@@ -219,7 +220,27 @@ async fn main() -> ExitCode {
             match Config::load(&path) {
                 Ok(config) => {
                     log_init(&config.log);
-                    match run(&config, &path).await {
+                    // 单实例闸门：**机器级**（与配置无关）+ **部署级**（state 目录）。拿到就持有到
+                    // 进程退出 —— 放在这里而不是 `run()` 里，是因为 `run()` 返回后运行时还要收尾
+                    // （阻塞任务 / 子进程），提前放锁会给「手动再起一个」留一个与正在退出的旧进程重叠的窗口。
+                    let mut locks = match acquire_instance_locks(&config) {
+                        Ok(locks) => locks,
+                        Err(err) => {
+                            log::error!("event=RunFailed error={}", chain_one_line(&err));
+                            eprintln!("[FAIL] {}", err.display_chain());
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    // 把实际生效的落点打出来：双实例排障时先看这一行，不用猜别人锁在哪。
+                    log::info!(
+                        "event=InstanceGate machine_lock={} state_lock={}",
+                        locks.machine.path().display(),
+                        config.state_dir.join(state::LOCK_FILE).display()
+                    );
+                    let outcome = run(&config, &path, &mut locks.machine).await;
+                    // 句柄**故意泄漏**：交给内核在进程退出时释放，别在收尾期间放锁。
+                    std::mem::forget(locks);
+                    match outcome {
                         Ok(()) => ExitCode::SUCCESS,
                         Err(err) => {
                             log::error!("event=RunFailed error={}", chain_one_line(&err));
@@ -311,12 +332,46 @@ fn write_new(path: &Path, text: String) -> GwlinkdResult<()> {
     )
 }
 
-/// 常驻：单实例 → 首跑置备（若未注册）→ 周期【续期 / 拉升级目标 / 拉自述面 / 上报状态】。
-async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
-    // 单实例：同机只允许一个常驻（否则双重上报 + 双重驱动升级）。持有到进程退出。
-    let _lock = state::acquire_single_instance_lock(&config.state_dir)
-        .map_err(|err| GwlinkdReason::AlreadyRunning.err(err))?;
+/// 单实例闸门的**两把锁**（语义不同，都要持有）：
+///
+/// - `machine`：机器级（`/tmp/wist-gwlinkd.lock`，与配置无关）—— 「这台机器上只能有一个
+///   gwlinkd 在跑」由它兑现。两份配置、两个 cwd、system + user 各装一份，都拦得住。
+/// - `_state`：部署级（`state_dir/gwlinkd.lock`）—— `unlink` 据它拒绝边跑边删，
+///   `service status` 据它判活；它回答的是「**这份部署**在跑吗」。
+struct InstanceLocks {
+    machine: single_instance::InstanceLock,
+    _state: state::LockGuard,
+}
 
+/// 按「机器级 → 部署级」的固定顺序拿锁（两把都是 `LOCK_NB`，不会互相等待）。
+///
+/// 错误 reason 要分清：「已被持有」是**正常结局**（`AlreadyRunning`，服务管理器拉起旧的就够）；
+/// 「锁文件打不开 / 加不了锁」是**环境问题**（`State`）—— 把它们混成一类，排障的人会一直去找进程。
+fn acquire_instance_locks(config: &Config) -> GwlinkdResult<InstanceLocks> {
+    let machine = single_instance::InstanceLock::acquire().map_err(|err| match err {
+        single_instance::LockError::Held(detail) => GwlinkdReason::AlreadyRunning.err(detail),
+        single_instance::LockError::Unavailable(detail) => GwlinkdReason::State.err(detail),
+    })?;
+    let _state = state::acquire_single_instance_lock(&config.state_dir).map_err(|err| {
+        let detail = err.to_string();
+        if matches!(err.reason(), StateReason::AlreadyRunning) {
+            GwlinkdReason::AlreadyRunning.err(detail)
+        } else {
+            GwlinkdReason::State.err(detail)
+        }
+    })?;
+    Ok(InstanceLocks { machine, _state })
+}
+
+/// 常驻：单实例 → 首跑置备（若未注册）→ 周期【续期 / 拉升级目标 / 拉自述面 / 上报状态】。
+///
+/// 单实例锁由 [`acquire_instance_locks`] 在调用方（`main`）取好并传进来：它要持有到**进程退出**，
+/// 不能随本函数返回就放（见 `main` 里的 `mem::forget`）。
+async fn run(
+    config: &Config,
+    path: &Path,
+    machine_lock: &mut single_instance::InstanceLock,
+) -> GwlinkdResult<()> {
     let identity = state::load_or_create_identity(&config.state_dir)
         .map_err(|err| GwlinkdReason::Identity.err(err))?;
 
@@ -512,6 +567,18 @@ async fn run(config: &Config, path: &Path) -> GwlinkdResult<()> {
 
     loop {
         ticker.tick().await;
+
+        // 闸门续命：`/tmp` 的按龄清理（systemd-tmpfiles / macOS periodic）会把锁文件当垃圾删掉，
+        // 删了之后「新建 + flock」是另一个 inode —— 闸门就漏了。被删/被换时 refresh 会重开重锁；
+        // **重锁拿不到 = 已有另一个实例**，宁可退出让服务管理器重来，也不双实例并存。
+        if let Err(err) = machine_lock.refresh() {
+            return Err(match err {
+                single_instance::LockError::Held(detail) => {
+                    GwlinkdReason::AlreadyRunning.err(detail)
+                }
+                single_instance::LockError::Unavailable(detail) => GwlinkdReason::State.err(detail),
+            });
+        }
 
         // 依赖工具版本变化很慢（安装 / 升级才变），不必每拍探测；定期刷新即可。
         if Instant::now() >= next_tool_probe_at {
