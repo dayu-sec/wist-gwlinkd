@@ -26,6 +26,8 @@ pub mod selfreport;
 pub mod service;
 pub mod single_instance;
 pub mod state;
+// 仅供 crate 内部（gops 系统根解析）：不对外暴露。
+mod sys_root;
 pub mod target;
 pub mod task_log;
 pub mod tool_install;

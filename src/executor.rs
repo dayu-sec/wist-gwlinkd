@@ -7,7 +7,7 @@
 //! 边界：本层只负责「构造命令行 + 归一化结局」；**结果可信度**（成功要不要佐证）是驱动的事，
 //! 见 `crate::upgrade`。见 CR-003 R4。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use tokio::process::Command;
@@ -24,8 +24,12 @@ pub const DEFAULT_ON_FAILURE: &str = "rollback-all";
 pub struct ExecutorInvocation<'a> {
     /// 目标版本 / URL / 本机路径（计划里直接填的那个）。
     pub to_version: &'a str,
-    /// 计划里的组件名；执行器未固定系统名时用它作 NAME。
-    pub component: Option<&'a str>,
+    /// 执行器的**目标系统名**（gops 的位置参数 `NAME`）；`None` = 不点名（工程内全部系统）。
+    ///
+    /// 注意：它不是计划里的**组件名**。组件名是发布口径（`galaxy-ops` / `wist-gateway-stack` …），
+    /// 跟工程里的系统不是一回事 —— 拿它当 `NAME` 会得到「未知系统或无效版本 spec」。
+    /// 解析见 [`UpgradeExecutor::resolve_system_name`]。
+    pub system_name: Option<&'a str>,
 }
 
 /// 一次执行的结局（记账 + 回执用）。
@@ -43,6 +47,15 @@ pub struct Outcome {
 pub trait UpgradeExecutor: Send + Sync {
     /// 程序路径（诊断 / 日志用）。
     fn program(&self) -> &str;
+
+    /// 把计划里的**组件名**翻成执行器的**目标系统名**。
+    ///
+    /// 默认：不支持点名（`None`）—— 只有按系统分派的执行器（gops）才需要。
+    /// 返回 `Err` = 组件既不是本机声明的组件、也不是工程里的系统：**拒发**（别把组件名
+    /// 当系统名塞进命令行，那会以「未知系统」失败，或更糟——改错升级目标）。
+    fn resolve_system_name(&self, _component: Option<&str>) -> Result<Option<String>, String> {
+        Ok(None)
+    }
 
     /// 发执行器**之前**的前置校验：`Err(可读原因)` = 别发（驱动把它落成可读失败并回执）。
     ///
@@ -90,6 +103,74 @@ impl GopsExecutor {
         }
     }
 
+    /// 解析 `gops prj upgrade` 的位置参数 `NAME`。
+    ///
+    /// 优先级：显式配置的 `upgrade_project_name` → 计划组件名（仅当它确实对应工程里的系统）
+    /// → 工程里唯一系统 → 不点名（`None`，gops 升级工程内全部系统）。
+    ///
+    /// 为什么不能直接拿组件名当 NAME：组件是**发布口径**（`galaxy-ops` / `galaxy-flow` /
+    /// `wist-gateway-stack` …），工程里不一定有同名系统。直接传的后果：
+    /// `gops prj upgrade ... galaxy-ops` → 「未知系统或无效版本 spec：`galaxy-ops`」；
+    /// 若改成“回落成工程里唯一的系统”，更糟 —— 会拿 gops 的版本去升网关栈。
+    /// 所以：对应不上就 **拒发**，并告诉人怎么声明（`[[upgrade.component]]` + `tool-copy`）。
+    ///
+    /// 解析出来的永远是 **`sys_model.yml` 的 `name`** —— gops 就按它匹配（目录名只当别名看）。
+    fn resolve_name(&self, component: Option<&str>) -> Result<Option<String>, String> {
+        let explicit = self
+            .project_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        // 没工程根 = gops 会跑到进程 cwd（preflight 已拒）：显式配的照给，其余不猜。
+        let Some(root) = self.project_dir.as_deref() else {
+            return Ok(explicit.map(str::to_string));
+        };
+        let systems = crate::sys_root::systems_under(root);
+        // gops 要的是模型名（目录名只是本地别名）：定位到系统就翻成模型名。
+        let name_of = |sys: &Path| {
+            crate::sys_root::model_name(sys).unwrap_or_else(|| crate::sys_root::dir_name(sys))
+        };
+
+        if let Some(name) = explicit {
+            if let Some(found) = systems
+                .iter()
+                .find(|sys| crate::sys_root::system_matches(sys, name))
+            {
+                return Ok(Some(name_of(found)));
+            }
+            // 一个系统都认不出来（工程不在 / 结构不是 `<工程根>/<系统>`）：无从判断，原样交给 gops。
+            if systems.is_empty() {
+                return Ok(Some(name.to_string()));
+            }
+            // 有系统却对不上 = 名字写错：当场报，别等 gops 回一句「未知系统」。
+            return Err(format!(
+                "upgrade_project_name = `{name}` 找不到对应系统：{} 下没有同名目录，也没有 name 相同的系统（已找到：{}）",
+                root.display(),
+                crate::sys_root::list_systems(&systems)
+            ));
+        }
+
+        let Some(component) = component else {
+            // 计划没给组件：只有一个系统就点名（避免“升级工程内全部”的意外），多个交给 gops。
+            return Ok(match systems.as_slice() {
+                [only] => Some(name_of(only)),
+                _ => None,
+            });
+        };
+        let Some(found) = systems
+            .iter()
+            .find(|sys| crate::sys_root::system_matches(sys, component))
+        else {
+            return Err(format!(
+                "组件 `{component}` 既不是本机声明的组件（`[[upgrade.component]]`），也不是 gops 工程 {} 里的系统（已导入：{}）；\
+                 宿主工具（如 galaxy-ops / galaxy-flow）要在 `[[upgrade.component]]` 里标 `install = \"tool-copy\"`",
+                root.display(),
+                crate::sys_root::list_systems(&systems)
+            ));
+        };
+        Ok(Some(name_of(found)))
+    }
+
     /// 设 `--on-failure`。
     pub fn with_on_failure(mut self, on_failure: impl Into<String>) -> Self {
         self.on_failure = on_failure.into();
@@ -116,6 +197,10 @@ impl UpgradeExecutor for GopsExecutor {
         &self.program
     }
 
+    fn resolve_system_name(&self, component: Option<&str>) -> Result<Option<String>, String> {
+        self.resolve_name(component)
+    }
+
     fn preflight(&self) -> UpgradeResult<()> {
         // 工程根是 **gops 的要求**，只对 gops 生效（站点脚本执行器不要求）。
         // gops 从 **cwd** 解析工程（`ops-prj.yml`），且 `gops prj upgrade` **没有**指定工程的旗标
@@ -140,8 +225,6 @@ impl UpgradeExecutor for GopsExecutor {
     }
 
     fn command(&self, invocation: &ExecutorInvocation<'_>) -> Command {
-        // 固定系统名优先；否则用计划里的组件名作 NAME。
-        let name = self.project_name.as_deref().or(invocation.component);
         let mut args = vec![
             "prj".to_string(),
             "upgrade".to_string(),
@@ -160,7 +243,8 @@ impl UpgradeExecutor for GopsExecutor {
             args.push("--health-timeout".to_string());
             args.push(seconds.to_string());
         }
-        if let Some(name) = name {
+        // NAME 由 [`Self::resolve_name`] 解析好传进来（不直接用计划里的组件名）。
+        if let Some(name) = invocation.system_name {
             args.push(name.to_string());
         }
 

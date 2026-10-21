@@ -15,6 +15,7 @@ use tokio::time::MissedTickBehavior;
 use crate::center::{CenterClient, WparseCommand, build_mtls_http_client};
 use crate::config::Config;
 use crate::state;
+use crate::sys_root::control_workdir;
 use crate::task_log::{self, TaskLog};
 
 const STATUS_PATH: &str = "/admin/v1/runtime/status";
@@ -412,7 +413,7 @@ async fn execute_control(
     }
 }
 
-/// 体检：在网关栈根（`upgrade_project_dir`）跑 `gops run diagnose --json`。
+/// 体检：在**系统根**（见 [`control_workdir`]）跑 `gops run diagnose --json`。
 ///
 /// 回执语义：
 /// - **exit 0 / 1 都算“执行成功”**：体检发现问题时 gops 本就退 1，报告里自带
@@ -423,15 +424,16 @@ async fn run_diagnose(
     command: &WparseCommand,
     task: Option<&TaskLog>,
 ) -> UpstreamResult {
-    let Some(dir) = config.upgrade_project_dir.clone() else {
-        let error =
-            "体检未配置工程根：upgrade_project_dir 未设置（gops 从 cwd 解析系统）".to_string();
-        record_event(task, "config.error", &error);
-        return UpstreamResult {
-            status_code: 500,
-            body: String::new(),
-            error: Some(error),
-        };
+    let dir = match control_workdir(config) {
+        Ok(dir) => dir,
+        Err(error) => {
+            record_event(task, "config.error", &format!("体检：{error}"));
+            return UpstreamResult {
+                status_code: 500,
+                body: String::new(),
+                error: Some(format!("体检：{error}")),
+            };
+        }
     };
     let program = config
         .diagnose_program
@@ -545,20 +547,21 @@ async fn run_diagnose(
     }
 }
 
-/// 重启**网关栈**：在工程根依次 `gops run stop` / `gops run start`。
+/// 重启**网关栈**：在系统根（见 [`control_workdir`]）依次 `gops run stop` / `gops run start`。
 ///
 /// 两步都带超时；任何一个失败都**明确报错**（尤其 `start` 失败时网关会停在停止态，
 /// 回执里必须写出来，不能只报“命令失败”）。
 async fn run_gateway_restart(config: &Config, task: Option<&TaskLog>) -> UpstreamResult {
-    let Some(dir) = config.upgrade_project_dir.clone() else {
-        let error =
-            "重启未配置工程根：upgrade_project_dir 未设置（gops 从 cwd 解析系统）".to_string();
-        record_event(task, "config.error", &error);
-        return UpstreamResult {
-            status_code: 500,
-            body: String::new(),
-            error: Some(error),
-        };
+    let dir = match control_workdir(config) {
+        Ok(dir) => dir,
+        Err(error) => {
+            record_event(task, "config.error", &format!("重启：{error}"));
+            return UpstreamResult {
+                status_code: 500,
+                body: String::new(),
+                error: Some(format!("重启：{error}")),
+            };
+        }
     };
     let program = config
         .upgrader_program
@@ -568,7 +571,11 @@ async fn run_gateway_restart(config: &Config, task: Option<&TaskLog>) -> Upstrea
 
     let mut steps: Vec<serde_json::Value> = Vec::new();
     for step in ["stop", "start"] {
-        record_event(task, "restart.step", &format!("{program} run {step}"));
+        record_event(
+            task,
+            "restart.step",
+            &format!("{program} run {step}（cwd={}）", dir.display()),
+        );
         match run_short(&program, &["run", step], &dir, timeout).await {
             Ok(output) if output.status.success() => {
                 if let Some(task) = task {
@@ -906,6 +913,8 @@ mod tests {
 
     #[cfg(unix)]
     fn diagnose_config(dir: &Path, program: &str, timeout: u64) -> Config {
+        // cwd 必须是系统根：这里把同一个目录当作系统根（配了 sys/sys_model.yml）。
+        make_system_root(dir);
         let path = dir.join("gwlinkd.toml");
         std::fs::write(
             &path,
@@ -917,6 +926,43 @@ mod tests {
         )
         .unwrap();
         Config::load(&path).expect("config")
+    }
+
+    /// 控制命令的配置：`state_dir` 在 `state`，`upgrade_project_dir` 单独指定（可为工程根）。
+    fn control_config(
+        state: &Path,
+        project_dir: &Path,
+        project_name: Option<&str>,
+        program: &str,
+    ) -> Config {
+        let path = state.join("gwlinkd.toml");
+        let name = project_name
+            .map(|name| format!("upgrade_project_name = \"{name}\"\n"))
+            .unwrap_or_default();
+        std::fs::write(
+            &path,
+            format!(
+                "state_dir = \"{}\"\nupgrade_project_dir = \"{}\"\n{name}diagnose_program = \"{program}\"\ndiagnose_timeout_seconds = 10\nupgrader_program = \"{program}\"\n",
+                state.display(),
+                project_dir.display()
+            ),
+        )
+        .unwrap();
+        Config::load(&path).expect("config")
+    }
+
+    /// 造一个系统根（默认内收布局 `sys/sys_model.yml`）。
+    fn make_system_root(dir: &Path) {
+        std::fs::create_dir_all(dir.join("sys")).unwrap();
+        let name = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "stack".to_string());
+        std::fs::write(
+            dir.join("sys").join("sys_model.yml"),
+            format!("name: {name}\nkind: docker-compose\n"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1070,6 +1116,75 @@ mod tests {
         assert_eq!(result.status_code, 200);
         let seen = std::fs::read_to_string(&argv).unwrap();
         assert!(seen.contains("run diagnose --json --no-color"), "{seen}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnose_runs_in_the_system_root_not_the_project_root() {
+        // 现场回归：工程根跑 diagnose → gx 报“系统未定义 diagnose 流程”（误导）。
+        let state = temp_state("diag-cwd");
+        let project = state.join("prj");
+        let system = project.join("wist-gateway-stack");
+        make_system_root(&system);
+        std::fs::write(project.join("ops-prj.yml"), "kind: ops\n").unwrap();
+        let cwd_file = state.join("cwd.txt");
+        let stub = stub_gops(
+            &state,
+            &format!(
+                "pwd > {}\necho '{{\"schema_version\":\"1\"}}'\nexit 0",
+                cwd_file.display()
+            ),
+        );
+        let config = control_config(&state, &project, None, &stub);
+        let result = execute_control(&config, &diagnose_command(), None).await;
+        assert_eq!(result.status_code, 200, "{:?}", result.error);
+        let seen = std::fs::read_to_string(&cwd_file).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(seen.trim()).unwrap(),
+            std::fs::canonicalize(&system).unwrap(),
+            "diagnose 的 cwd 必须是系统根"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_uses_the_system_root_as_cwd() {
+        // `gops run stop|start` 也是从 cwd 解析系统，cwd 错了同样重启不了。
+        let state = temp_state("restart-cwd");
+        let project = state.join("prj");
+        let system = project.join("wist-gateway-stack");
+        make_system_root(&system);
+        let cwd_file = state.join("cwd.txt");
+        let stub = stub_gops(&state, &format!("pwd >> {}\nexit 0", cwd_file.display()));
+        let config = control_config(&state, &project, None, &stub);
+        let result = run_gateway_restart(&config, None).await;
+        assert_eq!(result.status_code, 200, "{:?}", result.error);
+        let seen = std::fs::read_to_string(&cwd_file).unwrap();
+        let lines: Vec<&str> = seen.lines().collect();
+        assert_eq!(lines.len(), 2, "stop + start 都要跑：{seen}");
+        for line in lines {
+            assert_eq!(
+                std::fs::canonicalize(line.trim()).unwrap(),
+                std::fs::canonicalize(&system).unwrap(),
+                "restart 的 cwd 必须是系统根"
+            );
+        }
+    }
+
+    #[test]
+    fn control_commands_fail_closed_when_the_system_root_is_ambiguous() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let state = temp_state("cwd-ambiguous");
+        let project = state.join("prj");
+        make_system_root(&project.join("stack-a"));
+        make_system_root(&project.join("stack-b"));
+        let config = control_config(&state, &project, None, "/bin/true");
+        let diag = runtime.block_on(execute_control(&config, &diagnose_command(), None));
+        assert_eq!(diag.status_code, 500);
+        assert!(diag.error.unwrap_or_default().contains("多个系统"));
+        let restart = runtime.block_on(run_gateway_restart(&config, None));
+        assert_eq!(restart.status_code, 500);
+        assert!(restart.error.unwrap_or_default().contains("多个系统"));
     }
 
     #[test]

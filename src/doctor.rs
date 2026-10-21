@@ -111,6 +111,7 @@ pub fn diagnose(config: &Config) -> Report {
         self_reachable_check(config),
         upgrader_check(config),
         upgrade_project_check(config),
+        control_workdir_check(config),
         upgrade_check(config),
         upgrade_tools_check(config),
         reachability_check(config),
@@ -533,6 +534,36 @@ fn upgrade_project_check(config: &Config) -> Check {
             } else {
                 format!("{}（执行器 {program} 不要求工程根）", dir.display())
             },
+        ),
+    }
+}
+
+/// 控制命令（体检 / 重启网关）的 cwd：必须是**系统根**，而不是 gops 工程根。
+///
+/// 与 `upgrade.project` 分开：那个要的是工程根（`prj upgrade` 从 cwd 读 `ops-prj.yml`），
+/// 这个要的是系统根（`run diagnose|stop|start` 从 cwd 解析系统）—— 两者是父子关系，
+/// 搞混时会得到「系统未定义 diagnose 流程」这种看着像配置问题的假故障。
+fn control_workdir_check(config: &Config) -> Check {
+    if config.upgrade_project_dir.is_none() {
+        // 没配工程根：控制命令必然被拒，但那是 `upgrade.project` 在报，不重复刷红。
+        return Check::warn(
+            "control.workdir",
+            "体检/重启未可用",
+            "upgrade_project_dir 未设置，中心派来的体检 / 重启会被拒",
+        )
+        .with_hint("把 upgrade_project_dir 指到 gops 工程根（系统在其子目录或就是它本身）");
+    }
+    match crate::sys_root::control_workdir(config) {
+        Ok(dir) => Check::ok(
+            "control.workdir",
+            "体检/重启工作目录",
+            format!("{}（系统根）", dir.display()),
+        ),
+        Err(reason) => Check::fail(
+            "control.workdir",
+            "体检/重启定位不到系统",
+            reason,
+            "把 upgrade_project_dir 指到含系统的 gops 工程根，或用 upgrade_project_name 指定系统",
         ),
     }
 }
@@ -1085,6 +1116,87 @@ mod tests {
         let dir = temp_dir("proj-skip");
         let cfg = config(&dir); // upgrader_program = /bin/sh
         assert_eq!(status_of(&diagnose(&cfg), "upgrade.project"), Status::Ok);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- 体检 / 重启的 cwd（系统根）----
+
+    #[test]
+    fn an_unset_project_dir_warns_that_control_is_unavailable() {
+        let dir = temp_dir("ctl-none");
+        let cfg = config(&dir);
+        assert_eq!(status_of(&diagnose(&cfg), "control.workdir"), Status::Warn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_project_root_holding_a_single_system_is_a_usable_control_workdir() {
+        // 现场形态：upgrade_project_dir 是工程根，系统在子目录里 —— 必须点名子目录。
+        let dir = temp_dir("ctl-project");
+        let system = dir.join("wist-gateway-stack");
+        std::fs::create_dir_all(system.join("sys")).expect("mkdir");
+        std::fs::write(system.join("sys").join("sys_model.yml"), "name: s\n").expect("write");
+        let mut cfg = config(&dir);
+        cfg.upgrade_project_dir = Some(dir.clone());
+        let report = diagnose(&cfg);
+        assert_eq!(status_of(&report, "control.workdir"), Status::Ok);
+        assert!(
+            report
+                .find("control.workdir")
+                .expect("check")
+                .detail
+                .contains("wist-gateway-stack"),
+            "要写出实际会用的目录"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_project_root_without_any_system_fails_the_control_check() {
+        let dir = temp_dir("ctl-nosys");
+        std::fs::write(dir.join("ops-prj.yml"), "kind: ops\n").expect("write");
+        let mut cfg = config(&dir);
+        cfg.upgrade_project_dir = Some(dir.clone());
+        assert_eq!(status_of(&diagnose(&cfg), "control.workdir"), Status::Fail);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_missing_project_dir_fails_the_control_check() {
+        // 路径写错与“目录在但没系统”是两回事：前者要说清是**目录不存在**。
+        let dir = temp_dir("ctl-missing");
+        let mut cfg = config(&dir);
+        cfg.upgrade_project_dir = Some(dir.join("nope"));
+        let report = diagnose(&cfg);
+        assert_eq!(status_of(&report, "control.workdir"), Status::Fail);
+        assert!(
+            report
+                .find("control.workdir")
+                .expect("check")
+                .detail
+                .contains("工程根不存在"),
+            "要指出是目录不存在"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn several_systems_fail_the_control_check_and_name_the_candidates() {
+        let dir = temp_dir("ctl-multi");
+        for name in ["stack-a", "stack-b"] {
+            let system = dir.join(name);
+            std::fs::create_dir_all(system.join("sys")).expect("mkdir");
+            std::fs::write(system.join("sys").join("sys_model.yml"), "name: s\n").expect("write");
+        }
+        let mut cfg = config(&dir);
+        cfg.upgrade_project_dir = Some(dir.clone());
+        let report = diagnose(&cfg);
+        assert_eq!(status_of(&report, "control.workdir"), Status::Fail);
+        let detail = &report.find("control.workdir").expect("check").detail;
+        assert!(
+            detail.contains("stack-a") && detail.contains("stack-b"),
+            "{detail}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

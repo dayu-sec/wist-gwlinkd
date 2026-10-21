@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 
 use crate::center::CenterClient;
-use crate::error::{UpgradeReason, UpgradeResult, chain_one_line, logged_op};
+use crate::error::{UpgradeError, UpgradeReason, UpgradeResult, chain_one_line, logged_op};
 use crate::executor::{ExecutorInvocation, Outcome, UpgradeExecutor};
 use crate::selfreport::SelfReportClient;
 use crate::state::{self, UpgradeRecord};
@@ -423,13 +423,39 @@ impl UpgradeDriver {
         Ok(())
     }
 
+    /// 前置失败：落终态台账 + 收任务目录 + **回执中心**（不回执的话，中心条目会停在 `dispatched`），
+    /// 再把这个错误原样返回。`step` 统一记 `preflight`（没发执行器）。
+    async fn fail_before_spawn(
+        &self,
+        mut record: UpgradeRecord,
+        task: &Option<Arc<task_log::TaskLog>>,
+        reporter: Option<UpgradeReporter>,
+        reason: UpgradeError,
+    ) -> UpgradeError {
+        record.step = "preflight".to_string();
+        record.status = "failed".to_string();
+        record.detail = reason.to_string();
+        append_task_dir(task, &mut record);
+        if let Err(werr) = state::write_upgrade_record(&self.state_dir, &record) {
+            log::warn!(
+                "event=UpgradeRecordWriteFailed error={}",
+                chain_one_line(&werr)
+            );
+        }
+        if let Some(reporter) = reporter {
+            report_record(&reporter, &record).await;
+        }
+        reason
+    }
+
     /// 驱动一次升级（gops 执行器）：写 `running` 记录，起执行器，**升级期间持续刷心跳**；执行器结束后写终态记录，
     /// （若报成）用自述面**佐证**「网关确实回来了」，再（若给了 `reporter`）**回执**中心。
     ///
     /// 心跳生产者就是本进程：它持有子进程句柄，知道执行器还活着 —— 这正是「判死判据」需要的信号源
     /// （判据在 [`state::upgrader_is_declared_dead`]，但**必须有生产者**，否则长升级会被判假死）。
     ///
-    /// `component` 来自升级计划：当执行器未配固定系统名时，作为 gops 的 NAME 传入（只升该系统）。
+    /// `component` 来自升级计划：它是**发布组件名**，不是 gops 的系统名 ——
+    /// NAME 由执行器 [`UpgradeExecutor::resolve_system_name`] 解析（对应不上就前置失败）。
     ///
     /// [`artifact_url`]：中心**派生**的制品下发地址。执行器取件的 `--to` 用它（`gops --to <url>`）；
     /// 为 `None`（无对应 release）才回落用 [`to_version`]。**台账与回执仍记 `to_version`**（版本）。
@@ -479,20 +505,30 @@ impl UpgradeDriver {
         // 前置校验：执行器缺必要配置（gops 的工程根）就**别发** —— 发出去也只会以退出码失败，
         // 回执读不出原因。这里前置成可读失败，并照常回执（否则中心条目会停在 dispatched）。
         if let Err(reason) = self.executor.preflight() {
-            record.step = "preflight".to_string();
-            record.status = "failed".to_string();
-            record.detail = reason.to_string();
-            append_task_dir(&task, &mut record);
-            if let Err(werr) = state::write_upgrade_record(&self.state_dir, &record) {
-                log::warn!(
-                    "event=UpgradeRecordWriteFailed error={}",
-                    chain_one_line(&werr)
-                );
+            return Err(self
+                .fail_before_spawn(record, &task, reporter, reason)
+                .await);
+        }
+
+        // 目标系统名（gops 的 NAME）：由执行器把**组件名**翻成**系统名**。
+        // 翻不出来 = 这个组件本机不认识（既没在 `[[upgrade.component]]` 里声明，也不是工程里的系统）——
+        // 照发送只会得到「未知系统或无效版本 spec」，还可能把升级打到错的系统上。
+        let system_name = match self.executor.resolve_system_name(component) {
+            Ok(name) => name,
+            Err(reason) => {
+                let err = UpgradeReason::Preflight.err(reason);
+                return Err(self.fail_before_spawn(record, &task, reporter, err).await);
             }
-            if let Some(reporter) = reporter {
-                report_record(&reporter, &record).await;
-            }
-            return Err(reason);
+        };
+        if let Some(task) = &task {
+            // 排障要看得出“到底点了哪个系统”：NAME 为空 = gops 自己按工程全量升。
+            task.event(
+                "system.resolved",
+                Some(&match system_name.as_deref() {
+                    Some(name) => format!("NAME={name}"),
+                    None => "NAME=（不点名，工程内全部系统）".to_string(),
+                }),
+            );
         }
 
         // 取件下沉：**gops 不持中心信任**（私有 CA 下 HEAD/GET 中心地址直接 `error sending request`）。
@@ -550,7 +586,7 @@ impl UpgradeDriver {
         let invocation = ExecutorInvocation {
             // 执行器取件的 `--to`：优先用**已取到本地**的路径，其次中心地址，最后回落版本。
             to_version: staged_to.as_deref().or(artifact_url).unwrap_or(to_version),
-            component,
+            system_name: system_name.as_deref(),
         };
         let mut command = self.executor.command(&invocation);
         command.stderr(stderr);
@@ -977,7 +1013,8 @@ async fn stage_artifact(
     .await
     .map_err(|err| UpgradeReason::Artifact.err(format!("取包失败 {url}: {err}")))?;
 
-    // 中心带摘要就核（① 升级目前不带，仅 gwlinkd 自更新 / ② 带）。
+    // 中心带摘要就核（所有升级计划都带 —— 宿主工具 `tool-copy` 就地覆盖二进制时，
+    // 这是唯一的内容校验；gops 路径也顺带在取件阶段卡住投毒）。
     if let Some(expected) = expected_sha256
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1220,10 +1257,24 @@ mod tests {
     }
 
     /// 测试用 gops 执行器：`program` 的 basename 必须是 `gops`（那才走 gops 的前置校验），
-    /// 并给一个含 `ops-prj.yml` 的工程根。
+    /// 并给一个含 `ops-prj.yml` + 一个系统（`wist-gateway-stack`）的工程根。
     fn gops_script(dir: &Path, program: String) -> GopsExecutor {
         std::fs::write(dir.join("ops-prj.yml"), "kind: ops\n").expect("write ops-prj.yml");
+        make_system(&dir.join("wist-gateway-stack"));
         GopsExecutor::new(program).with_project(Some(dir.to_path_buf()), None)
+    }
+
+    /// 造一个系统根（模型名 = 目录名）。
+    fn make_system(dir: &Path) {
+        std::fs::create_dir_all(dir.join("sys")).expect("mkdir");
+        std::fs::write(
+            dir.join("sys").join("sys_model.yml"),
+            format!(
+                "name: {}\nkind: docker-compose\n",
+                dir.file_name().unwrap().to_string_lossy()
+            ),
+        )
+        .expect("write sys_model.yml");
     }
 
     /// 造一个 tar.gz：包内单条目 `entry` = `payload`。
@@ -1337,9 +1388,13 @@ mod tests {
     #[tokio::test]
     async fn start_passes_on_failure_json_and_component_to_the_executor() {
         let dir = temp_dir("args");
+        // 组件名对得上工程里的系统：NAME 用它（gops 按系统名匹配）。
+        std::fs::write(dir.join("ops-prj.yml"), "kind: ops\n").expect("write");
+        make_system(&dir.join("gw-stack"));
         let driver = UpgradeDriver::new(
             GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string())
-                .with_on_failure("halt"),
+                .with_on_failure("halt")
+                .with_project(Some(dir.clone()), None),
             &dir,
         );
         driver
@@ -1353,6 +1408,185 @@ mod tests {
         assert!(args.contains("--on-failure halt"), "{args}");
         assert!(args.contains("--json"), "{args}");
         assert!(args.ends_with("gw-stack"), "{args}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 工程根就是系统根：NAME 就用它的模型名（不要求它下面再挂一层）。
+    #[tokio::test]
+    async fn a_system_root_as_project_dir_still_resolves_its_name() {
+        let dir = temp_dir("project-is-system");
+        std::fs::write(dir.join("ops-prj.yml"), "kind: ops\n").expect("write");
+        make_system(&dir);
+        let driver = UpgradeDriver::new(
+            GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string())
+                .with_project(Some(dir.clone()), None),
+            &dir,
+        );
+        driver
+            .start("w-root", "0.1.0", "0.1.16", None, None, None)
+            .await
+            .expect("start");
+        let _ = wait_terminal(&dir).await;
+        let args = std::fs::read_to_string(dir.join("args.txt")).expect("args");
+        assert!(
+            args.ends_with(dir.file_name().unwrap().to_str().unwrap()),
+            "{args}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 组件名对不上任何系统 → **拒发**（不把组件名当系统名，也不静默换系统）。
+    #[tokio::test]
+    async fn an_unknown_component_is_refused_before_spawning_the_executor() {
+        let dir = temp_dir("unknown-component");
+        std::fs::write(dir.join("ops-prj.yml"), "kind: ops\n").expect("write");
+        make_system(&dir.join("wist-gateway-stack"));
+        let driver = UpgradeDriver::new(
+            GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string())
+                .with_project(Some(dir.clone()), None),
+            &dir,
+        );
+        let err = driver
+            .start(
+                "w-galaxy",
+                "0.1.0",
+                "2.10.0",
+                Some("galaxy-ops"),
+                None,
+                None,
+            )
+            .await
+            .expect_err("组件对不上系统：应当前置失败");
+        assert!(err.to_string().contains("galaxy-ops"), "{err}");
+        let record = wait_terminal(&dir).await;
+        assert_eq!(record.status, "failed");
+        assert_eq!(record.step, "preflight");
+        assert!(record.detail.contains("galaxy-ops"), "{}", record.detail);
+        assert!(record.detail.contains("tool-copy"), "{}", record.detail);
+        assert!(
+            record.detail.contains("wist-gateway-stack"),
+            "要列出工程里已导入的系统：{}",
+            record.detail
+        );
+        assert!(!dir.join("args.txt").exists(), "不该发执行器");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 计划没给组件：工程里只有一个系统就点名，多个就交给 gops（不替人挑）。
+    #[tokio::test]
+    async fn a_componentless_plan_names_the_only_system() {
+        let dir = temp_dir("no-component");
+        std::fs::write(dir.join("ops-prj.yml"), "kind: ops\n").expect("write");
+        make_system(&dir.join("wist-gateway-stack"));
+        let driver = UpgradeDriver::new(
+            GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string())
+                .with_project(Some(dir.clone()), None),
+            &dir,
+        );
+        driver
+            .start("w-nc", "0.1.0", "0.1.16", None, None, None)
+            .await
+            .expect("start");
+        let _ = wait_terminal(&dir).await;
+        let args = std::fs::read_to_string(dir.join("args.txt")).expect("args");
+        assert!(args.ends_with("wist-gateway-stack"), "{args}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 显式 `upgrade_project_name` 优先于组件名（现场强制点名时不被计划改掉）。
+    #[tokio::test]
+    async fn the_configured_project_name_wins_over_the_component() {
+        let dir = temp_dir("project-name-wins");
+        std::fs::write(dir.join("ops-prj.yml"), "kind: ops\n").expect("write");
+        make_system(&dir.join("stack-a"));
+        make_system(&dir.join("stack-b"));
+        let driver = UpgradeDriver::new(
+            GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string())
+                .with_project(Some(dir.clone()), Some("stack-b".to_string())),
+            &dir,
+        );
+        driver
+            .start("w-pn", "0.1.0", "0.1.16", Some("stack-a"), None, None)
+            .await
+            .expect("start");
+        let _ = wait_terminal(&dir).await;
+        let args = std::fs::read_to_string(dir.join("args.txt")).expect("args");
+        assert!(args.ends_with("stack-b"), "{args}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 无工程根时不猜 NAME（组件名也不当系统名）；显式配了的照给（preflight 会因缺工程根拒掉）。
+    #[test]
+    fn resolve_system_name_never_guesses_without_a_project_dir() {
+        let bare = GopsExecutor::new("gops");
+        assert_eq!(bare.resolve_system_name(Some("galaxy-ops")).unwrap(), None);
+        assert_eq!(bare.resolve_system_name(None).unwrap(), None);
+
+        let named = GopsExecutor::new("gops").with_project(None, Some("stack-a".into()));
+        assert_eq!(
+            named.resolve_system_name(None).unwrap().as_deref(),
+            Some("stack-a")
+        );
+        // 空白名字当没配。
+        let blank = GopsExecutor::new("gops").with_project(None, Some("  ".into()));
+        assert_eq!(blank.resolve_system_name(None).unwrap(), None);
+    }
+
+    /// 显式 `upgrade_project_name` 写错（工程里有系统却对不上）→ **当场拒**，不交给 gops
+    /// 去回一句「未知系统或无效版本 spec」。（与 `gwlinkd diagnose/restart` 同一道口径。）
+    #[tokio::test]
+    async fn a_mistyped_project_name_is_refused_with_candidates() {
+        let dir = temp_dir("bad-project-name");
+        std::fs::write(dir.join("ops-prj.yml"), "kind: ops\n").expect("write");
+        make_system(&dir.join("stack-a"));
+        let driver = UpgradeDriver::new(
+            GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string())
+                .with_project(Some(dir.clone()), Some("wist-gateway-stack".to_string())),
+            &dir,
+        );
+        let err = driver
+            .start("w-bad-name", "0.1.0", "0.1.16", None, None, None)
+            .await
+            .expect_err("配错系统名应当前置失败");
+        assert!(err.to_string().contains("upgrade_project_name"), "{err}");
+        let record = wait_terminal(&dir).await;
+        assert_eq!(record.step, "preflight");
+        assert!(record.detail.contains("stack-a"), "{}", record.detail);
+        assert!(!dir.join("args.txt").exists(), "不该发执行器");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 目录名与模型名不同：组件按目录名或模型名都能命中，但交给 gops 的永远是**模型名**
+    /// （gops 的 `prj upgrade NAME` 按 `sys_model.yml` 的 `name` 匹配）。
+    #[tokio::test]
+    async fn the_gops_name_is_always_the_model_name() {
+        let dir = temp_dir("model-name");
+        std::fs::write(dir.join("ops-prj.yml"), "kind: ops\n").expect("write");
+        let system = dir.join("dir-a");
+        std::fs::create_dir_all(system.join("sys")).expect("mkdir");
+        std::fs::write(
+            system.join("sys").join("sys_model.yml"),
+            "name: wist-gateway-stack\nkind: docker-compose\n",
+        )
+        .expect("write");
+        for component in ["dir-a", "wist-gateway-stack"] {
+            let _ = std::fs::remove_file(dir.join("args.txt"));
+            let driver = UpgradeDriver::new(
+                GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string())
+                    .with_project(Some(dir.clone()), None),
+                &dir,
+            );
+            driver
+                .start("w-model", "0.1.0", "0.1.16", Some(component), None, None)
+                .await
+                .expect("start");
+            let _ = wait_terminal(&dir).await;
+            let args = std::fs::read_to_string(dir.join("args.txt")).expect("args");
+            assert!(
+                args.ends_with("wist-gateway-stack"),
+                "component={component} 时 NAME 应是模型名：{args}"
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

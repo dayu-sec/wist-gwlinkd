@@ -433,19 +433,43 @@ fn relative(root: &Path, path: &Path) -> String {
         .to_string()
 }
 
-/// `which` 等价：`binary` 含分隔符就当路径；否则按 `PATH` 逐目录找**可执行常规文件**。
+/// `which` 等价：`binary` 含分隔符就当路径；否则按 `$HOME/bin` → `PATH` 逐目录找**可执行常规文件**。
 ///
 /// 不引外部 `whereis` / `which` 进程：一是它们找的是各自的内置目录集、未必含 `PATH`，
 /// 二是本函数要能单测。要求可执行位是为了不把 `PATH` 上靠前的**同名非可执行文件**误当原位置覆盖。
+///
+/// 先看 `$HOME/bin`：那是 gwlinkd 的部署惯例（`deps` 里的版本探测也是这个顺序），
+/// 而服务管理器给的最小 `PATH` 里常常没有它。
 fn which(binary: &str) -> Option<PathBuf> {
     if binary.contains('/') {
         let path = PathBuf::from(binary);
         return is_executable_file(&path).then_some(path);
     }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .map(|dir| dir.join(binary))
+    let home_bin = std::env::var_os("HOME").map(PathBuf::from);
+    let path_env = std::env::var_os("PATH");
+    which_in(binary, home_bin.as_deref(), path_env.as_deref())
+}
+
+/// [`which`] 的纯函数内核（`home` = `$HOME`，`path_env` = `$PATH`）：便于单测，不碰环境。
+fn which_in(
+    binary: &str,
+    home: Option<&Path>,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    // `HOME` 可能是空串（污染环境）：那就别拼成相对路径 `bin/<binary>`（会相对 cwd 解析）。
+    if let Some(home) = home.filter(|home| !home.as_os_str().is_empty()) {
+        candidates.push(home.join("bin").join(binary));
+    }
+    if let Some(paths) = path_env {
+        candidates.extend(
+            std::env::split_paths(paths)
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .map(|dir| dir.join(binary)),
+        );
+    }
+    candidates
+        .into_iter()
         .find(|candidate| is_executable_file(candidate))
 }
 
@@ -779,6 +803,48 @@ mod tests {
         );
         // 绝对不存在的路径 → None。
         assert!(which("/nonexistent/nope").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 裸名：先看 `$HOME/bin`，再看 `PATH`（部署惯例 vs 服务管理器的瘦 `PATH`）。
+    #[test]
+    fn which_looks_in_home_bin_before_path() {
+        let dir = temp_dir("which-home");
+        let home = dir.join("home");
+        let home_bin = home.join("bin");
+        let path_dir = dir.join("usr-bin");
+        std::fs::create_dir_all(&home_bin).expect("mkdir");
+        std::fs::create_dir_all(&path_dir).expect("mkdir");
+        let path_env = std::ffi::OsString::from(path_dir.display().to_string());
+
+        // 两处都没：None。
+        assert!(which_in("gx", Some(&home), Some(&path_env)).is_none());
+
+        // 只在 PATH：找到 PATH 的。
+        write_exec(&path_dir.join("gx"), b"x");
+        assert_eq!(
+            which_in("gx", Some(&home), Some(&path_env)).as_deref(),
+            Some(path_dir.join("gx").as_path())
+        );
+
+        // `$HOME/bin` 也有一份：优先它（与 `deps` 的探测同口径）。
+        write_exec(&home_bin.join("gx"), b"x");
+        assert_eq!(
+            which_in("gx", Some(&home), Some(&path_env)).as_deref(),
+            Some(home_bin.join("gx").as_path())
+        );
+
+        // 没 HOME（服务环境下也可能）：仍能靠 PATH 找到。
+        assert_eq!(
+            which_in("gx", None, Some(&path_env)).as_deref(),
+            Some(path_dir.join("gx").as_path())
+        );
+
+        // HOME 是空串（污染环境）：不能拼成相对路径 `bin/gx`（会相对 cwd 解析），仍走 PATH。
+        assert_eq!(
+            which_in("gx", Some(Path::new("")), Some(&path_env)).as_deref(),
+            Some(path_dir.join("gx").as_path())
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
