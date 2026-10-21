@@ -3,6 +3,20 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.16.1-alpha] - 2026-10-21
+
+### 新增
+
+- **状态上报带 gwlinkd 自身版本**（契约：`wist-control 0.17.0`）：中心「网关详情」以前只能看到
+  网关容器版本与 gops / gx，看不到**宿主侧常驻**的版本。现在 `gwlinkd_version` 随每次状态上报
+  带给中心，中心落库并同时以 Prometheus `gateway_gwlinkd_info{gwlinkd_version}` 暴露 ——
+  自更新后能直接看出哪几台还跑旧 gwlinkd，不必逐台登机器。
+
+### 兼容
+
+- 新增字段可选：老中心忽略该键；老 gwlinkd 不带时中心显示「—」（不冒充）。
+- 依赖 `wist-control 0.17`。
+
 ## [0.16.0-alpha] - 2026-10-21
 
 ### 变更
