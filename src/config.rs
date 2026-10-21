@@ -102,6 +102,15 @@ pub struct Config {
     /// 升级执行器程序（缺省 `gops`）。
     #[serde(default)]
     pub upgrader_program: Option<String>,
+    /// 体检执行器程序（缺省 = `upgrader_program`，即 `gops`）：`kind=diagnose` 时跑 `gops run diagnose --json`。
+    #[serde(default)]
+    pub diagnose_program: Option<String>,
+    /// 体检超时秒数（缺省 120）：体检要扫日志/挂目录，比普通命令慢，但不能无限挂。
+    #[serde(default)]
+    pub diagnose_timeout_seconds: Option<u64>,
+    /// 重启 gateway（`gops run stop` + `run start`）的超时秒数（缺省 120，上限 300）。
+    #[serde(default)]
+    pub restart_timeout_seconds: Option<u64>,
     /// 升级失败处置（`rollback-all` | `halt`；缺省 `rollback-all`）。
     #[serde(default)]
     pub upgrade_on_failure: Option<String>,

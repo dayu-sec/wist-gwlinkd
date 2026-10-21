@@ -75,16 +75,33 @@ pub struct LinkUpstreamReturned {
     pub regist_token: Option<String>,
 }
 
-/// 一条从 Center 命令队列拉到的 wparse admin 命令。
+/// 一条从 Center 命令队列拉到的命令。
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct WparseCommand {
     pub command_id: String,
+    /// `proxy`（wparse 管理面转发，缺省）/ `diagnose`（本机体检）。
+    /// 老中心不带这个键 → 按 `proxy` 处理。
+    #[serde(default = "default_command_kind")]
+    pub kind: String,
+    #[serde(default)]
     pub method: String,
+    #[serde(default)]
     pub path: String,
     #[serde(default)]
     pub body: Option<serde_json::Value>,
-    #[serde(default)]
+    /// 租约到期时间（中心下发，ISO8601）。
     pub lease_expires_at: String,
+}
+
+fn default_command_kind() -> String {
+    "proxy".to_string()
+}
+
+impl WparseCommand {
+    /// 是否控制类命令（不走 wparse 管理面）。
+    pub fn is_control(&self) -> bool {
+        self.kind != "proxy"
+    }
 }
 
 /// 中心客户端。

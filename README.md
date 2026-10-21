@@ -128,6 +128,40 @@ upgrade_project_dir = "/opt/wist/gateway-prj"      # gops 工程根（含 ops-pr
 upgrade_project_name = "wist-gateway"              # 只升该系统（缺省 = 全部已导入系统）
 upgrade_retry_on_dead = true                       # 判死后是否自动重驱同一计划（false = 只交管理面重派）
 upgrade_tool_require_arch = true                   # tool-copy：要求制品架构可校验且与本机一致（缺省 true）
+diagnose_program = "gops"                          # 体检执行器（缺省 = upgrader_program）
+diagnose_timeout_seconds = 120                     # 体检超时（秒，上限 300；超时回执 504）
+restart_timeout_seconds = 120                      # 「重启 gateway」每个步骤的超时（秒，上限 300）
+```
+
+### 「体检」控制命令（`kind = diagnose`）
+
+中心管理面 `POST /api/v1/admin/gateways/{id}/diagnose` 入队一条 `kind=diagnose` 的命令；
+gwlinkd 轮询取到后**不走 wparse 管理面**，而是在 `upgrade_project_dir` 里执行：
+
+```
+gops run diagnose --json --no-color
+```
+
+- **exit 0 / 1 都算命令执行成功**：gops 发现问题时本就退 1，报告里带 `summary.exit_code`；
+  中心因此能把“体检结果”与“命令没跑成”分开（后者才是 `failed`）。
+- exit 2 / 超时 / stdout 不是 JSON → 回执 `error`（中心把命令判 `failed`）。
+- 报告原文作为回执 body 落库；管理面 `GET /api/v1/admin/gateways/{id}/diagnose` 取最近一次。
+- 任务日志：`<state_dir>/tasks/diagnose-<command_id>-<ts>/`。
+- **阻塞边界**：体检在 relay 循环里**串行执行**（这段时间不拉新命令，WarpStation 的状态轮询会排队）。
+  实测一次约 2s；最坏情况受 `diagnose_timeout_seconds`（≤300s）约束。若现场频繁触发体检，
+  可把 `--logs` 调小或无头运行。
+
+### 「重启」控制命令（`kind = restart-gateway` / `restart-gwlinkd`）
+
+管理面 `POST /api/v1/admin/gateways/{id}/restart`，body `{"target":"gateway"|"gwlinkd"}`。
+
+| kind | gwlinkd 做什么 | 回执 |
+| --- | --- | --- |
+| `restart-gateway` | 在 `upgrade_project_dir` 依次 `gops run stop` → `gops run start`（每步 `restart_timeout_seconds`） | 200 + `{restart:"gateway",steps:[…]}`；任一步失败 → 500，`start` 失败时明确提示“网关可能仍处于停止状态” |
+| `restart-gwlinkd` | 先回执、`sleep 2s` 后执行 `systemctl restart wist-gwlinkd` / `launchctl kickstart -k system/com.dayu-sec.wist-gwlinkd` | **202** + `{scheduled:true,via:[…]}`；**没装服务定义**（手动 run）→ 409，不杀进程 |
+
+语义边界：`restart-gwlinkd` 的回执只代表“重启已触发”，不代表“已恢复”——恢复由随后的心跳/状态上报佐证。
+进度用 `GET /api/v1/admin/gateways/{id}/commands/{command_id}`（`state` / `response_status` / `error`）。
 
 # 本机组件目录：计划里的组件名 → 本机安装机制（缺省 gops-project）。
 # `tool-copy` = **无状态工具**：解包制品后把二进制复制覆盖到它在 PATH 上的原位置（不经 gops 工程）。

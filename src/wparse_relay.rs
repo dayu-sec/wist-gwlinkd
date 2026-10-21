@@ -156,15 +156,19 @@ pub async fn run(config: Config) {
             );
         }
 
-        let result = execute(
-            &http,
-            &token_file,
-            &upstream,
-            &allowed,
-            &command,
-            task.as_deref(),
-        )
-        .await;
+        let result = if command.is_control() {
+            execute_control(&config, &command, task.as_deref()).await
+        } else {
+            execute(
+                &http,
+                &token_file,
+                &upstream,
+                &allowed,
+                &command,
+                task.as_deref(),
+            )
+            .await
+        };
         let (ok, status, mut error) = outcome(&result);
         // 收尾在回执**之前**：失败时要把日志目录带回中心（升级链路同口径）。
         let log_dir = task
@@ -172,8 +176,9 @@ pub async fn run(config: Config) {
             .map(|task| task.finish(status, error.as_deref().unwrap_or("")));
         if ok {
             log::info!(
-                "event=WparseCommandDone command_id={} method={} path={} upstream_status={} log_dir={}",
+                "event=WparseCommandDone command_id={} kind={} method={} path={} upstream_status={} log_dir={}",
                 command.command_id,
+                command.kind,
                 command.method,
                 command.path,
                 result.status_code,
@@ -181,8 +186,9 @@ pub async fn run(config: Config) {
             );
         } else {
             log::warn!(
-                "event=WparseCommandFailed command_id={} method={} path={} upstream_status={} log_dir={} error={}",
+                "event=WparseCommandFailed command_id={} kind={} method={} path={} upstream_status={} log_dir={} error={}",
                 command.command_id,
+                command.kind,
                 command.method,
                 command.path,
                 result.status_code,
@@ -227,6 +233,7 @@ pub async fn run(config: Config) {
 fn task_meta(gateway_id: &str, upstream: &str, command: &WparseCommand) -> serde_json::Value {
     json!({
         "gateway_id": gateway_id,
+        "kind": &command.kind,
         "method": &command.method,
         "path": &command.path,
         "upstream": upstream,
@@ -239,9 +246,9 @@ fn task_meta(gateway_id: &str, upstream: &str, command: &WparseCommand) -> serde
     })
 }
 
-/// 是否给这条命令落任务目录（只有状态轮询不落）。
+/// 是否给这条命令落任务目录（只有状态轮询不落；控制类命令一律落）。
 fn should_record(command: &WparseCommand) -> bool {
-    !command.method.eq_ignore_ascii_case("GET")
+    command.is_control() || !command.method.eq_ignore_ascii_case("GET")
 }
 
 /// 从发布体里摘一个字符串字段（缺失 / 非字符串 → `null`）。
@@ -378,6 +385,325 @@ async fn execute(
             }
         }
     }
+}
+
+/// 控制类命令（`kind != proxy`）：**在本机执行**，不经过 wparse 管理面。
+///
+/// 目前只有 `diagnose`。未知 kind 一律**明确失败**（而不是静默当成功）——
+/// 中心派了新命令但本机 gwlinkd 太旧时，要让人能从回执里看出来。
+async fn execute_control(
+    config: &Config,
+    command: &WparseCommand,
+    task: Option<&TaskLog>,
+) -> UpstreamResult {
+    match command.kind.as_str() {
+        "diagnose" => run_diagnose(config, command, task).await,
+        "restart-gateway" => run_gateway_restart(config, task).await,
+        "restart-gwlinkd" => run_gwlinkd_restart(task).await,
+        other => {
+            let error = format!("不支持的控制命令 kind={other}（先升级 gwlinkd 再重派）");
+            record_event(task, "reject", &error);
+            UpstreamResult {
+                status_code: 400,
+                body: String::new(),
+                error: Some(error),
+            }
+        }
+    }
+}
+
+/// 体检：在网关栈根（`upgrade_project_dir`）跑 `gops run diagnose --json`。
+///
+/// 回执语义：
+/// - **exit 0 / 1 都算“执行成功”**：体检发现问题时 gops 本就退 1，报告里自带
+///   `summary.exit_code` —— 不能把“有问题”误报成“命令没跑成”。
+/// - exit 2 / 超时 / 输出不是 JSON → `error`，中心会把命令判 failed。
+async fn run_diagnose(
+    config: &Config,
+    command: &WparseCommand,
+    task: Option<&TaskLog>,
+) -> UpstreamResult {
+    let Some(dir) = config.upgrade_project_dir.clone() else {
+        let error =
+            "体检未配置工程根：upgrade_project_dir 未设置（gops 从 cwd 解析系统）".to_string();
+        record_event(task, "config.error", &error);
+        return UpstreamResult {
+            status_code: 500,
+            body: String::new(),
+            error: Some(error),
+        };
+    };
+    let program = config
+        .diagnose_program
+        .clone()
+        .or_else(|| config.upgrader_program.clone())
+        .unwrap_or_else(|| "gops".to_string());
+    let timeout = Duration::from_secs(
+        config
+            .diagnose_timeout_seconds
+            .unwrap_or(120)
+            // 上限 300s：中心的 `diagnose` 租约是 360s（`DIAGNOSE_LEASE_SECONDS`），
+            // 超时必须短于租约，否则会被判过期重派，同一台机器上跑两份。
+            .clamp(1, 300),
+    );
+
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(["run", "diagnose", "--json", "--no-color"])
+        .current_dir(&dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    record_event(
+        task,
+        "diagnose.start",
+        &format!(
+            "{program} run diagnose --json（cwd={}，timeout={}s，command_id={}）",
+            dir.display(),
+            timeout.as_secs(),
+            command.command_id
+        ),
+    );
+
+    let started = Instant::now();
+    let output = match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => {
+            let error = format!("无法执行 {program}：{err}");
+            record_event(task, "diagnose.failed", &error);
+            return UpstreamResult {
+                status_code: 500,
+                body: String::new(),
+                error: Some(error),
+            };
+        }
+        Err(_) => {
+            let error = format!("体检超时（{}s）已被终止", timeout.as_secs());
+            record_event(task, "diagnose.timeout", &error);
+            return UpstreamResult {
+                status_code: 504,
+                body: String::new(),
+                error: Some(error),
+            };
+        }
+    };
+
+    let code = output.status.code();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if let Some(task) = task {
+        task.output(&format!(
+            "< {program} exit={code:?} ({} ms)\n",
+            started.elapsed().as_millis()
+        ));
+        if !stderr.is_empty() {
+            task.output(&format!("{stderr}\n"));
+        }
+    }
+
+    match code {
+        Some(0) | Some(1) => {
+            if serde_json::from_str::<serde_json::Value>(&stdout).is_err() {
+                let error = format!(
+                    "体检输出不是合法 JSON（前 200 字节）：{}",
+                    truncate(stdout.clone())
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                );
+                record_event(task, "diagnose.failed", &error);
+                return UpstreamResult {
+                    status_code: 500,
+                    body: stdout,
+                    error: Some(error),
+                };
+            }
+            record_event(task, "diagnose.done", &format!("exit={code:?}"));
+            UpstreamResult {
+                status_code: 200,
+                body: stdout,
+                error: None,
+            }
+        }
+        other => {
+            let tail: String = stderr
+                .lines()
+                .rev()
+                .take(10)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            let error = format!("gops run diagnose 失败（exit={other:?}）：{tail}");
+            record_event(task, "diagnose.failed", &error);
+            UpstreamResult {
+                status_code: 500,
+                body: stdout,
+                error: Some(error),
+            }
+        }
+    }
+}
+
+/// 重启**网关栈**：在工程根依次 `gops run stop` / `gops run start`。
+///
+/// 两步都带超时；任何一个失败都**明确报错**（尤其 `start` 失败时网关会停在停止态，
+/// 回执里必须写出来，不能只报“命令失败”）。
+async fn run_gateway_restart(config: &Config, task: Option<&TaskLog>) -> UpstreamResult {
+    let Some(dir) = config.upgrade_project_dir.clone() else {
+        let error =
+            "重启未配置工程根：upgrade_project_dir 未设置（gops 从 cwd 解析系统）".to_string();
+        record_event(task, "config.error", &error);
+        return UpstreamResult {
+            status_code: 500,
+            body: String::new(),
+            error: Some(error),
+        };
+    };
+    let program = config
+        .upgrader_program
+        .clone()
+        .unwrap_or_else(|| "gops".to_string());
+    let timeout = Duration::from_secs(config.restart_timeout_seconds.unwrap_or(120).clamp(1, 300));
+
+    let mut steps: Vec<serde_json::Value> = Vec::new();
+    for step in ["stop", "start"] {
+        record_event(task, "restart.step", &format!("{program} run {step}"));
+        match run_short(&program, &["run", step], &dir, timeout).await {
+            Ok(output) if output.status.success() => {
+                if let Some(task) = task {
+                    task.output(&format!("< {program} run {step} ok\n"));
+                }
+                steps.push(json!({ "step": step, "exit": 0 }));
+            }
+            Ok(output) => {
+                let code = output.status.code();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let mut error = format!(
+                    "{program} run {step} 失败（exit={code:?}）：{}",
+                    stderr_tail(&stderr, 10)
+                );
+                if step == "start" {
+                    error.push_str("；网关可能仍处于停止状态，需人工确认");
+                }
+                if let Some(task) = task {
+                    task.output(&format!("{error}\n"));
+                }
+                record_event(task, "restart.failed", &error);
+                return UpstreamResult {
+                    status_code: 500,
+                    body: json!({ "restart": "gateway", "steps": steps }).to_string(),
+                    error: Some(error),
+                };
+            }
+            Err(err) => {
+                let error = format!("{program} run {step} 执行失败：{err}");
+                record_event(task, "restart.failed", &error);
+                return UpstreamResult {
+                    status_code: 500,
+                    body: json!({ "restart": "gateway", "steps": steps }).to_string(),
+                    error: Some(error),
+                };
+            }
+        }
+    }
+
+    record_event(task, "restart.done", "stop + start");
+    UpstreamResult {
+        status_code: 200,
+        body: json!({ "restart": "gateway", "steps": steps }).to_string(),
+        error: None,
+    }
+}
+
+/// 重启 **gwlinkd 自己**：先回执「已受理」，再延迟触发服务管理器重启。
+///
+/// 时序：回执由 relay 循环在 `execute_control` 返回后立即发出（毫秒级），这里 spawn 的任务
+/// 先 `sleep 2s` 再调 `systemctl restart` / `launchctl kickstart -k` —— 回执先到，进程后换。
+/// 回执语义是「已触发」，不是「已恢复」；恢复由随后的心跳/状态上报佐证。
+async fn run_gwlinkd_restart(task: Option<&TaskLog>) -> UpstreamResult {
+    let (platform, scope) = match gwlinkd_restart_plan(crate::service::any_installed_definition) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            record_event(task, "restart.rejected", &reason);
+            return UpstreamResult {
+                status_code: 409,
+                body: String::new(),
+                error: Some(reason),
+            };
+        }
+    };
+    let commands = crate::service::restart_commands(platform, scope);
+    let shown: Vec<String> = commands
+        .iter()
+        .map(|command| command.display_line())
+        .collect();
+    record_event(task, "restart.scheduled", &shown.join("; "));
+
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for command in commands {
+            let _ = tokio::task::spawn_blocking(move || crate::service::run_with_retries(&command))
+                .await;
+        }
+    });
+
+    UpstreamResult {
+        status_code: 202,
+        body: json!({
+            "restart": "gwlinkd",
+            "scheduled": true,
+            "via": shown,
+        })
+        .to_string(),
+        error: None,
+    }
+}
+
+/// 只做「能不能重启自己」的判定，不执行：没有已装服务定义 = 手动 `run`，重启后没有人拉起。
+fn gwlinkd_restart_plan(
+    lookup: impl FnOnce() -> Option<crate::service::InstalledDefinition>,
+) -> Result<
+    (
+        crate::service::ServicePlatform,
+        crate::service::ServiceScope,
+    ),
+    String,
+> {
+    match lookup() {
+        Some(definition) => Ok((definition.platform, definition.scope)),
+        None => Err(
+            "未检测到已安装的服务定义（可能是手动 run）：重启后没有服务管理器拉起，拒绝执行"
+                .to_string(),
+        ),
+    }
+}
+
+/// 跑一个短命令（`gops run stop|start`），带超时。
+async fn run_short(
+    program: &str,
+    args: &[&str],
+    dir: &Path,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
+        .current_dir(dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(err)) => Err(format!("无法执行 {program}：{err}")),
+        Err(_) => Err(format!("{program} 超时（{}s）已被终止", timeout.as_secs())),
+    }
+}
+
+/// 取 stderr 的最后 N 行（错误信息里只带尾巴，不把整段日志塞进回执）。
+fn stderr_tail(text: &str, lines: usize) -> String {
+    let mut tail: Vec<&str> = text.lines().rev().take(lines).collect();
+    tail.reverse();
+    tail.join("\n")
 }
 
 fn record_event(task: Option<&TaskLog>, phase: &str, detail: &str) {
@@ -548,11 +874,269 @@ mod tests {
     fn command(method: &str, path: &str) -> WparseCommand {
         WparseCommand {
             command_id: "cmd-1".to_string(),
+            kind: "proxy".to_string(),
             method: method.to_string(),
             path: path.to_string(),
             body: Some(json!({"model": "v1"})),
             lease_expires_at: "2026-10-20T12:00:00Z".to_string(),
         }
+    }
+
+    // ---- 控制类命令（kind=diagnose）----
+
+    fn diagnose_command() -> WparseCommand {
+        WparseCommand {
+            command_id: "cmd-diag".to_string(),
+            kind: "diagnose".to_string(),
+            method: String::new(),
+            path: String::new(),
+            body: None,
+            lease_expires_at: "2026-10-20T12:00:00Z".to_string(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn stub_gops(dir: &Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("stub-gops");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    #[cfg(unix)]
+    fn diagnose_config(dir: &Path, program: &str, timeout: u64) -> Config {
+        let path = dir.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "state_dir = \"{}\"\nupgrade_project_dir = \"{}\"\ndiagnose_program = \"{program}\"\ndiagnose_timeout_seconds = {timeout}\n",
+                dir.display(),
+                dir.display()
+            ),
+        )
+        .unwrap();
+        Config::load(&path).expect("config")
+    }
+
+    #[test]
+    fn a_command_without_kind_is_a_proxy_command() {
+        let parsed: WparseCommand = serde_json::from_str(
+            r#"{"command_id":"c1","method":"GET","path":"/x","lease_expires_at":"t"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.kind, "proxy");
+        assert!(!parsed.is_control());
+    }
+
+    #[test]
+    fn diagnose_kind_is_parsed_from_the_center_payload() {
+        let parsed: WparseCommand = serde_json::from_str(
+            r#"{"command_id":"c1","kind":"diagnose","method":"","path":"","lease_expires_at":"t"}"#,
+        )
+        .unwrap();
+        assert!(parsed.is_control());
+        assert_eq!(parsed.method, "", "控制命令没有 method/path");
+    }
+
+    #[test]
+    fn diagnose_commands_are_control_commands_and_always_recorded() {
+        let command = diagnose_command();
+        assert!(command.is_control());
+        assert!(should_record(&command), "控制类命令必须落任务目录");
+        assert!(!should_record(&super::tests::command("GET", STATUS_PATH)));
+    }
+
+    #[test]
+    fn an_unknown_control_kind_fails_loudly() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut command = diagnose_command();
+        command.kind = "restart-everything".to_string();
+        let state = temp_state("unknown-kind");
+        let config = diagnose_config(&state, "/bin/false", 10);
+        let result = runtime.block_on(execute_control(&config, &command, None));
+        assert_eq!(result.status_code, 400);
+        assert!(
+            result.error.unwrap_or_default().contains("不支持"),
+            "要明确报不支持，不能静默成功"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnose_exit_zero_returns_the_report() {
+        let state = temp_state("diag-zero");
+        let stub = stub_gops(
+            &state,
+            "echo '{\"schema_version\":\"1\",\"summary\":{}}'\nexit 0",
+        );
+        let config = diagnose_config(&state, &stub, 10);
+        let result = execute_control(&config, &diagnose_command(), None).await;
+        assert_eq!(result.status_code, 200);
+        assert!(result.error.is_none());
+        assert!(result.body.contains("schema_version"), "{}", result.body);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnose_exit_one_is_still_a_successful_command() {
+        // gops 发现问题时会退 1；报告本身就是回执内容，不能当“命令没跑成”。
+        let state = temp_state("diag-one");
+        let stub = stub_gops(
+            &state,
+            "echo '{\"summary\":{\"exit_code\":1,\"fail\":1}}'\nexit 1",
+        );
+        let config = diagnose_config(&state, &stub, 10);
+        let result = execute_control(&config, &diagnose_command(), None).await;
+        assert_eq!(result.status_code, 200);
+        assert!(result.error.is_none());
+        assert!(result.body.contains("\"fail\":1"), "{}", result.body);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnose_exit_two_is_a_failure_with_stderr_tail() {
+        let state = temp_state("diag-two");
+        let stub = stub_gops(&state, "echo 'compose 不可用' >&2\nexit 2");
+        let config = diagnose_config(&state, &stub, 10);
+        let result = execute_control(&config, &diagnose_command(), None).await;
+        assert_eq!(result.status_code, 500);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("exit=Some(2)"), "{error}");
+        assert!(error.contains("compose 不可用"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnose_output_must_be_json() {
+        let state = temp_state("diag-badjson");
+        let stub = stub_gops(&state, "echo 'not json'\nexit 0");
+        let config = diagnose_config(&state, &stub, 10);
+        let result = execute_control(&config, &diagnose_command(), None).await;
+        assert_eq!(result.status_code, 500);
+        assert!(
+            result.error.unwrap_or_default().contains("不是合法 JSON"),
+            "输出不合契约要报错"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnose_timeout_kills_the_child() {
+        let state = temp_state("diag-timeout");
+        let stub = stub_gops(&state, "sleep 30");
+        let config = diagnose_config(&state, &stub, 1);
+        let result = execute_control(&config, &diagnose_command(), None).await;
+        assert_eq!(result.status_code, 504);
+        assert!(result.error.unwrap_or_default().contains("超时"));
+    }
+
+    #[test]
+    fn diagnose_without_a_project_dir_fails_closed() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let state = temp_state("diag-noproject");
+        let path = state.join("gwlinkd.toml");
+        std::fs::write(&path, format!("state_dir = \"{}\"\n", state.display())).unwrap();
+        let config = Config::load(&path).unwrap();
+        let result = runtime.block_on(execute_control(&config, &diagnose_command(), None));
+        assert_eq!(result.status_code, 500);
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("upgrade_project_dir"),
+            "缺工程根要说清楚缺什么"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnose_invokes_gops_with_the_contract_flags() {
+        let state = temp_state("diag-argv");
+        let argv = state.join("argv.txt");
+        let stub = stub_gops(
+            &state,
+            &format!(
+                "printf '%s ' \"$@\" > {}\necho '{{\"schema_version\":\"1\"}}'\nexit 0",
+                argv.display()
+            ),
+        );
+        let config = diagnose_config(&state, &stub, 10);
+        // 就算带了 method/path，控制命令也**不能**走 wparse 转发路径。
+        let mut command = diagnose_command();
+        command.method = "POST".to_string();
+        command.path = "/admin/v1/reloads/model".to_string();
+        let result = execute_control(&config, &command, None).await;
+        assert_eq!(result.status_code, 200);
+        let seen = std::fs::read_to_string(&argv).unwrap();
+        assert!(seen.contains("run diagnose --json --no-color"), "{seen}");
+    }
+
+    #[test]
+    fn restart_gateway_is_rejected_without_a_service_definition() {
+        // 手动 `run` 时重启后没人拉起 —— 必须拒绝，而不是把进程杀掉。
+        let err = gwlinkd_restart_plan(|| None).unwrap_err();
+        assert!(err.contains("服务定义"), "{err}");
+    }
+
+    #[test]
+    fn stderr_tail_keeps_only_the_last_lines() {
+        let text = (1..=20)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail = stderr_tail(&text, 3);
+        assert_eq!(tail, "18\n19\n20");
+        assert_eq!(stderr_tail("only", 5), "only");
+        assert_eq!(stderr_tail("", 5), "");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_gateway_runs_stop_then_start() {
+        let state = temp_state("restart-order");
+        let argv = state.join("argv.txt");
+        let stub = stub_gops(
+            &state,
+            &format!("printf '%s\\n' \"$*\" >> {}\nexit 0", argv.display()),
+        );
+        let mut config = diagnose_config(&state, &stub, 10);
+        config.upgrader_program = Some(stub);
+        let result = run_gateway_restart(&config, None).await;
+        assert_eq!(result.status_code, 200);
+        assert!(result.error.is_none());
+        let seen = std::fs::read_to_string(&argv).unwrap();
+        assert_eq!(seen, "run stop\nrun start\n", "必须是先 stop 再 start");
+        assert!(result.body.contains("\"gateway\""), "{}", result.body);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_gateway_stops_at_the_failing_step() {
+        let state = temp_state("restart-fail");
+        let argv = state.join("argv.txt");
+        let stub = stub_gops(
+            &state,
+            &format!(
+                "printf '%s\\n' \"$*\" >> {}\necho 'compose 不可用' >&2\nexit 1",
+                argv.display()
+            ),
+        );
+        let mut config = diagnose_config(&state, &stub, 10);
+        config.upgrader_program = Some(stub);
+        let result = run_gateway_restart(&config, None).await;
+        assert_eq!(result.status_code, 500);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("run stop"), "{error}");
+        assert!(error.contains("compose 不可用"), "{error}");
+        let seen = std::fs::read_to_string(&argv).unwrap();
+        assert_eq!(seen, "run stop\n", "失败后不能再跑 start");
+    }
+
+    #[test]
+    fn task_meta_carries_the_command_kind() {
+        let meta = task_meta("gw-1", "https://127.0.0.1:19090", &diagnose_command());
+        assert_eq!(meta["kind"], json!("diagnose"));
     }
 
     fn new_task(state: &Path, command: &WparseCommand) -> std::sync::Arc<TaskLog> {

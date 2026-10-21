@@ -462,6 +462,39 @@ impl ServiceCommand {
     }
 }
 
+/// 让服务管理器**重启**服务（不 disable/enable，只让它重新拉起）。
+///
+/// 供 `kind=restart-gwlinkd` 使用：gwlinkd 自己调用这些命令，先回执、再延迟执行。
+/// systemd 用 `restart`（unix 进程替换，unit 不变）；launchd 用 `kickstart -k`（杀 job 再拉起）。
+pub fn restart_commands(platform: ServicePlatform, scope: ServiceScope) -> Vec<ServiceCommand> {
+    match platform {
+        ServicePlatform::Systemd => {
+            let mut args = Vec::new();
+            if scope == ServiceScope::User {
+                args.push("--user".to_string());
+            }
+            args.push("restart".to_string());
+            args.push(SERVICE_NAME.to_string());
+            vec![ServiceCommand::new("systemctl", args, false)]
+        }
+        ServicePlatform::Launchd => {
+            let domain = match scope {
+                ServiceScope::System => "system".to_string(),
+                ServiceScope::User => format!("gui/{}", current_uid()),
+            };
+            vec![ServiceCommand::new(
+                "launchctl",
+                vec![
+                    "kickstart".to_string(),
+                    "-k".to_string(),
+                    format!("{domain}/{LAUNCHD_LABEL}"),
+                ],
+                false,
+            )]
+        }
+    }
+}
+
 /// 让服务管理器加载并启动服务（幂等）。
 pub fn activate_commands(layout: &ServiceLayout, spec: &ServiceSpec) -> Vec<ServiceCommand> {
     match layout.platform {
@@ -854,6 +887,25 @@ mod tests {
             PathBuf::from("/usr/local/bin/wist-gwlinkd"),
             PathBuf::from("/etc/wist-gwlinkd/gwlinkd.toml"),
         )
+    }
+
+    #[test]
+    fn restart_commands_target_the_installed_service() {
+        let systemd = restart_commands(ServicePlatform::Systemd, ServiceScope::System);
+        assert_eq!(systemd.len(), 1);
+        assert_eq!(systemd[0].display_line(), "systemctl restart wist-gwlinkd");
+
+        let user = restart_commands(ServicePlatform::Systemd, ServiceScope::User);
+        assert_eq!(
+            user[0].display_line(),
+            "systemctl --user restart wist-gwlinkd"
+        );
+
+        let launchd = restart_commands(ServicePlatform::Launchd, ServiceScope::System);
+        assert_eq!(
+            launchd[0].display_line(),
+            "launchctl kickstart -k system/com.dayu-sec.wist-gwlinkd"
+        );
     }
 
     #[test]
