@@ -141,6 +141,8 @@ impl CenterClient {
     /// 规则发布命令结果：`POST /api/v1/gateway/commands/{id}/result`。
     ///
     /// 失败时带上任务日志目录 + 摘要（有界、写入时已脱敏），中心落库后可回给调用方。
+    // 参数就是这条回执的线上字段（多一个少一个都变契约）—— 拆结构只会让调用点多一层包装。
+    #[allow(clippy::too_many_arguments)]
     pub async fn report_wparse_command_result(
         &self,
         command_id: &str,
