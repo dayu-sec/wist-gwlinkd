@@ -3,6 +3,32 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.16.3-alpha] - 2026-10-21
+
+### 修复
+
+- **体检 / 重启在工程根上跑错目录**：`upgrade_project_dir` 是 gops **工程根**（`prj upgrade` 的 cwd），
+  而 `gops run diagnose|stop|start` 要的是**系统根**。工程根下挂着系统子目录时，旧实现会以
+  「系统未定义 diagnose 流程」这种看着像配置问题的假故障收场。现在按「显式 `upgrade_project_name`
+  → 工程根即系统根 → 唯一的系统子目录」定位；多个候选**不猜**，把候选列进回执。实际用的 cwd 也写进任务日志。
+- **升级把「组件名」当成了 gops 系统名**：中心发来的 `component`（如 `galaxy-ops`）是发布口径，
+  工程里没有同名系统时旧实现以「未知系统或无效版本 spec」失败。现在只在该组件确实对应工程里的系统时
+  才用作 NAME，否则**发执行器前**就拒，并说明该把它声明成 `[[upgrade.component]]` + `install = "tool-copy"`；
+  交给 gops 的 NAME 恒为 `sys/sys_model.yml` 的 `name`。
+- **`upgrade_project_name` 写错**现在是可读的配置错误（列出工程里已导入的系统），不再交给 gops 回一句天书。
+
+### 新增
+
+- `diagnose` 新增 `control.workdir` 检查：本地就能看到体检 / 重启 / 升级会点哪个系统、以及为什么点不到。
+- 工具就地安装（`tool-copy`）定位二进制时先看 `$HOME/bin`、再查 `PATH` —— 服务管理器的最小 `PATH` 里常没有 `~/bin`。
+
+### 兼容与注意
+
+- 中心现在对**所有**升级计划下发 `artifact_sha256`（`wist-center 0.19.7+`）：走 gops 的升级会在取件阶段
+  先核摘要，不符即失败，不再把可疑字节交给执行器。
+- 中心若把某个组件派给没声明它的网关（如 `galaxy-ops`），旧行为是执行器以 255 失败；现在是**前置失败**，
+  原因与处置都在回执里。
+
 ## [0.16.2-alpha] - 2026-10-21
 
 ### 新增
