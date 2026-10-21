@@ -910,10 +910,13 @@ async fn run(
                 public_base_url: self_state
                     .as_ref()
                     .and_then(|state| state.public_base_url.clone()),
-                // 报的是**网关（容器）版本**，不是 gwlinkd 自身版本 —— 这条状态描述的是网关。
+                // 报的是**网关（容器）版本** —— 这条状态描述的是网关；gwlinkd 自己的版本在
+                // 下面的 `gwlinkd_version`（两者用途不同：一个看栈，一个看宿主常驻）。
                 version: gateway_version,
                 gops_version: tool_versions.gops.clone(),
                 gx_version: tool_versions.gx.clone(),
+                // gwlinkd **自身**版本：中心据此知道这台网关的宿主常驻是哪个版本（自更新 / 排障用）。
+                gwlinkd_version: Some(wist_gwlinkd::VERSION.to_string()),
                 // 中心侧约定：`status` 是**在线/离线**（中心按 `== "online"` 计数与展示）。
                 // 之前误发 `"running"`（那是生命周期 `Running` 的概念）→ 中心把在跑的网关算成离线。
                 status: "online".to_string(),

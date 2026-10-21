@@ -577,6 +577,28 @@ mod tests {
         assert!(!err.is_unauthorized(), "{err}");
     }
 
+    /// 上报必须带 **gwlinkd 自身**版本：中心页面靠它与 gops / gx 并排展示；
+    /// `version` 是网关（容器）的，两者不能混（以前只报后者，宿主常驻版本在中心不可见）。
+    #[tokio::test]
+    async fn the_status_report_carries_the_gwlinkd_version() {
+        let (endpoint, captured) = capture_server("200 OK", r#"{"status":"accepted"}"#).await;
+        let client = CenterClient::new(endpoint);
+        client
+            .report_status(&status_payload())
+            .await
+            .expect("report");
+
+        let request = captured.await.expect("request");
+        assert!(
+            request.contains(&format!("\"gwlinkd_version\":\"{}\"", crate::VERSION)),
+            "缺 gwlinkd 自身版本：{request}"
+        );
+        assert!(
+            request.contains("\"version\":\"0.1.15\""),
+            "网关（容器）版本要照旧上报：{request}"
+        );
+    }
+
     #[test]
     fn build_mtls_http_client_rejects_a_bad_identity() {
         assert!(build_mtls_http_client(None, "not a pem").is_err());
@@ -600,6 +622,7 @@ mod tests {
             version: "0.1.15".into(),
             gops_version: None,
             gx_version: None,
+            gwlinkd_version: Some(crate::VERSION.into()),
             status: "online".into(),
             health: "ok".into(),
             memory_bytes: None,
