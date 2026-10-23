@@ -662,9 +662,15 @@ impl UpgradeDriver {
             let mut outcome = executor.interpret(ok, &raw, fallback);
 
             // 佐证只用网关 id（不随 renew 变）；回执另现读最新凭据（见下）。
+            //
+            // ⚠ 凭据住在**身份目录**（`credential.json` 是现场事实，与 `identity_dir` 同处；
+            //   `save_credential` / `doctor` / 主程序都读写 `identity_dir`）。
+            //   这里曾经读 `state_dir` —— 两个目录一拆开就永远读不到，
+            //   于是「执行器报成 ≠ 网关真的起来了」这道独立观测**静默降级**成只信退出码
+            //   （现场表现：升级日志里一句「未佐证（读不到长期身份）」，没人会去追）。
             let gateway_id = reporter
                 .as_ref()
-                .and_then(|reporter| state::load_credential(&reporter.state_dir))
+                .and_then(|reporter| state::load_credential(&reporter.identity_dir))
                 .map(|credential| credential.bundle.gateway_id);
 
             // **成功佐证**：执行器报成不等于网关真的起来了 —— 独立观测一次。
@@ -2563,7 +2569,10 @@ mod tests {
     const SELF_STATE_DEGRADED: &str = r#"{"gateway_id":"gw-1","version":"0.1.18-alpha","collected_at":"2026-10-04T00:00:00Z","store_healthy":false,"agent_count":0,"last_error":null}"#;
 
     /// 佐证分支要 `gateway_id`（从长期身份读）——所以得先存在一份凭据。
-    fn write_credential(dir: &Path, gateway_id: &str) {
+    ///
+    /// 参数是**身份目录**（`credential.json` 的落点，与 `state_dir` 不同）；
+    /// 目录不存在也无妨，`save_credential` 会建。
+    fn write_credential(identity_dir: &Path, gateway_id: &str) {
         let credential = state::StoredCredential {
             bundle: wist_control::GatewayCredentialBundle {
                 credential_id: "cred-test".into(),
@@ -2580,15 +2589,17 @@ mod tests {
             private_key_pem: "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n"
                 .into(),
         };
-        state::save_credential(dir, &credential).expect("credential");
+        state::save_credential(identity_dir, &credential).expect("credential");
     }
 
     /// 回执走 mTLS（身份在 `CenterClient` 里）；endpoint 故意不可达 —— 只关心台账，回执失败只记日志。
+    ///
+    /// `identity_dir` 刻意与 `state_dir` **分开**（真实布局就是这样）。
     fn reporter(dir: &Path, self_endpoint: Option<String>) -> UpgradeReporter {
         UpgradeReporter {
             client: crate::center::CenterClient::new("http://127.0.0.1:1"),
             state_dir: dir.to_path_buf(),
-            identity_dir: dir.to_path_buf(),
+            identity_dir: dir.join("identity"),
             self_client: self_endpoint.map(crate::selfreport::SelfReportClient::new),
         }
     }
@@ -2596,7 +2607,7 @@ mod tests {
     #[tokio::test]
     async fn a_healthy_gateway_corroborates_a_reported_success() {
         let dir = temp_dir("corr-ok");
-        write_credential(&dir, "gw-1");
+        write_credential(&dir.join("identity"), "gw-1");
         let endpoint = serve_self_state(SELF_STATE_HEALTHY).await;
         let driver = UpgradeDriver::new(
             GopsExecutor::new(script(&dir, "ok.sh", 0).to_string_lossy().to_string()),
@@ -2616,14 +2627,24 @@ mod tests {
             .expect("start");
         let record = wait_terminal(&dir).await;
         assert_eq!(record.status, "done");
-        assert!(record.detail.contains("佐证"), "{}", record.detail);
+        // 「未佐证」里也含“佐证”两字 —— 必须正着断，否则这道观测静默降级了也看不出来。
+        assert!(
+            !record.detail.contains("未佐证"),
+            "不应降级为未佐证：{}",
+            record.detail
+        );
+        assert!(
+            record.detail.contains("网关自述面已恢复且健康"),
+            "{}",
+            record.detail
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn a_degraded_gateway_downgrades_success_to_unverified() {
         let dir = temp_dir("corr-degraded");
-        write_credential(&dir, "gw-1");
+        write_credential(&dir.join("identity"), "gw-1");
         let endpoint = serve_self_state(SELF_STATE_DEGRADED).await;
         let driver = UpgradeDriver::new(
             GopsExecutor::new(script(&dir, "ok.sh", 0).to_string_lossy().to_string()),
@@ -2673,7 +2694,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_executor_is_not_corroborated() {
         let dir = temp_dir("corr-fail");
-        write_credential(&dir, "gw-1");
+        write_credential(&dir.join("identity"), "gw-1");
         let endpoint = serve_self_state(SELF_STATE_HEALTHY).await;
         let driver = UpgradeDriver::new(
             GopsExecutor::new(script(&dir, "bad.sh", 1).to_string_lossy().to_string()),
