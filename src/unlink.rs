@@ -37,11 +37,13 @@ pub const LINK_STATE_FILES: &[&str] = &[
     state::UPGRADE_CURSOR_FILE,
     state::UPGRADE_RECORD_FILE,
     state::UPGRADE_HEARTBEAT_FILE,
+    // 业务身份（tenant_id）：断开中心后不应继续沿用旧绑定（接新中心时中心会重新下发）。
+    state::BUSINESS_IDENTITY_FILE,
 ];
 
 /// [`LINK_STATE_FILES`] 里落在**身份目录**（`Config::identity_dir`）的那些；其余在 `state_dir`。
 /// 客户端证书 + 私钥是不可再生的长期身份，与锁 / 簿记 / 临时券分开存（前者进 `contract`）。
-pub const IDENTITY_STATE_FILES: &[&str] = &[state::CREDENTIAL_FILE];
+pub const IDENTITY_STATE_FILES: &[&str] = &[state::CREDENTIAL_FILE, state::BUSINESS_IDENTITY_FILE];
 
 /// 某个待删文件该去哪个目录找。
 fn file_dir<'a>(config: &'a Config, name: &str) -> &'a Path {

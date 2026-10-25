@@ -9,8 +9,8 @@ use std::time::Duration;
 use orion_error::prelude::*;
 use wist_control::{
     DateTime, GatewayCredentialBundle, GatewayEnrollmentResult, GatewayInitialConfig,
-    GatewayUpgradePlan, RegisterGateway, RenewGatewayCredential, ReportGatewayStatus,
-    ReportGatewayUpgradeResult,
+    GatewayStatusAccepted, GatewayUpgradePlan, RegisterGateway, RenewGatewayCredential,
+    ReportGatewayStatus, ReportGatewayUpgradeResult,
 };
 
 use crate::error::{CenterError, CenterReason, CenterResult};
@@ -268,7 +268,13 @@ impl CenterClient {
     }
 
     /// 周期上报：`POST /api/v1/gateway/status`（客户端证书 mTLS 鉴权，身份在客户端里）。
-    pub async fn report_status(&self, payload: &ReportGatewayStatus) -> CenterResult<()> {
+    ///
+    /// 回执带**中心权威期望的业务身份**（`desired_business_identity`）：命令丢失 / 离线 /
+    /// 重启后，网关据此自己补齐（设计 §11.1）。旧中心不带该字段 → `None`。
+    pub async fn report_status(
+        &self,
+        payload: &ReportGatewayStatus,
+    ) -> CenterResult<GatewayStatusAccepted> {
         let url = format!("{}/api/v1/gateway/status", self.endpoint);
         let response = self
             .http
@@ -277,8 +283,7 @@ impl CenterClient {
             .send()
             .await
             .source_raw_err(CenterReason::Http, "status 请求失败")?;
-        let _: serde_json::Value = decode(response, "status").await?;
-        Ok(())
+        decode(response, "status").await
     }
 
     /// 轮换：`POST /api/v1/gateway/credentials:renew`（以当前证书证明身份 + 新 CSR → 新证书；旧证书作废）。
@@ -598,7 +603,11 @@ mod tests {
     /// `version` 是网关（容器）的，两者不能混（以前只报后者，宿主常驻版本在中心不可见）。
     #[tokio::test]
     async fn the_status_report_carries_the_gwlinkd_version() {
-        let (endpoint, captured) = capture_server("200 OK", r#"{"status":"accepted"}"#).await;
+        let (endpoint, captured) = capture_server(
+            "200 OK",
+            r#"{"gateway_id":"gw-1","instance_id":"gw-1/boot-1","accepted_at":"2026-10-25T00:00:00Z"}"#,
+        )
+        .await;
         let client = CenterClient::new(endpoint);
         client
             .report_status(&status_payload())
@@ -614,6 +623,40 @@ mod tests {
             request.contains("\"version\":\"0.1.15\""),
             "网关（容器）版本要照旧上报：{request}"
         );
+    }
+
+    /// 回执里的**中心期望身份**要能被解析出来（命令丢失 / 离线补偿的入口）；
+    /// 旧中心不带该字段 → `None`，不报错。
+    #[tokio::test]
+    async fn status_receipt_surfaces_the_desired_business_identity() {
+        let endpoint = one_shot_server(
+            "200 OK",
+            r#"{"gateway_id":"gw-1","instance_id":"gw-1/boot-1","accepted_at":"2026-10-25T00:00:00Z","desired_business_identity":{"tenant_id":"tenant-acme","revision":3}}"#,
+        )
+        .await;
+        let client = CenterClient::new(endpoint);
+        let accepted = client
+            .report_status(&status_payload())
+            .await
+            .expect("report");
+        let desired = accepted.desired_business_identity.expect("desired");
+        assert_eq!(desired.tenant_id, "tenant-acme");
+        assert_eq!(desired.revision, 3);
+    }
+
+    #[tokio::test]
+    async fn status_receipt_tolerates_a_center_without_a_desired_identity() {
+        let endpoint = one_shot_server(
+            "200 OK",
+            r#"{"gateway_id":"gw-1","instance_id":"gw-1/boot-1","accepted_at":"2026-10-25T00:00:00Z"}"#,
+        )
+        .await;
+        let client = CenterClient::new(endpoint);
+        let accepted = client
+            .report_status(&status_payload())
+            .await
+            .expect("report");
+        assert!(accepted.desired_business_identity.is_none());
     }
 
     #[test]
@@ -640,6 +683,8 @@ mod tests {
             gops_version: None,
             gx_version: None,
             gwlinkd_version: Some(crate::VERSION.into()),
+            tenant_id: None,
+            binding_revision: None,
             status: "online".into(),
             health: "ok".into(),
             memory_bytes: None,

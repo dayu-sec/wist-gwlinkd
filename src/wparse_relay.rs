@@ -11,12 +11,14 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::time::MissedTickBehavior;
+use wist_control::DesiredBusinessIdentity;
 
 use crate::center::{CenterClient, WparseCommand, build_mtls_http_client};
 use crate::config::Config;
 use crate::state;
 use crate::sys_root::control_workdir;
 use crate::task_log::{self, TaskLog};
+use crate::wparse_env::{is_tag_safe, value_preview};
 
 const STATUS_PATH: &str = "/admin/v1/runtime/status";
 const RELOAD_PATH: &str = "/admin/v1/reloads/model";
@@ -34,7 +36,13 @@ struct UpstreamResult {
 }
 
 /// 常驻：短轮询 Center 命令队列并在本机执行。
-pub async fn run(config: Config) {
+///
+/// `desired`：状态上报回执带来的**中心权威期望业务身份**。补偿在这里做而不是在状态循环里
+/// —— 本任务才是 `.env` / 身份文件的写入者（见 [`apply_business_identity`]）。
+pub async fn run(
+    config: Config,
+    desired: tokio::sync::watch::Receiver<Option<DesiredBusinessIdentity>>,
+) {
     let relay = config.wparse_relay.clone();
     if !relay.enabled {
         return;
@@ -74,6 +82,8 @@ pub async fn run(config: Config) {
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut backoff = Duration::ZERO;
     let mut credential_missing_logged = false;
+    // 同一期望值失败后不每轮重试（生效命令可能要重启整栈，见 [`COMPENSATION_RETRY`]）。
+    let mut last_compensation: Option<(Instant, String, i64)> = None;
     log::info!(
         "event=WparseRelayStarted upstream={} poll_ms={}",
         upstream,
@@ -82,6 +92,10 @@ pub async fn run(config: Config) {
 
     loop {
         ticker.tick().await;
+
+        // 期望值补偿：命令队列丢失 / 离线 / 重启后靠状态回执收敛（设计 §11.1）。
+        let wanted = desired.borrow().as_ref().cloned();
+        compensate_desired_identity(&config, wanted, &mut last_compensation).await;
 
         // 证书轮换后 `identity_pem` 会变：只在变化时重建 mTLS 客户端。
         let Some(credential) = state::load_credential(config.identity_dir()) else {
@@ -244,6 +258,13 @@ fn task_meta(gateway_id: &str, upstream: &str, command: &WparseCommand) -> serde
         "model_version": body_field(&command.body, "version"),
         "model_group": body_field(&command.body, "group"),
         "reason": body_field(&command.body, "reason"),
+        // `bind-tenant`：绑定内容（tenant / revision）比模型字段更值得直接看到。
+        "tenant_id": body_field(&command.body, "tenant_id"),
+        "binding_revision": command
+            .body
+            .as_ref()
+            .and_then(|body| body.get("revision"))
+            .and_then(|value| value.as_i64()),
     })
 }
 
@@ -390,8 +411,8 @@ async fn execute(
 
 /// 控制类命令（`kind != proxy`）：**在本机执行**，不经过 wparse 管理面。
 ///
-/// 目前只有 `diagnose`。未知 kind 一律**明确失败**（而不是静默当成功）——
-/// 中心派了新命令但本机 gwlinkd 太旧时，要让人能从回执里看出来。
+/// 目前有 `diagnose` / `restart-gateway` / `restart-gwlinkd` / `bind-tenant`。未知 kind 一律**明确失败**
+/// （而不是静默当成功）—— 中心派了新命令但本机 gwlinkd 太旧时，要让人能从回执里看出来。
 async fn execute_control(
     config: &Config,
     command: &WparseCommand,
@@ -401,6 +422,7 @@ async fn execute_control(
         "diagnose" => run_diagnose(config, command, task).await,
         "restart-gateway" => run_gateway_restart(config, task).await,
         "restart-gwlinkd" => run_gwlinkd_restart(task).await,
+        "bind-tenant" => run_bind_tenant(config, command, task).await,
         other => {
             let error = format!("不支持的控制命令 kind={other}（先升级 gwlinkd 再重派）");
             record_event(task, "reject", &error);
@@ -410,6 +432,438 @@ async fn execute_control(
                 error: Some(error),
             }
         }
+    }
+}
+
+/// `bind-tenant` 载荷：Center 绑定表里的 `customer_id` 在数据面叫 `tenant_id`。
+#[derive(serde::Deserialize)]
+struct BindTenantPayload {
+    tenant_id: String,
+    #[serde(default = "default_bind_revision")]
+    revision: i64,
+}
+
+fn default_bind_revision() -> i64 {
+    1
+}
+
+/// 绑定业务身份：校验 → 落身份 → 写 `.env` → 重启 wparse（见 [`apply_business_identity`]）。
+///
+/// 幂等三态：
+/// - 更旧的 revision → 200 `ignored: stale`（不覆盖本地）；
+/// - 同 revision + 同 tenant + 已生效 → 200 直接返回（**不重复重启**，租约重投时常见）；
+/// - 否则应用。
+async fn run_bind_tenant(
+    config: &Config,
+    command: &WparseCommand,
+    task: Option<&TaskLog>,
+) -> UpstreamResult {
+    let Some(body) = command.body.as_ref() else {
+        let error = "bind-tenant 缺少 body".to_string();
+        record_event(task, "bind.rejected", &error);
+        return UpstreamResult {
+            status_code: 400,
+            body: String::new(),
+            error: Some(error),
+        };
+    };
+    let payload: BindTenantPayload = match serde_json::from_value(body.clone()) {
+        Ok(payload) => payload,
+        Err(err) => {
+            let error = format!("bind-tenant body 解析失败：{err}");
+            record_event(task, "bind.rejected", &error);
+            return UpstreamResult {
+                status_code: 400,
+                body: String::new(),
+                error: Some(error),
+            };
+        }
+    };
+    let tenant_id = payload.tenant_id.trim().to_string();
+    // 先校验格式：旧 revision 的非法值也要明确拒绝，不能被 stale 分支「成功」掉。
+    if !is_tag_safe(&tenant_id) {
+        let error = format!(
+            "tenant_id 不是 tag-safe（1..=64，仅 [A-Za-z0-9_.:/=@+,-]）：{}",
+            value_preview(&tenant_id)
+        );
+        record_event(task, "bind.rejected", &error);
+        return UpstreamResult {
+            status_code: 400,
+            body: json!({
+                "tenant_id": tenant_id,
+                "revision": payload.revision,
+                "wparse_applied": false,
+            })
+            .to_string(),
+            error: Some(error),
+        };
+    }
+    if let Some(current) = state::load_business_identity(config.identity_dir()) {
+        if payload.revision < current.revision {
+            let detail = format!(
+                "忽略旧命令：payload revision={} < local revision={}",
+                payload.revision, current.revision
+            );
+            record_event(task, "bind.stale", &detail);
+            return UpstreamResult {
+                status_code: 200,
+                body: json!({
+                    "requested": { "tenant_id": tenant_id, "revision": payload.revision },
+                    "tenant_id": current.tenant_id,
+                    "revision": current.revision,
+                    "ignored": "stale",
+                })
+                .to_string(),
+                error: None,
+            };
+        }
+        // 同版本同身份且已生效：幂等返回，不重跑生效命令（控制命令租约过期会重投）。
+        if payload.revision == current.revision
+            && current.tenant_id == tenant_id
+            && current.wparse_applied
+        {
+            record_event(
+                task,
+                "bind.unchanged",
+                &format!("revision={}", current.revision),
+            );
+            return UpstreamResult {
+                status_code: 200,
+                body: json!({
+                    "tenant_id": tenant_id,
+                    "revision": payload.revision,
+                    "wparse_applied": true,
+                    "apply": "unchanged",
+                })
+                .to_string(),
+                error: None,
+            };
+        }
+    }
+    match apply_business_identity(config, &tenant_id, payload.revision, task).await {
+        ApplyOutcome::Done {
+            wparse_applied: true,
+        } => UpstreamResult {
+            status_code: 200,
+            body: json!({
+                "tenant_id": tenant_id,
+                "revision": payload.revision,
+                "wparse_applied": true,
+            })
+            .to_string(),
+            error: None,
+        },
+        ApplyOutcome::Done {
+            wparse_applied: false,
+        } => UpstreamResult {
+            status_code: 200,
+            body: json!({
+                "tenant_id": tenant_id,
+                "revision": payload.revision,
+                "wparse_applied": false,
+                "apply": "pending",
+            })
+            .to_string(),
+            error: None,
+        },
+        ApplyOutcome::Failed { status, error } => UpstreamResult {
+            status_code: status,
+            body: json!({
+                "tenant_id": tenant_id,
+                "revision": payload.revision,
+                "wparse_applied": false,
+            })
+            .to_string(),
+            error: Some(error),
+        },
+    }
+}
+
+/// 应用业务身份的结果：**命令回执**与**状态回执补偿**共用同一条路径。
+enum ApplyOutcome {
+    /// `.env` 已写 + 身份已落盘；`wparse_applied` = 生效命令是否跑成功
+    /// （未配置生效命令 → false，等下次启动 / 人工重启）。
+    Done { wparse_applied: bool },
+    /// 失败；`status` 用作命令回执的 HTTP 状态码。
+    Failed { status: u16, error: String },
+}
+
+/// 落 `business-identity.json` → 写 `<工作根>/.env` →（配置了才）跑生效命令。
+///
+/// 顺序有意为**身份先、`.env` 后**（与设计 §8.2 一致）：`.env` 写失败时本地仍是
+/// 「未生效」，不会出现「数据面已是新租户、身份文件还是旧值」的错位（那会被中心判成漂移，
+/// 且因 `wparse_applied=true` 永不重试）。
+///
+/// **只由本模块的 relay 任务调用**（命令处理与状态回执补偿在同一条循环里）：
+/// `.env` / 身份文件不会有并发写者。
+async fn apply_business_identity(
+    config: &Config,
+    tenant_id: &str,
+    revision: i64,
+    task: Option<&TaskLog>,
+) -> ApplyOutcome {
+    let tenant_id = tenant_id.trim();
+    if !is_tag_safe(tenant_id) {
+        let error = format!(
+            "tenant_id 不是 tag-safe（1..=64，仅 [A-Za-z0-9_.:/=@+,-]）：{}",
+            value_preview(tenant_id)
+        );
+        record_event(task, "bind.rejected", &error);
+        return ApplyOutcome::Failed { status: 400, error };
+    }
+    // 先把**两条路径**都解析出来：配置类错误（未配工程根 / 多系统歧义 / 工作根不存在）
+    // 必须在动盘之前失败，否则会「已落盘但这个错永远重试」。
+    let work_dir = match crate::wparse_env::resolve_work_dir(config) {
+        Ok(dir) => dir,
+        Err(error) => {
+            record_event(task, "bind.rejected", &error);
+            return ApplyOutcome::Failed {
+                status: 500,
+                error: format!("定位 wparse 工作根失败：{error}"),
+            };
+        }
+    };
+    let apply_plan = match crate::wparse_env::apply_command(config) {
+        Some(command) => match control_workdir(config) {
+            Ok(dir) => Some((command.to_string(), dir)),
+            Err(error) => {
+                let error = format!("生效命令缺少系统根：{error}");
+                record_event(task, "bind.apply_failed", &error);
+                return ApplyOutcome::Failed { status: 500, error };
+            }
+        },
+        None => None,
+    };
+    let mut identity = state::BusinessIdentity {
+        tenant_id: tenant_id.to_string(),
+        revision,
+        wparse_applied: false,
+    };
+    if let Err(err) = state::save_business_identity(config.identity_dir(), &identity) {
+        let error = format!("保存业务身份失败：{err}");
+        record_event(task, "bind.failed", &error);
+        return ApplyOutcome::Failed { status: 500, error };
+    }
+    if let Err(error) = crate::wparse_env::write_tenant_id(&work_dir, tenant_id) {
+        record_event(task, "bind.env_failed", &error);
+        return ApplyOutcome::Failed {
+            status: 500,
+            error: format!("写 wparse .env 失败：{error}"),
+        };
+    }
+    record_event(
+        task,
+        "bind.stored",
+        &format!(
+            "tenant_id={tenant_id} revision={revision} env={}",
+            work_dir.join(crate::wparse_env::ENV_FILE).display()
+        ),
+    );
+    // 补偿路径没有 task 日志：这条 info 是唯一的「写到了哪个 .env」证据。
+    log::info!(
+        "event=TenantBindingStored tenant_id={tenant_id} revision={revision} env={}",
+        work_dir.join(crate::wparse_env::ENV_FILE).display()
+    );
+    let Some((apply_command, apply_dir)) = apply_plan else {
+        return ApplyOutcome::Done {
+            wparse_applied: false,
+        };
+    };
+    record_event(
+        task,
+        "bind.apply",
+        &format!("{apply_command}（cwd={}）", apply_dir.display()),
+    );
+    match run_shell(
+        &apply_command,
+        &apply_dir,
+        crate::wparse_env::apply_timeout(config),
+    )
+    .await
+    {
+        Ok(output) if output.status.success() => {
+            identity.wparse_applied = true;
+            if let Err(err) = state::save_business_identity(config.identity_dir(), &identity) {
+                log::warn!("event=TenantBindingFlagPersistFailed error={err}");
+            }
+            record_event(task, "bind.applied", &format!("tenant_id={tenant_id}"));
+            ApplyOutcome::Done {
+                wparse_applied: true,
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let error = format!(
+                "生效命令失败（exit={:?}）：{}",
+                output.status.code(),
+                stderr_tail(&stderr, 10)
+            );
+            record_event(task, "bind.apply_failed", &error);
+            ApplyOutcome::Failed { status: 500, error }
+        }
+        Err(error) => {
+            record_event(task, "bind.apply_failed", &error);
+            ApplyOutcome::Failed { status: 500, error }
+        }
+    }
+}
+
+/// 同一期望值失败后的重试间隔：生效命令可能要重启整栈，不能每轮（1.5s）都试。
+const COMPENSATION_RETRY: Duration = Duration::from_secs(60);
+
+/// 本地业务身份是否落后于中心期望值。
+fn needs_business_apply(
+    local: Option<&state::BusinessIdentity>,
+    desired: &DesiredBusinessIdentity,
+    can_apply: bool,
+) -> bool {
+    let Some(local) = local else {
+        return true;
+    };
+    // 回执最多 30s 才刷新一次，**可能比刚执行的命令旧**：更旧的期望值绝不能覆盖本地，
+    // 否则一次换绑会被「旧回执 → 回退 → 新回执 → 再改回」来回折腾（每次都是整栈重启）。
+    if desired.revision < local.revision {
+        return false;
+    }
+    if local.tenant_id != desired.tenant_id || local.revision < desired.revision {
+        return true;
+    }
+    // 同版本但上次没生效（`.env` 已写、重启没跑成）：配置了生效命令就再试。
+    can_apply && !local.wparse_applied
+}
+
+/// 状态回执带的**中心权威期望值** → 本地落后就自行补齐（设计 §11.1）。
+///
+/// 不依赖命令队列：离线 / 队列过期 / gwlinkd 重启都天然收敛；同一期望值失败后
+/// 至少隔 [`COMPENSATION_RETRY`] 才重试。
+async fn compensate_desired_identity(
+    config: &Config,
+    desired: Option<DesiredBusinessIdentity>,
+    last_attempt: &mut Option<(Instant, String, i64)>,
+) {
+    let Some(desired) = desired else {
+        return;
+    };
+    let can_apply = crate::wparse_env::apply_command(config).is_some();
+    let local = state::load_business_identity(config.identity_dir());
+    if !needs_business_apply(local.as_ref(), &desired, can_apply) {
+        return;
+    }
+    if let Some((at, tenant_id, revision)) = last_attempt
+        && *tenant_id == desired.tenant_id
+        && *revision == desired.revision
+        && at.elapsed() < COMPENSATION_RETRY
+    {
+        return;
+    }
+    *last_attempt = Some((Instant::now(), desired.tenant_id.clone(), desired.revision));
+    log::info!(
+        "event=TenantBindingCompensating tenant_id={} revision={} local_revision={:?}",
+        desired.tenant_id,
+        desired.revision,
+        local.as_ref().map(|identity| identity.revision)
+    );
+    match apply_business_identity(config, &desired.tenant_id, desired.revision, None).await {
+        ApplyOutcome::Done { wparse_applied } => log::info!(
+            "event=TenantBindingCompensated tenant_id={} revision={} wparse_applied={wparse_applied}",
+            desired.tenant_id,
+            desired.revision
+        ),
+        ApplyOutcome::Failed { error, .. } => log::warn!(
+            "event=TenantBindingCompensateFailed tenant_id={} revision={} error={error}",
+            desired.tenant_id,
+            desired.revision
+        ),
+    }
+}
+
+/// 启动自检 + 补偿：让**身份文件**与 `<工作根>/.env` 一致，并按需重跑生效命令。
+///
+/// 不能只看 `wparse_applied`：`business-identity.json` 随 `contract` 备份、`data-plane-run/`
+/// **不进备份**（设计 §8.1/§9.2）—— 换机/恢复后身份回来了、`.env` 没了，只看标志会直接 return，
+/// 造成「中心显示已生效、数据面永远是 `unbound`」且无人修复。人工误删/改 `.env` 同理。
+pub async fn reconcile_business_identity(config: &Config) {
+    let Some(mut identity) = state::load_business_identity(config.identity_dir()) else {
+        return;
+    };
+    let work_dir = match crate::wparse_env::resolve_work_dir(config) {
+        Ok(dir) => dir,
+        Err(error) => {
+            log::warn!("event=TenantBindingReconcileSkipped error={error}");
+            return;
+        }
+    };
+    let env_matches = std::fs::read_to_string(work_dir.join(crate::wparse_env::ENV_FILE))
+        .map(|text| {
+            crate::wparse_env::env_has_value(
+                &text,
+                crate::wparse_env::TENANT_KEY,
+                &identity.tenant_id,
+            )
+        })
+        .unwrap_or(false);
+    if identity.wparse_applied && env_matches {
+        return;
+    }
+    if !env_matches {
+        log::warn!(
+            "event=TenantBindingEnvDrift tenant_id={} revision={} env={}（现场值缺失/不一致，重写并重新生效）",
+            identity.tenant_id,
+            identity.revision,
+            work_dir.join(crate::wparse_env::ENV_FILE).display()
+        );
+        // 先降级标志再动盘：中途崩溃时下次启动仍会重试。
+        identity.wparse_applied = false;
+        if let Err(err) = state::save_business_identity(config.identity_dir(), &identity) {
+            log::warn!("event=TenantBindingFlagPersistFailed error={err}");
+        }
+    }
+    if let Err(error) = crate::wparse_env::write_tenant_id(&work_dir, &identity.tenant_id) {
+        log::warn!("event=TenantBindingReconcileEnvFailed error={error}");
+        return;
+    }
+    let Some(apply_command) = crate::wparse_env::apply_command(config) else {
+        log::info!(
+            "event=TenantBindingReconcilePending tenant_id={} revision={}（未配置生效命令）",
+            identity.tenant_id,
+            identity.revision
+        );
+        return;
+    };
+    let dir = match control_workdir(config) {
+        Ok(dir) => dir,
+        Err(error) => {
+            log::warn!("event=TenantBindingReconcileSkipped error={error}");
+            return;
+        }
+    };
+    match run_shell(
+        apply_command,
+        &dir,
+        crate::wparse_env::apply_timeout(config),
+    )
+    .await
+    {
+        Ok(output) if output.status.success() => {
+            identity.wparse_applied = true;
+            if let Err(err) = state::save_business_identity(config.identity_dir(), &identity) {
+                log::warn!("event=TenantBindingFlagPersistFailed error={err}");
+            }
+            log::info!(
+                "event=TenantBindingReconciled tenant_id={} revision={}",
+                identity.tenant_id,
+                identity.revision
+            );
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::warn!(
+                "event=TenantBindingReconcileFailed exit={:?} stderr={}",
+                output.status.code(),
+                stderr_tail(&stderr, 10)
+            );
+        }
+        Err(error) => log::warn!("event=TenantBindingReconcileFailed error={error}"),
     }
 }
 
@@ -703,6 +1157,51 @@ async fn run_short(
         Ok(Ok(output)) => Ok(output),
         Ok(Err(err)) => Err(format!("无法执行 {program}：{err}")),
         Err(_) => Err(format!("{program} 超时（{}s）已被终止", timeout.as_secs())),
+    }
+}
+
+/// 跑一条 shell 命令（`sh -c`），带超时；用于可配置的 wparse 生效命令。
+///
+/// 超时要杀**整个进程组**：`gops run stop && gops run start` 里的 `gops` 不是 sh 的
+/// 直接子进程（`&&` 会为每段起子 shell），只杀 sh 会让 `gops` 继续跑 —— 下次补偿再起一份，
+/// 两份 `stop/start` 并发。
+async fn run_shell(
+    command: &str,
+    dir: &Path,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg(command)
+        .current_dir(dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        // 自成进程组（pgid = 子进程 pid），超时时按组杀。
+        cmd.process_group(0);
+    }
+    let child = cmd
+        .spawn()
+        .map_err(|err| format!("无法执行生效命令 `{command}`：{err}"))?;
+    let pid = child.id();
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(err)) => Err(format!("无法执行生效命令 `{command}`：{err}")),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                // 负号 = 进程组；组已不存在（ESRCH）也无需处理。
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+            Err(format!(
+                "生效命令 `{command}` 超时（{}s），已杀整个进程组；网关可能停在**停止态**，请人工确认后重试",
+                timeout.as_secs()
+            ))
+        }
     }
 }
 
@@ -1539,5 +2038,283 @@ mod tests {
         let (events, output) = read_logs(&task);
         assert!(events.contains("\"phase\":\"upstream.failed\""), "{events}");
         assert!(output.contains("< transport error"), "{output}");
+    }
+
+    #[test]
+    fn tenant_id_must_be_tag_safe() {
+        assert!(is_tag_safe("tenant-acme"));
+        assert!(is_tag_safe("t.1/a=b@c+d,e:f"));
+        assert!(!is_tag_safe(""));
+        assert!(!is_tag_safe("tenant acme"));
+        assert!(!is_tag_safe(&"a".repeat(65)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_tenant_writes_env_and_marks_applied() {
+        let state = temp_state("bind-tenant");
+        std::fs::create_dir_all(state.join("sys")).unwrap();
+        std::fs::write(
+            state.join("sys/sys_model.yml"),
+            "name: test\nkind: docker-compose\n",
+        )
+        .unwrap();
+        let work = state.join("data-plane-run/dev");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join(".env"), "OTHER=keep\n").unwrap();
+        let path = state.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "state_dir = \"{}\"\nupgrade_project_dir = \"{}\"\nwparse_work_dir = \"{}\"\nwparse_apply_command = \"true\"\nwparse_apply_timeout_seconds = 5\n",
+                state.display(),
+                state.display(),
+                work.display()
+            ),
+        )
+        .unwrap();
+        let config = Config::load(&path).expect("config");
+        let command = WparseCommand {
+            command_id: "cmd-1".into(),
+            kind: "bind-tenant".into(),
+            method: String::new(),
+            path: String::new(),
+            body: Some(json!({"tenant_id": "tenant-acme", "revision": 1})),
+            lease_expires_at: "2030-01-01T00:00:00Z".into(),
+        };
+
+        let result = run_bind_tenant(&config, &command, None).await;
+        assert_eq!(result.status_code, 200, "{:?}", result.error);
+        let body: serde_json::Value = serde_json::from_str(&result.body).expect("body");
+        assert_eq!(body["wparse_applied"], true);
+        let env = std::fs::read_to_string(work.join(".env")).unwrap();
+        assert!(env.contains("OTHER=keep"));
+        assert!(env.contains("WIST_TENANT_ID=tenant-acme"));
+        let identity =
+            crate::state::load_business_identity(config.identity_dir()).expect("identity");
+        assert_eq!(identity.tenant_id, "tenant-acme");
+        assert_eq!(identity.revision, 1);
+        assert!(identity.wparse_applied);
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    fn business_identity(
+        tenant_id: &str,
+        revision: i64,
+        wparse_applied: bool,
+    ) -> crate::state::BusinessIdentity {
+        crate::state::BusinessIdentity {
+            tenant_id: tenant_id.to_string(),
+            revision,
+            wparse_applied,
+        }
+    }
+
+    #[test]
+    fn needs_business_apply_tracks_tenant_revision_and_pending_apply() {
+        let desired = DesiredBusinessIdentity {
+            tenant_id: "tenant-acme".into(),
+            revision: 2,
+        };
+        // 从未绑定过 → 要应用。
+        assert!(needs_business_apply(None, &desired, false));
+        // 换绑（tenant 不同）→ 要应用。
+        assert!(needs_business_apply(
+            Some(&business_identity("tenant-old", 2, true)),
+            &desired,
+            false
+        ));
+        // 本地版本旧 → 要应用。
+        assert!(needs_business_apply(
+            Some(&business_identity("tenant-acme", 1, true)),
+            &desired,
+            false
+        ));
+        // 一致且已生效 → 不动。
+        assert!(!needs_business_apply(
+            Some(&business_identity("tenant-acme", 2, true)),
+            &desired,
+            true
+        ));
+        // 一致但上次没跑成：配置了生效命令才重试。
+        assert!(needs_business_apply(
+            Some(&business_identity("tenant-acme", 2, false)),
+            &desired,
+            true
+        ));
+        assert!(!needs_business_apply(
+            Some(&business_identity("tenant-acme", 2, false)),
+            &desired,
+            false
+        ));
+        // 本地版本更新（回执最多 30s 才刷新，可能比刚执行的命令旧）→ **绝不回退**，
+        // 哪怕 tenant 不同：否则一次换绑会被旧回执来回覆盖（每次都整栈重启）。
+        assert!(!needs_business_apply(
+            Some(&business_identity("tenant-acme", 3, true)),
+            &desired,
+            true
+        ));
+        assert!(!needs_business_apply(
+            Some(&business_identity("tenant-newer", 3, true)),
+            &desired,
+            true
+        ));
+    }
+
+    /// 离线补偿：状态回执带中心期望值 → relay 写 `.env` + 落身份 + 跑生效命令。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compensate_desired_identity_writes_env_and_marks_applied() {
+        let state = temp_state("compensate");
+        std::fs::create_dir_all(state.join("sys")).unwrap();
+        std::fs::write(
+            state.join("sys/sys_model.yml"),
+            "name: test\nkind: docker-compose\n",
+        )
+        .unwrap();
+        let work = state.join("data-plane-run/dev");
+        std::fs::create_dir_all(&work).unwrap();
+        let path = state.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "state_dir = \"{}\"\nupgrade_project_dir = \"{}\"\nwparse_work_dir = \"{}\"\nwparse_apply_command = \"true\"\nwparse_apply_timeout_seconds = 5\n",
+                state.display(),
+                state.display(),
+                work.display()
+            ),
+        )
+        .unwrap();
+        let config = Config::load(&path).expect("config");
+        let mut last_attempt = None;
+
+        compensate_desired_identity(
+            &config,
+            Some(DesiredBusinessIdentity {
+                tenant_id: "tenant-acme".into(),
+                revision: 4,
+            }),
+            &mut last_attempt,
+        )
+        .await;
+
+        let env = std::fs::read_to_string(work.join(".env")).unwrap();
+        assert!(env.contains("WIST_TENANT_ID=tenant-acme"), "{env}");
+        let identity =
+            crate::state::load_business_identity(config.identity_dir()).expect("identity");
+        assert_eq!(identity.tenant_id, "tenant-acme");
+        assert_eq!(identity.revision, 4);
+        assert!(identity.wparse_applied);
+        assert!(last_attempt.is_some());
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    /// bind 场景的配置：系统根 + 工作根 + 可配置生效命令。
+    fn bind_config(state: &Path, work: &Path, apply_command: &str) -> Config {
+        std::fs::create_dir_all(state.join("sys")).unwrap();
+        std::fs::write(
+            state.join("sys/sys_model.yml"),
+            "name: test\nkind: docker-compose\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(work).unwrap();
+        let path = state.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "state_dir = \"{}\"\nupgrade_project_dir = \"{}\"\nwparse_work_dir = \"{}\"\nwparse_apply_command = \"{}\"\nwparse_apply_timeout_seconds = 5\n",
+                state.display(),
+                state.display(),
+                work.display(),
+                apply_command
+            ),
+        )
+        .unwrap();
+        Config::load(&path).expect("config")
+    }
+
+    fn bind_command(tenant_id: &str, revision: i64) -> WparseCommand {
+        WparseCommand {
+            command_id: "cmd-bind".into(),
+            kind: "bind-tenant".into(),
+            method: String::new(),
+            path: String::new(),
+            body: Some(json!({ "tenant_id": tenant_id, "revision": revision })),
+            lease_expires_at: "2030-01-01T00:00:00Z".into(),
+        }
+    }
+
+    /// 同 revision / 同 tenant 且已生效：幂等返回，**不重跑生效命令**（命令租约过期会重投）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_tenant_is_idempotent_and_does_not_restart_twice() {
+        let state = temp_state("bind-idempotent");
+        let work = state.join("data-plane-run/dev");
+        let marker = state.join("apply-ran");
+        let command = format!("echo ran >> {}", marker.display());
+        let config = bind_config(&state, &work, &command);
+        crate::state::save_business_identity(
+            config.identity_dir(),
+            &business_identity("tenant-acme", 1, true),
+        )
+        .expect("seed identity");
+
+        let result = run_bind_tenant(&config, &bind_command("tenant-acme", 1), None).await;
+        assert_eq!(result.status_code, 200, "{:?}", result.error);
+        let body: serde_json::Value = serde_json::from_str(&result.body).expect("body");
+        assert_eq!(body["apply"], "unchanged");
+        assert_eq!(body["wparse_applied"], true);
+        assert!(!marker.exists(), "幂等返回不应重生效");
+
+        // 换绑（revision 递增）→ 才真正重生效。
+        let result = run_bind_tenant(&config, &bind_command("tenant-acme", 2), None).await;
+        assert_eq!(result.status_code, 200, "{:?}", result.error);
+        assert!(marker.exists(), "新 revision 应该重生效");
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    /// 旧 revision + 非法 tenant：必须 400（不能因为 stale 就“成功”掉）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_tenant_rejects_an_unsafe_tenant_even_when_the_command_is_stale() {
+        let state = temp_state("bind-unsafe-stale");
+        let work = state.join("data-plane-run/dev");
+        let config = bind_config(&state, &work, "true");
+        crate::state::save_business_identity(
+            config.identity_dir(),
+            &business_identity("tenant-acme", 5, true),
+        )
+        .expect("seed identity");
+
+        let result = run_bind_tenant(&config, &bind_command("bad value", 1), None).await;
+        assert_eq!(result.status_code, 400, "{:?}", result.error);
+        let env = std::fs::read_to_string(work.join(".env")).unwrap_or_default();
+        assert!(!env.contains("bad value"), "非法值不得写入 .env：{env}");
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    /// 恢复/误删 `.env`：身份文件说「已生效」也要重新校验现场值（否则数据面永远 unbound）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_rewrites_the_env_when_it_is_missing_or_stale() {
+        let state = temp_state("reconcile-env");
+        let work = state.join("data-plane-run/dev");
+        let config = bind_config(&state, &work, "true");
+        crate::state::save_business_identity(
+            config.identity_dir(),
+            &business_identity("tenant-acme", 2, true),
+        )
+        .expect("seed identity");
+        std::fs::write(work.join(".env"), "OTHER=keep\nWIST_TENANT_ID=tenant-old\n").unwrap();
+
+        reconcile_business_identity(&config).await;
+
+        let env = std::fs::read_to_string(work.join(".env")).unwrap();
+        assert!(env.contains("OTHER=keep"), "其它键要保留：{env}");
+        assert!(env.contains("WIST_TENANT_ID=tenant-acme"), "{env}");
+        let identity =
+            crate::state::load_business_identity(config.identity_dir()).expect("identity");
+        assert!(identity.wparse_applied, "重写后应重新标成已生效");
+        let _ = std::fs::remove_dir_all(state);
     }
 }

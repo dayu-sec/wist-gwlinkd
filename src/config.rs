@@ -111,6 +111,17 @@ pub struct Config {
     /// 重启 gateway（`gops run stop` + `run start`）的超时秒数（缺省 120，上限 300）。
     #[serde(default)]
     pub restart_timeout_seconds: Option<u64>,
+    /// wparse 工作根（`.env` 落点）。缺省：系统根下 `data-plane-run/dev`（存在时）
+    /// 或 `data-plane-run/work`。开发态/发布态不同，显式配置最稳。
+    #[serde(default)]
+    pub wparse_work_dir: Option<PathBuf>,
+    /// `bind-tenant` 生效命令（在系统根用 `sh -c` 执行）：开发态 `./dev/svc.sh restart wparse --no-build`；
+    /// 发布态 `gops run stop && gops run start`。空 = 只写 `.env`，回执 `pending`。
+    #[serde(default)]
+    pub wparse_apply_command: Option<String>,
+    /// 生效命令超时秒数（缺省 120，上限 300）。
+    #[serde(default)]
+    pub wparse_apply_timeout_seconds: Option<u64>,
     /// 升级失败处置（`rollback-all` | `halt`；缺省 `rollback-all`）。
     #[serde(default)]
     pub upgrade_on_failure: Option<String>,
@@ -362,6 +373,15 @@ state_dir = "state"
 # 可选：本机网关自述面 / 环回面（「链接上级」页面路才需要）
 # gateway_self_endpoint = "https://127.0.0.1:3000"
 # gateway_self_ca = "identity/public/gateway-ca.crt.pem"
+
+# 可选：业务身份（tenant_id）落地（设计 edge/gateway-business-identity.md）—— 不配就**不会生效**。
+#   wparse_work_dir         wparse 工作根（`.env` 落点）；缺省在系统根下找 `data-plane-run/dev|work`
+#                           （两个并存时会报错，必须显式配）。
+#   wparse_apply_command    写 `.env` 后让它重读：开发态用 `svc.sh`，发布态整栈重启；
+#                           空 = 只写 `.env`（回执 `pending`，永远不会自动生效）。
+# wparse_work_dir = "/opt/wist-gateway-stack/data-plane-run/work"
+# wparse_apply_command = "gops run stop && gops run start"
+# wparse_apply_timeout_seconds = 120
 
 # 可选：发布 ②「Agent 包交付」（gwlinkd 取包、网关托管）。
 # 收到中心派下的 agent 包后，gwlinkd 先把包落到宿主投放目录，再环回把**本机路径**交给网关。

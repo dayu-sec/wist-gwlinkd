@@ -25,6 +25,11 @@ pub struct GwlinkdStatus {
     pub gx_version: Option<String>,
     pub center_endpoint: String,
     pub state: String,
+    /// 业务身份（Center 绑定后由 gwlinkd 落盘；数据面字段名 `tenant_id`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_revision: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_expires_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -57,6 +62,8 @@ mod tests {
             gx_version: None,
             center_endpoint: "https://center.example".into(),
             state: STATE_LINKED.into(),
+            tenant_id: None,
+            binding_revision: None,
             credential_expires_at: None,
             last_center_report_at: None,
             last_error: None,
@@ -80,6 +87,11 @@ mod tests {
             "None 应被跳过: {value}"
         );
         assert!(!object.contains_key("gx_version"), "None 应被跳过: {value}");
+        assert!(!object.contains_key("tenant_id"), "None 应被跳过: {value}");
+        assert!(
+            !object.contains_key("binding_revision"),
+            "None 应被跳过: {value}"
+        );
         assert!(
             value["reported_at"].is_string(),
             "reported_at 应为 RFC3339 串: {value}"
@@ -97,6 +109,8 @@ mod tests {
             gx_version: Some("0.17.0".into()),
             center_endpoint: "https://center.example".into(),
             state: STATE_DEGRADED.into(),
+            tenant_id: Some("tenant-acme".into()),
+            binding_revision: Some(3),
             credential_expires_at: Some("2026-12-01T00:00:00Z".into()),
             last_center_report_at: Some("2026-10-05T00:00:00Z".into()),
             last_error: Some("中心不可达".into()),
@@ -107,6 +121,8 @@ mod tests {
         assert_eq!(value["last_error"], "中心不可达");
         assert_eq!(value["gops_version"], "2.4.0");
         assert_eq!(value["gx_version"], "0.17.0");
+        assert_eq!(value["tenant_id"], "tenant-acme");
+        assert_eq!(value["binding_revision"], 3);
         assert!(value["credential_expires_at"].is_string(), "{value}");
         assert!(value["last_center_report_at"].is_string(), "{value}");
     }

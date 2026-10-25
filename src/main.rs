@@ -397,6 +397,8 @@ async fn run(
     // 否则后续周期（上报 / 续期 / 升级）仍用**旧 gateway_id**，中心按客户端证书认人 → `certificate_mismatch`。
     let reloaded = Config::load(path).conv_err()?;
     let config: &Config = &reloaded;
+    // 启动补偿：上次若只落了业务身份、没来得及写 `.env` / 重启 wparse，这里补一次。
+    wist_gwlinkd::wparse_relay::reconcile_business_identity(config).await;
     let trust_bundle = config.trust_bundle.clone();
     let trust: Option<&Path> = if trust_bundle.exists() {
         Some(trust_bundle.as_path())
@@ -414,10 +416,14 @@ async fn run(
     let mut client = mtls_client(config, trust, &credential)?;
     // 规则发布命令中继：独立任务，短轮询 Center 命令队列并调用本机 wparse admin。
     // 任务内部自己重建 mTLS 客户端（证书轮换后旧客户端失效）。
+    // 它会拿到状态回执里的**中心期望业务身份**（`desired`），本地落后时自己补齐 ——
+    // relay 任务才是 `.env` / 身份文件的唯一写者，补偿与命令处理不会并发。
+    let (desired_identity_tx, desired_identity_rx) =
+        tokio::sync::watch::channel::<Option<wist_control::DesiredBusinessIdentity>>(None);
     if config.wparse_relay.enabled {
         let relay_config = config.clone();
         tokio::spawn(async move {
-            wist_gwlinkd::wparse_relay::run(relay_config).await;
+            wist_gwlinkd::wparse_relay::run(relay_config, desired_identity_rx).await;
         });
     }
     let instance_id = state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)
@@ -903,6 +909,7 @@ async fn run(
             .unwrap_or_else(|| "unknown".to_string());
 
         if Instant::now() >= next_status_at {
+            let business_identity = state::load_business_identity(config.identity_dir());
             let payload = ReportGatewayStatus {
                 gateway_id: config.gateway_id.clone(),
                 instance_id: instance_id.clone(),
@@ -917,6 +924,14 @@ async fn run(
                 gx_version: tool_versions.gx.clone(),
                 // gwlinkd **自身**版本：中心据此知道这台网关的宿主常驻是哪个版本（自更新 / 排障用）。
                 gwlinkd_version: Some(wist_gwlinkd::VERSION.to_string()),
+                // 业务身份（gwlinkd 本地落盘的 tenant_id / revision）：中心据此判“已生效/漂移”。
+                tenant_id: business_identity
+                    .as_ref()
+                    .map(|identity| identity.tenant_id.clone()),
+                binding_revision: business_identity
+                    .as_ref()
+                    .filter(|identity| identity.wparse_applied)
+                    .map(|identity| identity.revision),
                 // 中心侧约定：`status` 是**在线/离线**（中心按 `== "online"` 计数与展示）。
                 // 之前误发 `"running"`（那是生命周期 `Running` 的概念）→ 中心把在跑的网关算成离线。
                 status: "online".to_string(),
@@ -965,11 +980,14 @@ async fn run(
                 reported_at: DateTime::now(),
             };
             match client.report_status(&payload).await {
-                Ok(()) => {
+                Ok(accepted) => {
                     status_backoff = Duration::ZERO;
                     linkd_state = STATE_LINKED.to_string();
                     linkd_last_error = None;
                     linkd_last_report_at = Some(linkd_status::now_rfc3339());
+                    // 回执里的期望身份 → relay 任务（本地落后就自己补）。接收端不在（relay
+                    // 未启用）时忽略：没有 `.env` 写入者，补偿也不该发生。
+                    let _ = desired_identity_tx.send(accepted.desired_business_identity);
                     log::info!("event=StatusReported gateway_id={}", config.gateway_id);
                 }
                 Err(err) if err.is_unauthorized() => {
@@ -994,6 +1012,7 @@ async fn run(
 
         // 推 gwlinkd 自身状态（心跳）给网关：页面据此展示「宿主侧常驻在不在跑」。
         if let Some(linkd_client) = &linkd_client {
+            let business_identity = state::load_business_identity(config.identity_dir());
             let status = GwlinkdStatus {
                 gateway_id: config.gateway_id.clone(),
                 instance_id: instance_id.clone(),
@@ -1002,6 +1021,13 @@ async fn run(
                 gx_version: tool_versions.gx.clone(),
                 center_endpoint: config.control_center_endpoint.clone(),
                 state: linkd_state.clone(),
+                tenant_id: business_identity
+                    .as_ref()
+                    .map(|identity| identity.tenant_id.clone()),
+                binding_revision: business_identity
+                    .as_ref()
+                    .filter(|identity| identity.wparse_applied)
+                    .map(|identity| identity.revision),
                 credential_expires_at: credential
                     .bundle
                     .not_after
@@ -1828,6 +1854,7 @@ async fn wait_for_gateway_request(
             Err(err) => log::warn!("event=LinkRequestFailed error={}", chain_one_line(&err)),
         }
         // 心率：接入前也推一条「在跑、等待接入」——免得页面把「还没接」当成「gwlinkd 没跑」。
+        let business_identity = state::load_business_identity(config.identity_dir());
         let waiting = GwlinkdStatus {
             gateway_id: config.gateway_id.clone(),
             instance_id: state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)
@@ -1837,6 +1864,13 @@ async fn wait_for_gateway_request(
             gx_version: tool_versions.gx.clone(),
             center_endpoint: config.control_center_endpoint.clone(),
             state: STATE_WAITING_LINK_REQUEST.to_string(),
+            tenant_id: business_identity
+                .as_ref()
+                .map(|identity| identity.tenant_id.clone()),
+            binding_revision: business_identity
+                .as_ref()
+                .filter(|identity| identity.wparse_applied)
+                .map(|identity| identity.revision),
             credential_expires_at: None,
             last_center_report_at: None,
             last_error: None,
@@ -1950,6 +1984,35 @@ async fn onboard(
         })?;
     // 链接配置（信任锚 / 协议版本 / 注册 token 引用）落盘留痕 —— 不再丢弃。
     state::save_link_config(&config.state_dir, &returned.config)?;
+    // 首次接入时中心把业务身份一并带出：落 `identity_dir/business-identity.json`，
+    // 后续周期状态上报即可回显；写失败不阻断接入（命令路径还会补）。
+    if let Some(tenant_id) = returned.config.tenant_id.clone() {
+        let tenant_id = tenant_id.trim();
+        // 落盘边界照样校验（Center 旧版/异常时可能漏校验）；不合法就不落盘，让命令路径报错。
+        if !wist_gwlinkd::wparse_env::is_tag_safe(tenant_id) {
+            log::warn!(
+                "event=TenantBindingRejected reason=unsafe_tenant_id value={}",
+                wist_gwlinkd::wparse_env::value_preview(tenant_id)
+            );
+        } else {
+            // 重新接入时**不能降级**：本地已有更新的 revision 就以本地为准（否则一次重接
+            // 会把已生效的换绑退回去，还会触发一次整栈重启）。
+            let incoming = returned.config.binding_revision.unwrap_or(1);
+            let (persisted_tenant, revision) =
+                match state::load_business_identity(config.identity_dir()) {
+                    Some(local) if local.revision > incoming => (local.tenant_id, local.revision),
+                    _ => (tenant_id.to_string(), incoming),
+                };
+            let identity = state::BusinessIdentity {
+                tenant_id: persisted_tenant,
+                revision,
+                wparse_applied: false,
+            };
+            if let Err(err) = state::save_business_identity(config.identity_dir(), &identity) {
+                log::warn!("event=TenantBindingPersistFailed error={}", err);
+            }
+        }
+    }
     let regist_token = returned.regist_token.ok_or_else(|| {
         GwlinkdReason::Enrollment.err(
             "中心认为该网关**已初始化**，但本地无客户端证书 —— 无法自动恢复（CR-003 尚缺「身份重置」路径）。\
@@ -1968,6 +2031,8 @@ async fn onboard(
     )
     .await?;
     state::clear_regist_token(&config.state_dir);
+    // 首次接入带出的业务身份：立即写 `.env` 并按配置生效（失败不阻断接入，后续启动会补偿）。
+    wist_gwlinkd::wparse_relay::reconcile_business_identity(config).await;
     Ok(())
 }
 
@@ -2120,6 +2185,7 @@ async fn announce_unlinked_to_gateway(config: &Config) {
         }
     };
     let tool_versions = ToolVersions::detect(config.upgrader_program.as_deref()).await;
+    let business_identity = state::load_business_identity(config.identity_dir());
     let status = GwlinkdStatus {
         gateway_id: config.gateway_id.clone(),
         instance_id: String::new(),
@@ -2128,6 +2194,13 @@ async fn announce_unlinked_to_gateway(config: &Config) {
         gx_version: tool_versions.gx.clone(),
         center_endpoint: config.control_center_endpoint.clone(),
         state: STATE_WAITING_LINK_REQUEST.to_string(),
+        tenant_id: business_identity
+            .as_ref()
+            .map(|identity| identity.tenant_id.clone()),
+        binding_revision: business_identity
+            .as_ref()
+            .filter(|identity| identity.wparse_applied)
+            .map(|identity| identity.revision),
         credential_expires_at: None,
         last_center_report_at: None,
         last_error: None,
@@ -2566,6 +2639,9 @@ mod tests {
             diagnose_program: None,
             diagnose_timeout_seconds: None,
             restart_timeout_seconds: None,
+            wparse_work_dir: None,
+            wparse_apply_command: None,
+            wparse_apply_timeout_seconds: None,
             upgrade_on_failure: None,
             upgrade_health_cmd: None,
             upgrade_health_timeout_seconds: None,

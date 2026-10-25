@@ -33,6 +33,7 @@ pub mod task_log;
 pub mod tool_install;
 pub mod unlink;
 pub mod upgrade;
+pub mod wparse_env;
 pub mod wparse_relay;
 
 /// 当前版本（由 gx 同步 `Cargo.toml` / `version.txt`）。

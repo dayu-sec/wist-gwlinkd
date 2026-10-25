@@ -36,6 +36,9 @@ pub const LINK_CONFIG_FILE: &str = "link-config.json";
 /// 首跑置备遗留的**注册 token**：link-upstream 已签发、register 尚未消费时落盘，
 /// 使 register 失败（网络）后下次可**免接入券**重试。
 pub const REGIST_TOKEN_FILE: &str = "regist-token";
+/// 业务身份（Center 绑定 → gwlinkd 落盘；数据面字段名 `tenant_id`）。
+/// 不是密钥，放 `identity_dir` 以便随 `contract` 备份。
+pub const BUSINESS_IDENTITY_FILE: &str = "business-identity.json";
 /// **部署级**单实例锁文件（`state_dir` 下）：回答「**这份部署**在跑吗」。
 /// 「同机只能有一个 gwlinkd」由机器级闸门 [`crate::single_instance`] 负责（与配置无关）。
 pub const LOCK_FILE: &str = "gwlinkd.lock";
@@ -111,6 +114,14 @@ fn write_atomic(path: &Path, content: &str) -> StateResult<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, content)
         .source_err(StateReason::Io, format!("写入失败 {}", tmp.display()))?;
+    // 非密钥文件（升级簿记 / 业务身份）：显式 `0644`，不随服务进程的 umask 漂
+    // （systemd 常设 `UMask=0077`，否则会变成 0600，与设计 §8.1 不一致）。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))
+            .source_err(StateReason::Io, format!("设置权限失败 {}", tmp.display()))?;
+    }
     std::fs::rename(&tmp, path)
         .source_err(StateReason::Io, format!("落盘失败 {}", path.display()))
         .map_err(StateError::from)
@@ -372,6 +383,34 @@ pub fn save_link_config(
     let text =
         serde_json::to_string_pretty(config).source_err(StateReason::Json, "序列化链接配置失败")?;
     write_secret(&path_in(state_dir, LINK_CONFIG_FILE), &text)
+}
+
+/// 业务身份（`tenant_id` + `revision`）：Center 绑定后由命令 / 初始配置带来。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BusinessIdentity {
+    pub tenant_id: String,
+    #[serde(default = "default_business_revision")]
+    pub revision: i64,
+    /// 是否已写入 wparse `.env` 并触发重启；false = 只落盘、待生效。
+    #[serde(default)]
+    pub wparse_applied: bool,
+}
+
+fn default_business_revision() -> i64 {
+    1
+}
+
+/// 读业务身份；文件不存在 / 解析失败 → `None`（旧现场还没绑定过是正常态）。
+pub fn load_business_identity(identity_dir: &Path) -> Option<BusinessIdentity> {
+    let text = std::fs::read_to_string(path_in(identity_dir, BUSINESS_IDENTITY_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// 原子写业务身份（非密钥，默认权限）。
+pub fn save_business_identity(identity_dir: &Path, identity: &BusinessIdentity) -> StateResult<()> {
+    let text = serde_json::to_string_pretty(identity)
+        .source_err(StateReason::Json, "序列化业务身份失败")?;
+    write_atomic(&path_in(identity_dir, BUSINESS_IDENTITY_FILE), &text)
 }
 
 /// 读取已落盘的链接配置（link-upstream 返回）：用于遗留 RegistToken 的**免接入券**重试
@@ -657,6 +696,20 @@ mod tests {
         };
         save_upgrade_cursor(&dir, &cursor).expect("save cursor");
         assert_eq!(load_upgrade_cursor(&dir), cursor);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn business_identity_round_trips_and_defaults_revision() {
+        let dir = temp_dir("identity");
+        assert_eq!(load_business_identity(&dir), None);
+        let identity = BusinessIdentity {
+            tenant_id: "tenant-a".into(),
+            revision: 2,
+            wparse_applied: true,
+        };
+        save_business_identity(&dir, &identity).expect("save identity");
+        assert_eq!(load_business_identity(&dir), Some(identity));
         let _ = std::fs::remove_dir_all(dir);
     }
 
