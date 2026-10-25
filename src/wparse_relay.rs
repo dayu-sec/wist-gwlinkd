@@ -555,17 +555,26 @@ async fn run_bind_tenant(
         },
         ApplyOutcome::Done {
             wparse_applied: false,
-        } => UpstreamResult {
-            status_code: 200,
-            body: json!({
+        } => {
+            // `Done{wparse_applied:false}` 只有一个来源：**没配置生效命令**（`apply_plan` 为空），
+            // 即 `.env` 已写、身份已落盘，但 wparse 不会重启 —— 数据面仍是旧租户。
+            // 必须把这层意思带给中心：否则回执看着是成功，页面只会停在“已下发”，
+            // 而现场已经出现过“绑了但数据一直带 unbound”（2026-10-25）。
+            let reason = "gwlinkd 未配置 wparse_apply_command：.env 已写，但 wparse 没重启，数据面仍是旧租户";
+            let mut body = json!({
                 "tenant_id": tenant_id,
                 "revision": payload.revision,
                 "wparse_applied": false,
-                "apply": "pending",
-            })
-            .to_string(),
-            error: None,
-        },
+                "apply": "not_configured",
+            });
+            body["reason"] = json!(reason);
+            record_event(task, "bind.not_applied", reason);
+            UpstreamResult {
+                status_code: 200,
+                body: body.to_string(),
+                error: None,
+            }
+        }
         ApplyOutcome::Failed { status, error } => UpstreamResult {
             status_code: status,
             body: json!({
@@ -1095,18 +1104,60 @@ async fn run_gwlinkd_restart(task: Option<&TaskLog>) -> UpstreamResult {
         }
     };
     let commands = crate::service::restart_commands(platform, scope);
-    let shown: Vec<String> = commands
-        .iter()
-        .map(|command| command.display_line())
-        .collect();
+    // macOS system 域 launchd 要 root 才能 `kickstart`：非 root 时这条路径必失败，
+    // 不硬试（试了也是静默失败），直接走“自己退出、交给 KeepAlive 拉起”。
+    let via_exit_fallback = crate::service::restart_requires_privilege(platform, scope);
+    let supervised = crate::service::supervised_by_init();
+    let shown: Vec<String> = if via_exit_fallback {
+        vec![
+            "self-exit（服务定义 KeepAlive 拉起：launchd system 域需要 root，kickstart 会被拒）"
+                .to_string(),
+        ]
+    } else {
+        commands
+            .iter()
+            .map(|command| command.display_line())
+            .collect()
+    };
     record_event(task, "restart.scheduled", &shown.join("; "));
 
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        for command in commands {
-            let _ = tokio::task::spawn_blocking(move || crate::service::run_with_retries(&command))
-                .await;
+        let mut last_error = if via_exit_fallback {
+            "launchctl kickstart 需要 root（system 域）".to_string()
+        } else {
+            String::new()
+        };
+        if !via_exit_fallback {
+            for command in commands {
+                let shown = command.display_line();
+                match tokio::task::spawn_blocking(move || {
+                    crate::service::run_with_retries(&command)
+                })
+                .await
+                {
+                    Ok(Ok(outcome)) if outcome.success => {
+                        log::info!("event=GwlinkdRestartCommandDone command={shown}");
+                        return;
+                    }
+                    Ok(Ok(outcome)) => {
+                        last_error =
+                            format!("{shown} 失败（stderr={}）", stderr_tail(&outcome.stderr, 3));
+                    }
+                    Ok(Err(err)) => last_error = format!("{shown} 无法执行：{err}"),
+                    Err(err) => last_error = format!("{shown} 任务加入失败：{err}"),
+                }
+            }
         }
+        // 服务管理器没接受重启命令：自己退出，由 KeepAlive / `Restart=` 拉起（新进程会重读配置）。
+        // **只在托管时**这么做：手动 `run` 退出去就再也没人拉起了。
+        if supervised {
+            log::warn!(
+                "event=GwlinkdRestartViaExit reason={last_error}（服务管理器会拉起新进程，新进程重读配置）"
+            );
+            std::process::exit(0);
+        }
+        log::error!("event=GwlinkdRestartFailed reason={last_error}（未被服务管理器托管，不自杀）");
     });
 
     UpstreamResult {
@@ -1115,6 +1166,8 @@ async fn run_gwlinkd_restart(task: Option<&TaskLog>) -> UpstreamResult {
             "restart": "gwlinkd",
             "scheduled": true,
             "via": shown,
+            "restart_requires_privilege": via_exit_fallback,
+            "supervised": supervised,
         })
         .to_string(),
         error: None,
@@ -2095,6 +2148,63 @@ mod tests {
         assert_eq!(identity.tenant_id, "tenant-acme");
         assert_eq!(identity.revision, 1);
         assert!(identity.wparse_applied);
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    /// 没配置生效命令时：`.env` 写了，但必须**明确告诉中心「数据面没生效」**。
+    ///
+    /// 现场教训（2026-10-25）：回执只有 `wparse_applied:false` 时中心什么也不记，
+    /// 页面就停在「已下发」，人只能上机翻 gwlinkd 配置才发现 `wparse_apply_command` 没生效。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_tenant_without_apply_command_reports_not_configured() {
+        let state = temp_state("bind-tenant-no-apply");
+        std::fs::create_dir_all(state.join("sys")).unwrap();
+        std::fs::write(
+            state.join("sys/sys_model.yml"),
+            "name: test\nkind: docker-compose\n",
+        )
+        .unwrap();
+        let work = state.join("data-plane-run/dev");
+        std::fs::create_dir_all(&work).unwrap();
+        let path = state.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "state_dir = \"{}\"\nupgrade_project_dir = \"{}\"\nwparse_work_dir = \"{}\"\n",
+                state.display(),
+                state.display(),
+                work.display()
+            ),
+        )
+        .unwrap();
+        let config = Config::load(&path).expect("config");
+        let command = WparseCommand {
+            command_id: "cmd-2".into(),
+            kind: "bind-tenant".into(),
+            method: String::new(),
+            path: String::new(),
+            body: Some(json!({"tenant_id": "tenant-acme", "revision": 3})),
+            lease_expires_at: "2030-01-01T00:00:00Z".into(),
+        };
+
+        let result = run_bind_tenant(&config, &command, None).await;
+        assert_eq!(result.status_code, 200, "{:?}", result.error);
+        let body: serde_json::Value = serde_json::from_str(&result.body).expect("body");
+        assert_eq!(body["wparse_applied"], false);
+        assert_eq!(body["apply"], "not_configured");
+        assert!(
+            body["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("wparse_apply_command")),
+            "{body}"
+        );
+        // `.env` 仍然写了（下次启动就生效），只是这次还没落到数据面。
+        let env = std::fs::read_to_string(work.join(".env")).unwrap();
+        assert!(env.contains("WIST_TENANT_ID=tenant-acme"));
+        let identity =
+            crate::state::load_business_identity(config.identity_dir()).expect("identity");
+        assert!(!identity.wparse_applied);
         let _ = std::fs::remove_dir_all(state);
     }
 

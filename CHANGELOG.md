@@ -3,6 +3,21 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.17.1-alpha] - 2026-10-25
+
+### 修复
+
+- **「重启 gwlinkd」在 macOS 上静默失效**：system 域 launchd 的 `launchctl kickstart -k` 需要 root，
+  gwlinkd 以普通账号运行 ⇒ 命令必被拒，而旧实现根本不看退出码，回执是 202 / `status=ok`，
+  进程根本没换、配置一直是旧的。现在两件事一起改：
+  - 知道这条路径要权限时**不硬试**，直接自己退出、交给服务定义里的 `KeepAlive` / `Restart=` 拉起
+    （效果等同重启，新进程会重读配置）；
+  - 仍然失败且**不是**由服务管理器托管时，明确记日志报错，不再假装已重启。
+- **绑定「报成功但数据面没生效」现在会说明原因**：`.env` 写了却没有生效命令（
+  `wparse_apply_command` 为空 —— 典型是 `localize` 重渲了 `gwlinkd.toml` 但进程没重启）时，
+  回执从 `apply: pending` 改为 `apply: not_configured` 并带 `reason`，中心能把它写进绑定记录。
+  现场表现是“绑了客户，数据一直带 `unbound`，页面却停在已下发”。
+
 ## [0.17.0-alpha] - 2026-10-25
 
 ### 新增

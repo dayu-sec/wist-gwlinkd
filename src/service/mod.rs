@@ -495,6 +495,34 @@ pub fn restart_commands(platform: ServicePlatform, scope: ServiceScope) -> Vec<S
     }
 }
 
+/// 这条重启命令是否需要**更高权限**才可能成功。
+///
+/// 只有 macOS **system 域** launchd 命中：`launchctl kickstart -k system/<label>` 要 root，
+/// 非 root 调用会被拒（`Operation not permitted`）。而 gwlinkd 本体按服务定义里的 `--run-as`
+/// 以普通账号跑 —— 所以这条路径**必失败**，不该“试一下再看”（2026-10-25 实测：
+/// `restart-gwlinkd` 回执 202 / `status=ok`，进程根本没换，页面却显示已重启）。
+pub fn restart_requires_privilege(platform: ServicePlatform, scope: ServiceScope) -> bool {
+    matches!(platform, ServicePlatform::Launchd)
+        && scope == ServiceScope::System
+        && current_uid() != 0
+}
+
+/// 本进程是否由服务管理器托管（会被拉起），而不是手动 `wist-gwlinkd run`。
+///
+/// 判据是父进程：systemd 与 launchd 都直接 spawn 服务进程，父进程就是 init（pid 1）；
+/// 手动跑时父进程是 shell。**“自己退出让服务管理器拉起”只在托管时安全** ——
+/// 否则等于自杀且无人拉起（配置里明确拒绝过这种情形）。
+pub fn supervised_by_init() -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::getppid() == 1 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 /// 让服务管理器加载并启动服务（幂等）。
 pub fn activate_commands(layout: &ServiceLayout, spec: &ServiceSpec) -> Vec<ServiceCommand> {
     match layout.platform {
@@ -905,6 +933,25 @@ mod tests {
         assert_eq!(
             launchd[0].display_line(),
             "launchctl kickstart -k system/com.dayu-sec.wist-gwlinkd"
+        );
+    }
+
+    /// macOS **system 域** launchd 只有 root 能 kickstart；非 root 调用必被拒。
+    /// 判错这件事的代价很具体：回执说“已重启”，进程根本没换，配置一直是旧的。
+    #[test]
+    fn restart_needs_privilege_only_for_system_launchd() {
+        assert!(!restart_requires_privilege(
+            ServicePlatform::Systemd,
+            ServiceScope::System
+        ));
+        assert!(!restart_requires_privilege(
+            ServicePlatform::Launchd,
+            ServiceScope::User
+        ));
+        // system 域：root 下能直接 kickstart，非 root 必走“自己退出”兜底。
+        assert_eq!(
+            restart_requires_privilege(ServicePlatform::Launchd, ServiceScope::System),
+            current_uid() != 0
         );
     }
 
