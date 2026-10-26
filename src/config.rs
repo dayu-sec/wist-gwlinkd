@@ -115,8 +115,10 @@ pub struct Config {
     /// 或 `data-plane-run/work`。开发态/发布态不同，显式配置最稳。
     #[serde(default)]
     pub wparse_work_dir: Option<PathBuf>,
-    /// `bind-tenant` 生效命令（在系统根用 `sh -c` 执行）：开发态 `./dev/svc.sh restart wparse --no-build`；
-    /// 发布态 `gops run stop && gops run start`。空 = 只写 `.env`，回执 `pending`。
+    /// `bind-tenant` 生效命令（在系统根用 `sh -c` 执行）—— **只决定「怎么做」**：
+    /// 是否生效是指令规则（`bind-tenant` 一定让租户生效）。**不写 / 留空** = 用缺省：
+    /// 开发态 `./dev/svc.sh restart wparse --no-build`，发布态 `<upgrader_program> run stop && run start`。
+    /// 见 [`crate::wparse_env::resolve_apply_action`]。
     #[serde(default)]
     pub wparse_apply_command: Option<String>,
     /// 生效命令超时秒数（缺省 120，上限 300）。
@@ -374,11 +376,12 @@ state_dir = "state"
 # gateway_self_endpoint = "https://127.0.0.1:3000"
 # gateway_self_ca = "identity/public/gateway-ca.crt.pem"
 
-# 可选：业务身份（tenant_id）落地（设计 edge/gateway-business-identity.md）—— 不配就**不会生效**。
+# 可选：业务身份（tenant_id）落地（设计 edge/gateway-business-identity.md）。
 #   wparse_work_dir         wparse 工作根（`.env` 落点）；缺省在系统根下找 `data-plane-run/dev|work`
 #                           （两个并存时会报错，必须显式配）。
-#   wparse_apply_command    写 `.env` 后让它重读：开发态用 `svc.sh`，发布态整栈重启；
-#                           空 = 只写 `.env`（回执 `pending`，永远不会自动生效）。
+#   wparse_apply_command    写 `.env` 后**怎么做**（是否生效是指令规则，不是配置项）。
+#                           **不写 / 留空** → 用缺省（`data-plane-run/dev` + `dev/svc.sh` 就用它，
+#                                  否则 `<upgrader_program> run stop && run start`）；写命令 → 用它。
 # wparse_work_dir = "/opt/wist-gateway-stack/data-plane-run/work"
 # wparse_apply_command = "gops run stop && gops run start"
 # wparse_apply_timeout_seconds = 120

@@ -3,6 +3,39 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.18.0-alpha] - 2026-10-26
+
+### 新增
+
+- **绑定客户的「生效动作」有缺省了**：不写 `wparse_apply_command` 也能生效 —— 以前这一条漏配，
+  现场就是「绑定成功、`.env` 已写、数据面一直带 `unbound`」，而人得先发现配置缺失再去补。
+  现在按**工作根的形态**推断：
+  - 开发态（`<栈根>/data-plane-run/dev` + 栈根带 `dev/svc.sh`）→ `./dev/svc.sh restart wparse --no-build`
+    （wparse 是宿主进程，用 gops 会在旁边多起一套容器，必须避开）；
+  - 发布态（`<栈根>/data-plane-run/work`）→ `<upgrader_program> run stop && run start`
+    （与栈模板同口径：整栈重启已确认可接受）。
+
+  显式配置仍然优先（想只重启 wparse、或换成站点脚本，照常写）。
+  注意：**「是否生效」不是配置项** —— `bind-tenant` 的语义就是让租户生效，所以它一定会跑
+  生效动作；`wparse_apply_command` 只决定**怎么做**（不写 / 留空 = 用缺省）。
+
+### 变更
+
+- 生效动作是**缺省推出来的**时候，任务日志会多一条 `bind.apply_default`（服务日志里对应
+  `TenantBindingApplyDefault`）—— 排查时能分清「配置里写的」和「gwlinkd 自己选的」。
+- 推不出生效动作（工作根不在 `<栈根>/data-plane-run/{dev,work}` 布局下、又没有工程根）时，
+  回执原因从笼统的「未配置 wparse_apply_command」改为写明**为什么**，
+  `.env` 仍照写（补上配置 / 重启后仍会收敛）。
+
+### 升级注意
+
+- **`wparse_apply_command` 留空不再表示「不生效」**：0.17 把 `=""` 当「只写 `.env`、
+  不重启」；0.18 起**是否生效由指令规则决定**（`bind-tenant` 一定生效），这条配置只决定
+  “怎么做” —— **不写 / 留空 = 用缺省**（发布态整栈 `stop && start`）。启动时会打一条
+  `event=WparseApplyCommandBlank` 提醒旧写法。
+- 如果某个现场确实不希望数据面因绑定而重启，应在**指令层**解决（不下发绑定 / 换用别的指令），
+  不要用配置关掉生效 —— 那会让“绑定成功”与“数据面真的生效”再次脱节。
+
 ## [0.17.1-alpha] - 2026-10-25
 
 ### 修复

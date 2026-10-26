@@ -397,6 +397,17 @@ async fn run(
     // 否则后续周期（上报 / 续期 / 升级）仍用**旧 gateway_id**，中心按客户端证书认人 → `certificate_mismatch`。
     let reloaded = Config::load(path).conv_err()?;
     let config: &Config = &reloaded;
+    // 0.17 曾把 `wparse_apply_command = ""` 当「不自动重启」；现在「是否生效」是指令规则，
+    // 配置只决定「怎么做」—— 留空 = 用缺省。旧写法会静默变成“会重启”，必须提醒一次。
+    if config
+        .wparse_apply_command
+        .as_deref()
+        .is_some_and(|raw| raw.trim().is_empty())
+    {
+        log::warn!(
+            "event=WparseApplyCommandBlank（留空不再表示「不生效」：bind-tenant 一定让数据面生效；这条配置只决定「怎么做」，请写具体命令或删掉这一行）"
+        );
+    }
     // 启动补偿：上次若只落了业务身份、没来得及写 `.env` / 重启 wparse，这里补一次。
     wist_gwlinkd::wparse_relay::reconcile_business_identity(config).await;
     let trust_bundle = config.trust_bundle.clone();

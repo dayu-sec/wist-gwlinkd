@@ -133,6 +133,19 @@ diagnose_timeout_seconds = 120                     # 体检超时（秒，上限
 restart_timeout_seconds = 120                      # 「重启 gateway」每个步骤的超时（秒，上限 300）
 ```
 
+### 控制指令一览（指令 → 做什么）
+
+**「做什么」由指令种类决定，不是配置项**（配置只提供「怎么做」：生效命令 / 执行器 / 超时 / 目录）。
+未知 `kind` 一律 **400**，不静默成功。
+
+| kind | gwlinkd 做什么 | 碰数据面重载吗 |
+| --- | --- | --- |
+| `bind-tenant` | 校验 revision / tag-safe → 落 `business-identity.json` → 合并写 `<工作根>/.env` → 跑生效动作（`wparse_apply_command`；不写/留空用缺省） | **会**（指令语义就是“让租户生效”，配置关不掉） |
+| `restart-gateway` | 系统根依次 `gops run stop` → `gops run start` | 会（进程级） |
+| `restart-gwlinkd` | 先回执，`sleep 2s` 后重启自己（服务管理器） | 不涉及 |
+| `diagnose` | 系统根跑 `gops run diagnose --json` | 不涉及 |
+| `proxy`（缺省 kind，如 `reloads/model`） | 按白名单原样转发给 wparse 管理面 | 不重启：wparse 自己热加载 |
+
 ### 「体检」控制命令（`kind = diagnose`）
 
 中心管理面 `POST /api/v1/admin/gateways/{id}/diagnose` 入队一条 `kind=diagnose` 的命令；

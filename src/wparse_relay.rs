@@ -413,6 +413,12 @@ async fn execute(
 ///
 /// 目前有 `diagnose` / `restart-gateway` / `restart-gwlinkd` / `bind-tenant`。未知 kind 一律**明确失败**
 /// （而不是静默当成功）—— 中心派了新命令但本机 gwlinkd 太旧时，要让人能从回执里看出来。
+///
+/// **指令规则**：「是否让数据面生效」是**指令的语义**，不是配置项：
+/// - `bind-tenant` 的语义就是「让这个租户生效」⇒ 一定写 `.env` 并跑生效动作；
+///   `wparse_apply_command` 只能决定**怎么做**（重启方式），关不掉它。
+/// - 其它指令不碰数据面重载：`proxy` 类（如 `reloads/model`）由 wparse 自己热加载，
+///   `restart-*` 只管进程生命周期。
 async fn execute_control(
     config: &Config,
     command: &WparseCommand,
@@ -541,9 +547,7 @@ async fn run_bind_tenant(
         }
     }
     match apply_business_identity(config, &tenant_id, payload.revision, task).await {
-        ApplyOutcome::Done {
-            wparse_applied: true,
-        } => UpstreamResult {
+        ApplyOutcome::Applied => UpstreamResult {
             status_code: 200,
             body: json!({
                 "tenant_id": tenant_id,
@@ -553,14 +557,10 @@ async fn run_bind_tenant(
             .to_string(),
             error: None,
         },
-        ApplyOutcome::Done {
-            wparse_applied: false,
-        } => {
-            // `Done{wparse_applied:false}` 只有一个来源：**没配置生效命令**（`apply_plan` 为空），
-            // 即 `.env` 已写、身份已落盘，但 wparse 不会重启 —— 数据面仍是旧租户。
+        ApplyOutcome::NotApplied { reason } => {
+            // `.env` 已写、身份已落盘，但这次没生效（`reason` 说明为什么）。
             // 必须把这层意思带给中心：否则回执看着是成功，页面只会停在“已下发”，
             // 而现场已经出现过“绑了但数据一直带 unbound”（2026-10-25）。
-            let reason = "gwlinkd 未配置 wparse_apply_command：.env 已写，但 wparse 没重启，数据面仍是旧租户";
             let mut body = json!({
                 "tenant_id": tenant_id,
                 "revision": payload.revision,
@@ -568,7 +568,7 @@ async fn run_bind_tenant(
                 "apply": "not_configured",
             });
             body["reason"] = json!(reason);
-            record_event(task, "bind.not_applied", reason);
+            record_event(task, "bind.not_applied", &reason);
             UpstreamResult {
                 status_code: 200,
                 body: body.to_string(),
@@ -590,14 +590,15 @@ async fn run_bind_tenant(
 
 /// 应用业务身份的结果：**命令回执**与**状态回执补偿**共用同一条路径。
 enum ApplyOutcome {
-    /// `.env` 已写 + 身份已落盘；`wparse_applied` = 生效命令是否跑成功
-    /// （未配置生效命令 → false，等下次启动 / 人工重启）。
-    Done { wparse_applied: bool },
+    /// `.env` 已写 + 身份已落盘 + 生效命令跑成功。
+    Applied,
+    /// `.env` 已写 + 身份已落盘，但这次没生效（附原因，回执要带给中心）。
+    NotApplied { reason: String },
     /// 失败；`status` 用作命令回执的 HTTP 状态码。
     Failed { status: u16, error: String },
 }
 
-/// 落 `business-identity.json` → 写 `<工作根>/.env` →（配置了才）跑生效命令。
+/// 落 `business-identity.json` → 写 `<工作根>/.env` → 跑生效动作（显式配置或推出来的缺省）。
 ///
 /// 顺序有意为**身份先、`.env` 后**（与设计 §8.2 一致）：`.env` 写失败时本地仍是
 /// 「未生效」，不会出现「数据面已是新租户、身份文件还是旧值」的错位（那会被中心判成漂移，
@@ -620,7 +621,7 @@ async fn apply_business_identity(
         record_event(task, "bind.rejected", &error);
         return ApplyOutcome::Failed { status: 400, error };
     }
-    // 先把**两条路径**都解析出来：配置类错误（未配工程根 / 多系统歧义 / 工作根不存在）
+    // 先把**工作根**解析出来：配置类错误（未配工程根 / 多系统歧义 / 工作根不存在）
     // 必须在动盘之前失败，否则会「已落盘但这个错永远重试」。
     let work_dir = match crate::wparse_env::resolve_work_dir(config) {
         Ok(dir) => dir,
@@ -632,17 +633,10 @@ async fn apply_business_identity(
             };
         }
     };
-    let apply_plan = match crate::wparse_env::apply_command(config) {
-        Some(command) => match control_workdir(config) {
-            Ok(dir) => Some((command.to_string(), dir)),
-            Err(error) => {
-                let error = format!("生效命令缺少系统根：{error}");
-                record_event(task, "bind.apply_failed", &error);
-                return ApplyOutcome::Failed { status: 500, error };
-            }
-        },
-        None => None,
-    };
+    // 生效动作：没配也能推（缺省见 `wparse_env::resolve_apply_action`）。
+    // 推不出来**不是**配置错误：`.env` 照写（下次启动 / 补配置后就生效），
+    // 这次只回执「没生效 + 原因」。
+    let apply_action = crate::wparse_env::resolve_apply_action(config, &work_dir);
     let mut identity = state::BusinessIdentity {
         tenant_id: tenant_id.to_string(),
         revision,
@@ -673,19 +667,28 @@ async fn apply_business_identity(
         "event=TenantBindingStored tenant_id={tenant_id} revision={revision} env={}",
         work_dir.join(crate::wparse_env::ENV_FILE).display()
     );
-    let Some((apply_command, apply_dir)) = apply_plan else {
-        return ApplyOutcome::Done {
-            wparse_applied: false,
-        };
+    let action = match apply_action {
+        Ok(action) => action,
+        Err(reason) => {
+            record_event(task, "bind.not_applied", &reason);
+            return ApplyOutcome::NotApplied { reason };
+        }
     };
+    if action.defaulted {
+        record_event(
+            task,
+            "bind.apply_default",
+            &format!("{}（cwd={}）", action.command, action.dir.display()),
+        );
+    }
     record_event(
         task,
         "bind.apply",
-        &format!("{apply_command}（cwd={}）", apply_dir.display()),
+        &format!("{}（cwd={}）", action.command, action.dir.display()),
     );
     match run_shell(
-        &apply_command,
-        &apply_dir,
+        &action.command,
+        &action.dir,
         crate::wparse_env::apply_timeout(config),
     )
     .await
@@ -696,9 +699,7 @@ async fn apply_business_identity(
                 log::warn!("event=TenantBindingFlagPersistFailed error={err}");
             }
             record_event(task, "bind.applied", &format!("tenant_id={tenant_id}"));
-            ApplyOutcome::Done {
-                wparse_applied: true,
-            }
+            ApplyOutcome::Applied
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -753,7 +754,11 @@ async fn compensate_desired_identity(
     let Some(desired) = desired else {
         return;
     };
-    let can_apply = crate::wparse_env::apply_command(config).is_some();
+    // 「能不能生效」看的是**推出来的动作**，不是配置里有没有写
+    // —— 缺省生效命令也算（否则没写配置的现场永远不重试）。
+    let can_apply = crate::wparse_env::resolve_work_dir(config)
+        .map(|work_dir| crate::wparse_env::resolve_apply_action(config, &work_dir).is_ok())
+        .unwrap_or(false);
     let local = state::load_business_identity(config.identity_dir());
     if !needs_business_apply(local.as_ref(), &desired, can_apply) {
         return;
@@ -773,8 +778,13 @@ async fn compensate_desired_identity(
         local.as_ref().map(|identity| identity.revision)
     );
     match apply_business_identity(config, &desired.tenant_id, desired.revision, None).await {
-        ApplyOutcome::Done { wparse_applied } => log::info!(
-            "event=TenantBindingCompensated tenant_id={} revision={} wparse_applied={wparse_applied}",
+        ApplyOutcome::Applied => log::info!(
+            "event=TenantBindingCompensated tenant_id={} revision={}",
+            desired.tenant_id,
+            desired.revision
+        ),
+        ApplyOutcome::NotApplied { reason } => log::info!(
+            "event=TenantBindingCompensatePending tenant_id={} revision={} reason={reason}",
             desired.tenant_id,
             desired.revision
         ),
@@ -831,24 +841,27 @@ pub async fn reconcile_business_identity(config: &Config) {
         log::warn!("event=TenantBindingReconcileEnvFailed error={error}");
         return;
     }
-    let Some(apply_command) = crate::wparse_env::apply_command(config) else {
-        log::info!(
-            "event=TenantBindingReconcilePending tenant_id={} revision={}（未配置生效命令）",
-            identity.tenant_id,
-            identity.revision
-        );
-        return;
-    };
-    let dir = match control_workdir(config) {
-        Ok(dir) => dir,
-        Err(error) => {
-            log::warn!("event=TenantBindingReconcileSkipped error={error}");
+    let action = match crate::wparse_env::resolve_apply_action(config, &work_dir) {
+        Ok(action) => action,
+        Err(reason) => {
+            log::info!(
+                "event=TenantBindingReconcilePending tenant_id={} revision={} reason={reason}",
+                identity.tenant_id,
+                identity.revision
+            );
             return;
         }
     };
+    if action.defaulted {
+        log::info!(
+            "event=TenantBindingApplyDefault command={} cwd={}",
+            action.command,
+            action.dir.display()
+        );
+    }
     match run_shell(
-        apply_command,
-        &dir,
+        &action.command,
+        &action.dir,
         crate::wparse_env::apply_timeout(config),
     )
     .await
@@ -2151,28 +2164,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(state);
     }
 
-    /// 没配置生效命令时：`.env` 写了，但必须**明确告诉中心「数据面没生效」**。
+    /// 没配置生效命令、也推不出缺省时：`.env` 写了，但必须**明确告诉中心「数据面没生效」**。
     ///
     /// 现场教训（2026-10-25）：回执只有 `wparse_applied:false` 时中心什么也不记，
-    /// 页面就停在「已下发」，人只能上机翻 gwlinkd 配置才发现 `wparse_apply_command` 没生效。
+    /// 页面就停在「已下发」，人只能上机翻 gwlinkd 配置才发现生效动作没跑。
     #[cfg(unix)]
     #[tokio::test]
     async fn bind_tenant_without_apply_command_reports_not_configured() {
         let state = temp_state("bind-tenant-no-apply");
-        std::fs::create_dir_all(state.join("sys")).unwrap();
-        std::fs::write(
-            state.join("sys/sys_model.yml"),
-            "name: test\nkind: docker-compose\n",
-        )
-        .unwrap();
-        let work = state.join("data-plane-run/dev");
+        // 工作根刻意不在 `<系统根>/data-plane-run/{dev,work}` 布局下，且没有工程根：
+        // 缺省推不出来 —— 这是唯一该走到 `not_configured` 的形态。
+        let work = state.join("work-elsewhere");
         std::fs::create_dir_all(&work).unwrap();
         let path = state.join("gwlinkd.toml");
         std::fs::write(
             &path,
             format!(
-                "state_dir = \"{}\"\nupgrade_project_dir = \"{}\"\nwparse_work_dir = \"{}\"\n",
-                state.display(),
+                "state_dir = \"{}\"\nwparse_work_dir = \"{}\"\n",
                 state.display(),
                 work.display()
             ),
@@ -2205,6 +2213,121 @@ mod tests {
         let identity =
             crate::state::load_business_identity(config.identity_dir()).expect("identity");
         assert!(!identity.wparse_applied);
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    /// 一条配置都不写时也要真的生效：开发态缺省用栈根的 `dev/svc.sh`。
+    ///
+    /// 现场教训（2026-10-26）：让「生效」只依赖一条手写配置，等于把绑定客户的成败
+    /// 挂在一次 `localize` + 一次重启上；缺省必须能从现场自己推得出来。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_tenant_defaults_to_svc_sh_in_the_dev_layout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = temp_state("bind-tenant-default-dev");
+        std::fs::create_dir_all(state.join("sys")).unwrap();
+        std::fs::write(
+            state.join("sys/sys_model.yml"),
+            "name: test\nkind: docker-compose\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(state.join("dev")).unwrap();
+        let marker = state.join("svc-args");
+        std::fs::write(
+            state.join("dev/svc.sh"),
+            format!("#!/bin/sh\nprintf '%s' \"$*\" > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            state.join("dev/svc.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let work = state.join("data-plane-run/dev");
+        std::fs::create_dir_all(&work).unwrap();
+        // 只配 state_dir 与工作根：生效命令靠缺省。
+        let path = state.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "state_dir = \"{}\"\nwparse_work_dir = \"{}\"\n",
+                state.display(),
+                work.display()
+            ),
+        )
+        .unwrap();
+        let config = Config::load(&path).expect("config");
+        let command = WparseCommand {
+            command_id: "cmd-default".into(),
+            kind: "bind-tenant".into(),
+            method: String::new(),
+            path: String::new(),
+            body: Some(json!({"tenant_id": "tenant-acme", "revision": 1})),
+            lease_expires_at: "2030-01-01T00:00:00Z".into(),
+        };
+
+        let result = run_bind_tenant(&config, &command, None).await;
+        assert_eq!(result.status_code, 200, "{:?}", result.error);
+        let body: serde_json::Value = serde_json::from_str(&result.body).expect("body");
+        assert_eq!(body["wparse_applied"], true, "{body}");
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("缺省生效动作没跑"),
+            "restart wparse --no-build"
+        );
+        let env = std::fs::read_to_string(work.join(".env")).unwrap();
+        assert!(env.contains("WIST_TENANT_ID=tenant-acme"));
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    /// 发布态缺省也要真的执行（不只是算出字符串）：`stop` 与 `start` 两段都要跑到，
+    /// 且 cwd 是**从工作根反推的系统根**（gops 从 cwd 解析系统）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_tenant_defaults_to_the_stack_restart_in_the_release_layout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = temp_state("bind-tenant-default-release");
+        std::fs::create_dir_all(state.join("sys")).unwrap();
+        std::fs::write(
+            state.join("sys/sys_model.yml"),
+            "name: test\nkind: docker-compose\n",
+        )
+        .unwrap();
+        let work = state.join("data-plane-run/work");
+        std::fs::create_dir_all(&work).unwrap();
+        // 假执行器：记下每次调用的参数，兼验证 cwd（落文件时用相对路径）。
+        let program = state.join("fake-gops");
+        std::fs::write(&program, "#!/bin/sh\necho \"$*\" >> calls.log\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = state.join("gwlinkd.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "state_dir = \"{}\"\nwparse_work_dir = \"{}\"\nupgrader_program = \"{}\"\n",
+                state.display(),
+                work.display(),
+                program.display()
+            ),
+        )
+        .unwrap();
+        let config = Config::load(&path).expect("config");
+        let command = WparseCommand {
+            command_id: "cmd-default-release".into(),
+            kind: "bind-tenant".into(),
+            method: String::new(),
+            path: String::new(),
+            body: Some(json!({"tenant_id": "tenant-acme", "revision": 2})),
+            lease_expires_at: "2030-01-01T00:00:00Z".into(),
+        };
+
+        let result = run_bind_tenant(&config, &command, None).await;
+        assert_eq!(result.status_code, 200, "{:?}", result.error);
+        let body: serde_json::Value = serde_json::from_str(&result.body).expect("body");
+        assert_eq!(body["wparse_applied"], true, "{body}");
+        let calls = std::fs::read_to_string(state.join("calls.log"))
+            .expect("cwd 不对：假执行器没在系统根落文件");
+        assert_eq!(calls, "run stop\nrun start\n", "{calls}");
         let _ = std::fs::remove_dir_all(state);
     }
 
