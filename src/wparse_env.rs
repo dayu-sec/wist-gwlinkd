@@ -2,7 +2,8 @@
 //!
 //! 设计 `wist-design/doc/design/edge/gateway-business-identity.md`：
 //! - wparse 从**工作根**的 `.env` 读取 `${WIST_TENANT_ID}`（已实测，按 work-root 解析）；
-//! - 该文件不是密钥，权限 `0644`；只合并这一个键，保留现场其它键；
+//! - 该文件不是密钥；模式按**挂载策略**（读写 `0660` / 只读 `0640`，与 `gops sys perms`
+//!   同口径）—— 写死 `0644` 会让 `gops run start` 判待修并拒启；只合并这一个键，保留现场其它键；
 //! - 写入后需让 wparse 重新读取（开发态 `svc.sh restart`、发布态 `gops run stop/start`；
 //!   都没配也能推出来，见 [`resolve_apply_action`]）。
 //!
@@ -85,9 +86,13 @@ pub fn write_tenant_id(work_dir: &Path, tenant_id: &str) -> Result<PathBuf, Stri
         drop(file);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            // 不是密钥：wparse 容器用户（uid 999）必须能读。失败要报，不能吞。
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))
+            // 模式跟**挂载策略**走，不写死：`.env` 落在 bind 挂载里，模式必须满足
+            // `gops sys perms` 的契约（读写 0660 / 只读 0640），否则 `gops run start`
+            // 的前置会判待修并拒启 —— 那会让「绑定客户」把整栈停在停止态。
+            // 工作根是 setgid 目录，文件组仍是容器 gid，0660/0640 对 wparse(999) 均可读。
+            let (_, file_mode) = crate::host_mode::mount_policy(work_dir)
+                .map_err(|err| format!("判定 .env 挂载策略失败 {}: {err}", work_dir.display()))?;
+            crate::host_mode::set_mode(&tmp, file_mode)
                 .map_err(|err| format!("设置 .env 权限失败 {}: {err}", tmp.display()))?;
         }
         Ok(())
@@ -114,6 +119,46 @@ fn ensure_regular_file(path: &Path) -> Result<(), String> {
             path.display()
         )),
         _ => Ok(()),
+    }
+}
+
+/// 把**已存在** `.env` 的模式对齐到挂载策略（内容不动、不触发重启）。
+///
+/// 为什么需要：老版本把 `.env` 写死 `0644`，文件一旦落下就不会自己变好 —— 而
+/// `gops run start` 的前置按模式判待修，会把**整个栈**挡在停止态。写入路径只在新绑定 /
+/// 值漂移时才跑，所以启动自检这里顺手收一次（与 0.18.1 交付包「顺手对齐旧文件」同一思路）。
+///
+/// 返回是否真的改了模式（供调用方记日志）。
+pub fn align_env_mode(work_dir: &Path) -> Result<bool, String> {
+    let path = work_dir.join(ENV_FILE);
+    // 不跟符号链接：工作根对容器可写，跟着改会变成「让 gwlinkd chmod 任意本用户可写的文件」。
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => meta,
+        Ok(_) => {
+            return Err(format!(
+                "{} 不是普通文件（可能是符号链接），拒绝调整",
+                path.display()
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("读 {} 失败：{err}", path.display())),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let (_, file_mode) = crate::host_mode::mount_policy(work_dir)
+            .map_err(|err| format!("判定 .env 挂载策略失败 {}: {err}", work_dir.display()))?;
+        if meta.permissions().mode() & 0o7777 == file_mode {
+            return Ok(false);
+        }
+        crate::host_mode::set_mode(&path, file_mode)
+            .map_err(|err| format!("对齐 .env 权限失败 {}: {err}", path.display()))?;
+        Ok(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        Ok(false)
     }
 }
 
@@ -478,6 +523,78 @@ mod tests {
         assert!(write_tenant_id(&dir, "a\nWP_SINK=evil").is_err());
         assert!(!dir.join(ENV_FILE).exists(), "被拒的值不该落盘");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `.env` 的模式必须跟挂载策略一致：写死 `0644` 会让 `gops run start` 的
+    /// perms preflight 判待修并拒启（曾经的整栈停机就是这个）。
+    #[cfg(unix)]
+    #[test]
+    fn write_tenant_id_aligns_env_mode_with_mount_policy() {
+        use std::os::unix::fs::PermissionsExt;
+        fn mode_of(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+        }
+
+        // 读写挂载（setgid + 组可写）→ 0660
+        let rw = temp_work_dir("mode-rw");
+        std::fs::set_permissions(&rw, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        let path = write_tenant_id(&rw, "tenant-a").expect("write");
+        assert_eq!(mode_of(&path), 0o660, "读写挂载的 .env 必须是 0660");
+        let _ = std::fs::remove_dir_all(&rw);
+
+        // 只读挂载 → 0640
+        let ro = temp_work_dir("mode-ro");
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o2750)).unwrap();
+        let path = write_tenant_id(&ro, "tenant-a").expect("write");
+        assert_eq!(mode_of(&path), 0o640, "只读挂载的 .env 必须是 0640");
+        let _ = std::fs::remove_dir_all(&ro);
+    }
+
+    /// 老版本落下的 `0644` 要能在启动自检里被顺手收回（内容不动、幂等）。
+    #[cfg(unix)]
+    #[test]
+    fn align_env_mode_fixes_a_legacy_0644_env() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_work_dir("align");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        let path = dir.join(ENV_FILE);
+        std::fs::write(&path, "WIST_TENANT_ID=tenant-a\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            align_env_mode(&dir).expect("align"),
+            "0644 → 0660 应报告改动"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o660
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "WIST_TENANT_ID=tenant-a\n",
+            "只改模式，不能动内容"
+        );
+        assert!(!align_env_mode(&dir).expect("align again"), "已对齐则幂等");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 符号链接一律拒绝调整（不能跟着改到目标文件）。
+    #[cfg(unix)]
+    #[test]
+    fn align_env_mode_refuses_a_symlinked_env() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = temp_work_dir("align-symlink");
+        let target = dir.join("credential.json");
+        std::fs::write(&target, "SECRET=1\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, dir.join(ENV_FILE)).unwrap();
+        assert!(align_env_mode(&dir).is_err());
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o600,
+            "不能改到链接目标"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

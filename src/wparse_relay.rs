@@ -812,6 +812,16 @@ pub async fn reconcile_business_identity(config: &Config) {
             return;
         }
     };
+    // 老现场可能留着 `0644` 的 `.env`（老版本写死的）：内容不变也要把模式收回来，
+    // 否则 `gops run start` 会一直判待修、整栈起不来。只改模式，不重写内容、不重启数据面。
+    match crate::wparse_env::align_env_mode(&work_dir) {
+        Ok(true) => log::info!(
+            "event=TenantBindingEnvModeAligned env={}",
+            work_dir.join(crate::wparse_env::ENV_FILE).display()
+        ),
+        Ok(false) => {}
+        Err(error) => log::warn!("event=TenantBindingEnvModeAlignFailed error={error}"),
+    }
     let env_matches = std::fs::read_to_string(work_dir.join(crate::wparse_env::ENV_FILE))
         .map(|text| {
             crate::wparse_env::env_has_value(

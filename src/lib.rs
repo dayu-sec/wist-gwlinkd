@@ -17,6 +17,7 @@ pub mod deps;
 pub mod doctor;
 pub mod error;
 pub mod executor;
+pub mod host_mode;
 pub mod identity;
 pub mod knowledge_package;
 pub mod link_request;

@@ -19,6 +19,7 @@ use wist_gwlinkd::error::{
     OpLoggable, StateReason, chain_one_line, logged_op,
 };
 use wist_gwlinkd::executor::{DEFAULT_ON_FAILURE, DEFAULT_UPGRADER_PROGRAM, GopsExecutor};
+use wist_gwlinkd::host_mode::{mount_policy, set_mode};
 use wist_gwlinkd::identity;
 use wist_gwlinkd::knowledge_package::KnowledgePackageClient;
 use wist_gwlinkd::link_request::LinkRequestClient;
@@ -1329,7 +1330,12 @@ async fn deliver_knowledge_package(
         }
 
         let filename = safe_artifact_filename_with(&artifact_url, GwlinkdReason::KnowledgePackage)?;
-        write_drop_file(drop_dir, &filename, bytes).await?;
+        write_drop_file(drop_dir, &filename, bytes)
+            .await
+            .source_err(
+                GwlinkdReason::KnowledgePackage,
+                format!("写投放文件失败 {}", drop_dir.join(&filename).display()),
+            )?;
 
         // 签名旁文件：`<来源>.sig`（发布侧同名）。取不到不阻断，只记日志。
         let signature_url = format!("{artifact_url}.sig");
@@ -1342,7 +1348,15 @@ async fn deliver_knowledge_package(
         .await
         {
             Ok(signature) => {
-                write_drop_file(drop_dir, &format!("{filename}.sig"), signature).await?;
+                write_drop_file(drop_dir, &format!("{filename}.sig"), signature)
+                    .await
+                    .source_err(
+                        GwlinkdReason::KnowledgePackage,
+                        format!(
+                            "写签名旁文件失败 {}",
+                            drop_dir.join(format!("{filename}.sig")).display()
+                        ),
+                    )?;
             }
             // 已存在的旧 `.sig` 必须删掉：否则网关会拿上一版的签名去验这一版
             // （验签失败的报错会指向签名，而不是「这次没取到签名」）。
@@ -1372,28 +1386,78 @@ async fn deliver_knowledge_package(
 }
 
 /// 把一个交付文件落到投放目录：先写 `<name>.partial` 再改名，避免半截文件被网关读到。
-async fn write_drop_file(dir: &Path, filename: &str, bytes: Vec<u8>) -> GwlinkdResult<()> {
+///
+/// **模式必须自己设**（与 `gops sys perms` 同口径）：`std::fs::write` 出来是 `0644`，
+/// `create_dir_all` 出来是 `0755`，而 `packages/` 对网关是**只读**挂载（期望 文件 `0640` / 目录 `2750`）。
+/// 不设的后果不是“多一条告警”：`gops run start` 的前置见到待修项就**拒绝启动** ——
+/// 2026-10-26 现场就是交付的知识库包 `0644` 让生效命令 `exit 255`、整栈停在停止态。
+async fn write_drop_file(dir: &Path, filename: &str, bytes: Vec<u8>) -> std::io::Result<()> {
     let write_dir = dir.to_path_buf();
     let target = dir.join(filename);
-    tokio::task::spawn_blocking(move || -> GwlinkdResult<()> {
-        std::fs::create_dir_all(&write_dir).source_err(
-            GwlinkdReason::KnowledgePackage,
-            format!("建投放目录失败 {}", write_dir.display()),
-        )?;
-        let partial = partial_path(&target);
-        std::fs::write(&partial, &bytes).source_err(
-            GwlinkdReason::KnowledgePackage,
-            format!("写投放文件失败 {}", partial.display()),
-        )?;
-        std::fs::rename(&partial, &target).source_err(
-            GwlinkdReason::KnowledgePackage,
-            format!("落盘投放文件失败 {}", target.display()),
-        )
-    })
-    .await
-    .map_err(|err| GwlinkdReason::KnowledgePackage.err(format!("投放任务异常: {err}")))??;
-    Ok(())
+    tokio::task::spawn_blocking(move || write_drop_blocking(&write_dir, &target, &bytes))
+        .await
+        .map_err(|err| std::io::Error::other(format!("投放任务异常: {err}")))?
 }
+
+/// [`write_drop_file`] 的同步内核（单测直接调）。
+fn write_drop_blocking(dir: &Path, target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // 策略必须在**建目录之前**判定：`create_dir_all` 出来的模式受运行 umask 影响
+    // （022 → 0755、002 → 0775），拿它当信号会把只读挂载误判成读写。
+    let (dir_mode, file_mode) = mount_policy(dir)
+        .map_err(|err| io_context(err, format!("判定投放目录策略失败 {}", dir.display())))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|err| io_context(err, format!("建投放目录失败 {}", dir.display())))?;
+    set_mode(dir, dir_mode)
+        .map_err(|err| io_context(err, format!("对齐投放目录权限失败 {}", dir.display())))?;
+    align_existing_drop_files(dir, file_mode);
+    let partial = partial_path(target);
+    std::fs::write(&partial, bytes)
+        .map_err(|err| io_context(err, format!("写临时文件失败 {}", partial.display())))?;
+    set_mode(&partial, file_mode)
+        .map_err(|err| io_context(err, format!("对齐投放文件权限失败 {}", partial.display())))?;
+    std::fs::rename(&partial, target)
+        .map_err(|err| io_context(err, format!("落盘投放文件失败 {}", target.display())))
+}
+
+/// 给 `io::Error` 补一层“哪一步失败”的上下文（回报里能直接看出是目录还是文件）。
+fn io_context(err: std::io::Error, what: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(err.kind(), format!("{}: {err}", what.into()))
+}
+
+/// 顺手对齐投放目录里**已存在**的普通文件（老版本落下的 `0644` 不会自己变好）。
+///
+/// 只改模式、失败只告警：交付本身不应该因为“收拾旧文件”而失败。
+#[cfg(unix)]
+fn align_existing_drop_files(dir: &Path, file_mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        // `file_type()` 不跟符号链接：不把投放目录里被植入的链接当成文件去改模式。
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.permissions().mode() & 0o7777 == file_mode {
+            continue;
+        }
+        let path = entry.path();
+        if let Err(err) = set_mode(&path, file_mode) {
+            log::warn!(
+                "event=AgentPackageDropAlignSkip path={} error={}",
+                path.display(),
+                chain_one_line(&err)
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn align_existing_drop_files(_dir: &Path, _file_mode: u32) {}
 
 /// 目标平台集合（发布 ②）：优先契约的 `artifacts`（**多平台**，中心给该版本全部平台）；
 /// 为空时回落到单值 `artifact_url` + 摘要 + **本机平台**（旧中心 / ① 语义，兼容）。
@@ -1499,26 +1563,14 @@ async fn deliver_agent_package(
             // 安全文件名（防 `..` / 控制字符把落点带出投放目录）+ **平台限定**（同版本多平台可能同名制品）。
             let filename = platform_drop_filename(platform, artifact_url)?;
             // 落到宿主投放目录（网关容器只读挂载同一份）：先写临时再改名，避免半截文件被读。
+            // 模式对齐在 `write_drop_file` 里做（`0640/2750`）—— 否则 `gops run start` 会拒绝启动。
             let drop_path = drop_dir.join(&filename);
-            let write_dir = drop_dir.to_path_buf();
-            let write_target = drop_path.clone();
-            tokio::task::spawn_blocking(move || -> GwlinkdResult<()> {
-                std::fs::create_dir_all(&write_dir).source_err(
+            write_drop_file(drop_dir, &filename, bytes)
+                .await
+                .source_err(
                     GwlinkdReason::AgentPackage,
-                    format!("建投放目录失败 {}", write_dir.display()),
+                    format!("写投放文件失败 {}", drop_path.display()),
                 )?;
-                let partial = partial_path(&write_target);
-                std::fs::write(&partial, &bytes).source_err(
-                    GwlinkdReason::AgentPackage,
-                    format!("写投放文件失败 {}", partial.display()),
-                )?;
-                std::fs::rename(&partial, &write_target).source_err(
-                    GwlinkdReason::AgentPackage,
-                    format!("落盘投放文件失败 {}", write_target.display()),
-                )
-            })
-            .await
-            .map_err(|err| GwlinkdReason::AgentPackage.err(format!("投放任务异常: {err}")))??;
 
             let container_path = format!("{}/{}", container_dir.trim_end_matches('/'), filename);
             delivered.push((
@@ -4522,6 +4574,84 @@ mod tests {
             partial_path(std::path::Path::new("/drop/pkg.tar.gz")),
             std::path::PathBuf::from("/drop/pkg.tar.gz.partial")
         );
+    }
+
+    /// 交付落盘必须对齐 `gops sys perms`：只读挂载 → 目录 `2750`、文件 `0640`。
+    ///
+    /// 不对齐的后果不是告警：`gops run start` 的前置见到待修项就拒绝启动
+    /// （2026-10-26 现场：交付的知识库包 `0644` → 生效命令 exit 255、整栈停在停止态）。
+    #[cfg(unix)]
+    #[test]
+    fn drop_files_follow_the_read_only_perms_contract() {
+        use std::os::unix::fs::PermissionsExt;
+        fn mode(path: &std::path::Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+        }
+
+        let dir = temp_dir("drop-modes-ro").join("packages").join("agents");
+        let target = dir.join("wist-knowledge-0.5.5.tar.gz");
+        write_drop_blocking(&dir, &target, b"x").expect("write");
+
+        assert_eq!(
+            mode(&dir),
+            0o2750,
+            "只读挂载的目录要 2750（setgid + 组可读）"
+        );
+        assert_eq!(mode(&target), 0o640, "只读挂载的文件要 0640");
+    }
+
+    /// 现场已按**读写**挂载对齐过（目录组可写）时跟随 `2770/0660`，不要每次交付又改回去。
+    #[cfg(unix)]
+    #[test]
+    fn drop_files_follow_a_read_write_mount() {
+        use std::os::unix::fs::PermissionsExt;
+        fn mode(path: &std::path::Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+        }
+
+        let dir = temp_dir("drop-modes-rw").join("packages");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2770)).expect("chmod");
+        let target = dir.join("pkg.tar.gz");
+        write_drop_blocking(&dir, &target, b"x").expect("write");
+
+        assert_eq!(mode(&dir), 0o2770);
+        assert_eq!(mode(&target), 0o660);
+    }
+
+    /// 老版本落下的 `0644`：下一次交付顺手对齐（不用等人工 `perms --apply`）。
+    #[cfg(unix)]
+    #[test]
+    fn drop_delivery_aligns_preexisting_files() {
+        use std::os::unix::fs::PermissionsExt;
+        fn mode(path: &std::path::Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+        }
+
+        let dir = temp_dir("drop-align-existing").join("packages");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let stale = dir.join("old-package.tar.gz");
+        std::fs::write(&stale, b"old").expect("write");
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let target = dir.join("new-package.tar.gz");
+        write_drop_blocking(&dir, &target, b"x").expect("write");
+
+        assert_eq!(mode(&stale), 0o640, "旧文件要被顺手对齐");
+        assert_eq!(mode(&target), 0o640);
+    }
+
+    /// “组可写”不等于“读写挂载”：旧版本建的 / umask 002 下的 `0775` 目录**没有 setgid**，
+    /// 不能当 rw 跟着走（否则只读挂载会被判成 `2770`，照样过不了 perms）。
+    #[cfg(unix)]
+    #[test]
+    fn mount_policy_requires_setgid_before_treating_a_dir_as_read_write() {
+        let dir = temp_dir("drop-modes-plain").join("packages");
+        std::fs::create_dir_all(&dir).expect("dir");
+        set_mode(&dir, 0o775).expect("chmod");
+
+        let (dir_mode, file_mode) = mount_policy(&dir).expect("policy");
+        assert_eq!((dir_mode, file_mode), (0o2750, 0o640));
     }
 
     /// 交付后按 mtime 保留**最新** N 份，删其余；子目录不动。
