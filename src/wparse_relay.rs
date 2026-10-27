@@ -647,7 +647,16 @@ async fn apply_business_identity(
         record_event(task, "bind.failed", &error);
         return ApplyOutcome::Failed { status: 500, error };
     }
-    if let Err(error) = crate::wparse_env::write_tenant_id(&work_dir, tenant_id) {
+    // 主路 `WP_GLOBAL_TAGS`（tenant_id / gateway_id / instance_id）+ 兼容 `WIST_TENANT_ID`。
+    let instance_id =
+        crate::state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)
+            .unwrap_or_default();
+    if let Err(error) = crate::wparse_env::write_business_tags(
+        &work_dir,
+        tenant_id,
+        &config.gateway_id,
+        &instance_id,
+    ) {
         record_event(task, "bind.env_failed", &error);
         return ApplyOutcome::Failed {
             status: 500,
@@ -658,7 +667,8 @@ async fn apply_business_identity(
         task,
         "bind.stored",
         &format!(
-            "tenant_id={tenant_id} revision={revision} env={}",
+            "tenant_id={tenant_id} gateway_id={} instance_id={instance_id} revision={revision} env={}",
+            config.gateway_id,
             work_dir.join(crate::wparse_env::ENV_FILE).display()
         ),
     );
@@ -847,7 +857,15 @@ pub async fn reconcile_business_identity(config: &Config) {
             log::warn!("event=TenantBindingFlagPersistFailed error={err}");
         }
     }
-    if let Err(error) = crate::wparse_env::write_tenant_id(&work_dir, &identity.tenant_id) {
+    let instance_id =
+        crate::state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)
+            .unwrap_or_default();
+    if let Err(error) = crate::wparse_env::write_business_tags(
+        &work_dir,
+        &identity.tenant_id,
+        &config.gateway_id,
+        &instance_id,
+    ) {
         log::warn!("event=TenantBindingReconcileEnvFailed error={error}");
         return;
     }

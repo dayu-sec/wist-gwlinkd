@@ -1,9 +1,13 @@
-//! wparse 业务身份的现场值：`<work_dir>/.env` 里的 `WIST_TENANT_ID`。
+//! wparse 业务身份的现场值：`<work_dir>/.env` 里的 `WP_GLOBAL_TAGS`（主）/ `WIST_TENANT_ID`（兼容）。
 //!
-//! 设计 `wist-design/doc/design/edge/gateway-business-identity.md`：
-//! - wparse 从**工作根**的 `.env` 读取 `${WIST_TENANT_ID}`（已实测，按 work-root 解析）；
+//! 设计 `wist-design/doc/design/edge/gateway-business-identity.md`（D7）：
+//! - **主路**：wparse ≥ 0.31 支持实例级全局 tag `WP_GLOBAL_TAGS`，启动时从**工作根** `.env` 读取，
+//!   在解析成功后盖到**所有**记录上，并**先删同名字段再写**（连规则/OML 里写死的 `tenant_id`
+//!   也会被覆盖）。不需要任何 sink 配置，也不依赖 wp-infra —— 这是"不需要 sink 配置"的机制。
+//! - **兼容**：`WIST_TENANT_ID` 仍写一份，给还没升级的引擎 / 旧 `topology/sinks/defaults.toml`
+//!   占位用。
 //! - 该文件不是密钥；模式按**挂载策略**（读写 `0660` / 只读 `0640`，与 `gops sys perms`
-//!   同口径）—— 写死 `0644` 会让 `gops run start` 判待修并拒启；只合并这一个键，保留现场其它键；
+//!   同口径）—— 写死 `0644` 会让 `gops run start` 判待修并拒启；只合并这几个键，保留现场其它键；
 //! - 写入后需让 wparse 重新读取（开发态 `svc.sh restart`、发布态 `gops run stop/start`；
 //!   都没配也能推出来，见 [`resolve_apply_action`]）。
 //!
@@ -20,8 +24,16 @@ use crate::sys_root::control_workdir;
 
 /// wparse 工作根下的现场值文件。
 pub const ENV_FILE: &str = ".env";
-/// 业务身份键（与 wparse `topology/sinks/defaults.toml` 的 `${WIST_TENANT_ID}` 对应）。
+/// 业务身份键（兼容路径：与 wparse `topology/sinks/defaults.toml` 的 `${WIST_TENANT_ID}` 对应）。
 pub const TENANT_KEY: &str = "WIST_TENANT_ID";
+/// 引擎级全局 tag（主路，wparse ≥ 0.31）：盖在所有解析成功的记录上，覆盖同名规则字段。
+pub const GLOBAL_TAGS_KEY: &str = "WP_GLOBAL_TAGS";
+/// 全局 tag 里的业务身份字段名（与 Center 的 `customer_id` 在边界做映射）。
+pub const TENANT_TAG_KEY: &str = "tenant_id";
+/// 全局 tag 里的网关标识（center 侧 `gateway_id`）。
+pub const GATEWAY_TAG_KEY: &str = "gateway_id";
+/// 全局 tag 里的实例标识（`<gateway_id>/inst-<boot>`，重装会换新的）—— 真正“这台安装”的唯 ID。
+pub const INSTANCE_TAG_KEY: &str = "instance_id";
 
 /// `tenant_id` 会成为 wparse tag 的 value：只允许 tag-safe 字符集（与 wparse `validate_tags` 同口径）。
 ///
@@ -36,7 +48,7 @@ pub fn is_tag_safe(value: &str) -> bool {
         })
 }
 
-/// 在工作根里写/更新 `WIST_TENANT_ID`（原子写；保留其它键）。
+/// 在工作根里写/更新 `WIST_TENANT_ID`（原子写；保留其它键）。兼容路径，主路见 [`write_business_tags`]。
 ///
 /// 失败一律上抛：**静默失败**（例如 chmod 失败导致容器读不到）会表现为
 /// 「Center 认为已生效、数据面仍是 `unbound`」，比直接报错难查得多。
@@ -48,6 +60,122 @@ pub fn write_tenant_id(work_dir: &Path, tenant_id: &str) -> Result<PathBuf, Stri
             value_preview(tenant_id)
         ));
     }
+    write_env_with(work_dir, |existing| {
+        Ok(upsert_env_value(existing, TENANT_KEY, tenant_id))
+    })
+}
+
+/// 写业务身份的现场值：**主路**是 `WP_GLOBAL_TAGS`，并把 `WIST_TENANT_ID` 一起写上（兼容）。
+///
+/// 写进去三个全局 tag：
+/// - `tenant_id`：业务身份（= Center 的 `customer_id`）；
+/// - `gateway_id`：网关标识（中心侧身份，如 `X4`）；
+/// - `instance_id`：本次安装的唯 ID（`<gateway_id>/inst-<boot>`，重装会换新的）。
+///
+/// 为什么要全局 tag 而不是只靠 sink 占位：`topology/` 会被 `project_remote` 从 wp-infra 整体覆盖，
+/// 占位很容易被冲掉；全局 tag 由引擎在解析成功后盖到**所有**记录上，且**覆盖同名规则字段**
+/// （规则里写死的 `tenant_id = chars(...)` 也会被盖掉）。
+pub fn write_business_tags(
+    work_dir: &Path,
+    tenant_id: &str,
+    gateway_id: &str,
+    instance_id: &str,
+) -> Result<PathBuf, String> {
+    let tenant_id = tenant_id.trim();
+    if !is_tag_safe(tenant_id) {
+        return Err(format!(
+            "tenant_id 不是 tag-safe：{}",
+            value_preview(tenant_id)
+        ));
+    }
+    let gateway_id = gateway_id.trim();
+    let instance_id = instance_id.trim();
+    // dotenv 是逐行格式：值里出现换行/控制字符等于往 `.env` 里注入新行。**不**放行。
+    for (name, value) in [("gateway_id", gateway_id), ("instance_id", instance_id)] {
+        ensure_single_line(name, value)?;
+    }
+    write_env_with(work_dir, |existing| {
+        let mut content = upsert_env_value(existing, TENANT_KEY, tenant_id);
+        // `WP_GLOBAL_TAGS` 还可能携带其它 tag（owner_id / env …）：**按 key 合并**，不能整行覆盖。
+        let mut tags = env_value(existing, GLOBAL_TAGS_KEY).unwrap_or_default();
+        tags = upsert_global_tag(&tags, TENANT_TAG_KEY, tenant_id)?;
+        if !gateway_id.is_empty() {
+            tags = upsert_global_tag(&tags, GATEWAY_TAG_KEY, gateway_id)?;
+        }
+        if !instance_id.is_empty() {
+            tags = upsert_global_tag(&tags, INSTANCE_TAG_KEY, instance_id)?;
+        }
+        content = upsert_env_value(&content, GLOBAL_TAGS_KEY, &tags);
+        Ok(content)
+    })
+}
+
+/// dotenv 值里不允许换行/控制字符（防注入）。
+fn ensure_single_line(name: &str, value: &str) -> Result<(), String> {
+    if value.chars().any(|ch| ch.is_control()) {
+        return Err(format!(
+            "{name} 含换行/控制字符，拒绝写 .env：{}",
+            value_preview(value)
+        ));
+    }
+    Ok(())
+}
+
+/// 解析 `WP_GLOBAL_TAGS`：`k=v,k2=v2` 或 JSON 对象（与 wparse `parse_global_tags` 同口径）。
+pub fn parse_global_tags(raw: &str) -> Result<Vec<(String, String)>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    if raw.starts_with('{') {
+        let map: std::collections::BTreeMap<String, String> = serde_json::from_str(raw)
+            .map_err(|err| format!("{GLOBAL_TAGS_KEY} 不是合法 JSON 对象：{err}"))?;
+        return Ok(map.into_iter().collect());
+    }
+    let mut out = Vec::new();
+    for item in raw.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (key, value) = item
+            .split_once('=')
+            .ok_or_else(|| format!("{GLOBAL_TAGS_KEY} 项 '{item}' 必须是 key=value 形式"))?;
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(format!("{GLOBAL_TAGS_KEY} 含空 key"));
+        }
+        out.push((key.to_string(), value.trim().to_string()));
+    }
+    Ok(out)
+}
+
+/// 把 `key=value` 合并进 `WP_GLOBAL_TAGS` 的原始值，返回重新序列化后的串。
+///
+/// 已有 key 覆盖、其它 key 保留；值里出现 `,` / `=` / 引号时切 JSON 形式（kv 形式会有歧义）。
+pub fn upsert_global_tag(raw: &str, key: &str, value: &str) -> Result<String, String> {
+    let mut map: std::collections::BTreeMap<String, String> =
+        parse_global_tags(raw)?.into_iter().collect();
+    map.insert(key.to_string(), value.to_string());
+    let ambiguous = map.iter().any(|(key, value)| {
+        key.contains(',') || key.contains('=') || value.contains([',', '=', '"'])
+    });
+    if ambiguous {
+        return serde_json::to_string(&map)
+            .map_err(|err| format!("序列化 {GLOBAL_TAGS_KEY} 失败：{err}"));
+    }
+    Ok(map
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+/// 原子写入：先读现场（不存在当空）→ 交给 `transform` 生成新内容 → 临时文件 + rename。
+fn write_env_with<F>(work_dir: &Path, transform: F) -> Result<PathBuf, String>
+where
+    F: FnOnce(&str) -> Result<String, String>,
+{
     let path = work_dir.join(ENV_FILE);
     ensure_regular_file(&path)?;
     let existing = match std::fs::read_to_string(&path) {
@@ -64,7 +192,7 @@ pub fn write_tenant_id(work_dir: &Path, tenant_id: &str) -> Result<PathBuf, Stri
     };
     std::fs::create_dir_all(work_dir)
         .map_err(|err| format!("创建 wparse 工作根失败 {}: {err}", work_dir.display()))?;
-    let content = upsert_env_value(&existing, TENANT_KEY, tenant_id);
+    let content = transform(&existing)?;
     // 随机名 + `create_new`：并发写不互相踩，且**拒绝**被预置的符号链接/同名文件。
     let tmp = work_dir.join(format!(
         ".env.wist-{}-{}",
@@ -168,6 +296,33 @@ pub fn env_has_value(content: &str, key: &str, value: &str) -> bool {
     content
         .lines()
         .any(|line| normalize_env_line(line).as_deref() == Some(wanted.as_str()))
+}
+
+/// 取 `.env` 里某个键的现值（多行时取最后一行；行不存在 → `None`）。
+///
+/// 合并 `WP_GLOBAL_TAGS` 时要用它把现场已有的其它 tag 读回来。
+pub fn env_value(content: &str, key: &str) -> Option<String> {
+    let mut found = None;
+    for line in content.lines() {
+        if env_line_key(line).as_deref() == Some(key) {
+            let rest = line.trim_start();
+            let rest = rest.strip_prefix("export ").unwrap_or(rest);
+            if let Some((_, value)) = rest.split_once('=') {
+                found = Some(unquote_env_value(value.trim()));
+            }
+        }
+    }
+    found
+}
+
+/// dotenv 允许 `KEY="a b"` / `KEY='a b'`；取回时去掉外层引号。
+fn unquote_env_value(value: &str) -> String {
+    for quote in ['"', '\''] {
+        if value.len() >= 2 && value.starts_with(quote) && value.ends_with(quote) {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
 }
 
 /// 合并式更新：`KEY=value` 已存在则替换，缺失则追加；其它行（注释/其它键）原样保留。
@@ -511,6 +666,109 @@ mod tests {
             })
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn global_tags_merge_preserves_other_keys_and_overrides_tenant() {
+        // 现场可能已经有 owner_id / env：要**按 key 合并**，不能整行覆盖。
+        let merged =
+            upsert_global_tag("owner_id=team-a,env=prod", TENANT_TAG_KEY, "t-1").expect("merge");
+        assert_eq!(merged, "env=prod,owner_id=team-a,tenant_id=t-1");
+        // 同 key 覆盖（不出现两条）。
+        let merged = upsert_global_tag(&merged, TENANT_TAG_KEY, "t-2").expect("merge");
+        assert_eq!(merged.matches("tenant_id=").count(), 1);
+        assert!(merged.contains("tenant_id=t-2"), "{merged}");
+        // 空值 / 缺失 → 从零开始也能用。
+        assert_eq!(
+            upsert_global_tag("", GATEWAY_TAG_KEY, "X4").expect("merge"),
+            "gateway_id=X4"
+        );
+        assert_eq!(
+            upsert_global_tag("   ", GATEWAY_TAG_KEY, "X4").unwrap(),
+            "gateway_id=X4"
+        );
+    }
+
+    #[test]
+    fn global_tags_switch_to_json_when_values_are_ambiguous() {
+        // 值里有 `,` / `=` 时 kv 形式解析不回来 → 必须落 JSON（wparse 两种都接受）。
+        let merged = upsert_global_tag("env=dev", "note", "a,b=c").expect("merge");
+        assert!(merged.starts_with('{'), "{merged}");
+        assert!(merged.contains("\"note\":\"a,b=c\""), "{merged}");
+        // 读回来一致（我们自己的解析器也要能读 JSON）。
+        let parsed: std::collections::BTreeMap<String, String> =
+            parse_global_tags(&merged).unwrap().into_iter().collect();
+        assert_eq!(parsed.get("note").map(String::as_str), Some("a,b=c"));
+        assert_eq!(parsed.get("env").map(String::as_str), Some("dev"));
+    }
+
+    #[test]
+    fn global_tags_reject_malformed_input() {
+        assert!(parse_global_tags("owner_id").is_err());
+        assert!(parse_global_tags("=team-a").is_err());
+        assert!(parse_global_tags("{\"owner_id\":1}").is_err());
+        assert!(parse_global_tags("  , , ").unwrap().is_empty());
+    }
+
+    /// 主路：一份 `.env` 同时写 `WP_GLOBAL_TAGS`（三个 tag）与兼容的 `WIST_TENANT_ID`。
+    #[test]
+    fn write_business_tags_writes_global_tags_and_keeps_other_keys() {
+        let dir = temp_work_dir("business-tags");
+        std::fs::write(
+            dir.join(ENV_FILE),
+            "OTHER=keep\nWP_GLOBAL_TAGS=owner_id=team-a\n",
+        )
+        .unwrap();
+        let path =
+            write_business_tags(&dir, "2092453428448002048", "X4", "X4/inst-1792").expect("write");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("OTHER=keep"), "{text}");
+        assert!(
+            text.contains("WIST_TENANT_ID=2092453428448002048"),
+            "{text}"
+        );
+        let tags = env_value(&text, GLOBAL_TAGS_KEY).expect("global tags");
+        assert_eq!(
+            tags,
+            "gateway_id=X4,instance_id=X4/inst-1792,owner_id=team-a,tenant_id=2092453428448002048"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 二次写入不能把已有的 gateway/instance 丢掉（同值幂等）。
+    #[test]
+    fn write_business_tags_is_idempotent() {
+        let dir = temp_work_dir("business-tags-idem");
+        let first = write_business_tags(&dir, "t-1", "X4", "X4/inst-1").unwrap();
+        let one = std::fs::read_to_string(&first).unwrap();
+        let second = write_business_tags(&dir, "t-1", "X4", "X4/inst-1").unwrap();
+        let two = std::fs::read_to_string(&second).unwrap();
+        assert_eq!(one, two);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 换绑：tenant 变、gateway/instance 不变；旧值不该残留。
+    #[test]
+    fn write_business_tags_replaces_tenant_for_rebinding() {
+        let dir = temp_work_dir("business-tags-rebind");
+        write_business_tags(&dir, "t-old", "X4", "X4/inst-1").unwrap();
+        let path = write_business_tags(&dir, "t-new", "X4", "X4/inst-1").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("t-old"), "{text}");
+        let tags = env_value(&text, GLOBAL_TAGS_KEY).unwrap();
+        assert!(tags.contains("tenant_id=t-new"), "{tags}");
+        assert!(tags.contains("gateway_id=X4"), "{tags}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// gateway_id / instance_id 里带换行 = 往 `.env` 注入新行，直接拒。
+    #[test]
+    fn write_business_tags_rejects_control_chars() {
+        let dir = temp_work_dir("business-tags-inject");
+        assert!(write_business_tags(&dir, "t-1", "X4\nEVIL=1", "X4/inst-1").is_err());
+        assert!(write_business_tags(&dir, "t-1", "X4", "X4/inst-1\nEVIL=1").is_err());
+        assert!(!dir.join(ENV_FILE).exists(), "被拒的值不该落盘");
         let _ = std::fs::remove_dir_all(dir);
     }
 

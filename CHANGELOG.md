@@ -3,6 +3,28 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.18.2-alpha] - 2026-10-27
+
+### 修复
+
+- **绑定客户后数据里的 `tenant_id` 不是绑定值**：注入机制改用 wparse 的**实例级全局 tag**
+  `WP_GLOBAL_TAGS`（wparse ≥ 0.31，0.34 沿用）：`<work>/.env` 写
+  `WP_GLOBAL_TAGS=tenant_id:…,gateway_id:…,instance_id:…`，引擎在解析成功后盖到**所有**记录上，
+  并**先删同名字段再写** —— 连规则/OML 里写死的 `tenant_id = chars(…)` 也会被覆盖。
+  - 不再依赖 `topology/sinks/defaults.toml` 里的 `${WIST_TENANT_ID}` 占位：那份文件会被
+    `project_remote` 从 **wp-infra** 整体覆盖，占位很容易被冲掉（2026-10-27 现场：
+    `work/topology/sinks/defaults.toml` 只剩 `env:dev`，`.env` 里的值根本没人引用）。
+  - `WIST_TENANT_ID` 仍写一份（兼容旧引擎 / 旧占位）。
+- **`WP_GLOBAL_TAGS` 按 key 合并**：现场已有的 `owner_id` / `env` 等 tag 原样保留，只替换/新增
+  `tenant_id` / `gateway_id` / `instance_id`；值里含 `,` / `=` 时自动落 JSON 形式（wparse 两种都接受）。
+  gateway_id / instance_id 带换行/控制字符直接拒写（dotenv 是逐行格式）。
+
+### 新增
+
+- **数据记录带上网关标识**：除 `tenant_id` 外，全局 tag 还写 `gateway_id`（中心侧身份，如 `X4`）
+  与 `instance_id`（`<gateway_id>/inst-<boot>`，**重装会换新**）—— 同一客户下多台网关 / 同一台重装
+  后的数据可以直接区分。
+
 ## [0.18.1-alpha] - 2026-10-27
 
 ### 修复
