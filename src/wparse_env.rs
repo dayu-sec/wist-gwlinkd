@@ -110,6 +110,7 @@ pub fn write_business_tags(
     })
 }
 
+/// `WP_GLOBAL_TAGS` 里的 tenant_id 是否已就位（旧 `.env` 升级后靠它判漂移）。
 /// dotenv 值里不允许换行/控制字符（防注入）。
 fn ensure_single_line(name: &str, value: &str) -> Result<(), String> {
     if value.chars().any(|ch| ch.is_control()) {
@@ -296,6 +297,20 @@ pub fn env_has_value(content: &str, key: &str, value: &str) -> bool {
     content
         .lines()
         .any(|line| normalize_env_line(line).as_deref() == Some(wanted.as_str()))
+}
+
+/// `WP_GLOBAL_TAGS` 里是否有 `key=value`（启动自检用：旧 `.env` 升级后要判出来并重写）。
+pub fn env_has_global_tag(content: &str, key: &str, value: &str) -> bool {
+    let Some(raw) = env_value(content, GLOBAL_TAGS_KEY) else {
+        return false;
+    };
+    parse_global_tags(&raw)
+        .map(|pairs| {
+            pairs
+                .into_iter()
+                .any(|(tag_key, tag_value)| tag_key == key && tag_value == value)
+        })
+        .unwrap_or(false)
 }
 
 /// 取 `.env` 里某个键的现值（多行时取最后一行；行不存在 → `None`）。
@@ -633,6 +648,31 @@ mod tests {
         assert!(env_has_value(content, TENANT_KEY, "tenant-a"));
         assert!(!env_has_value(content, TENANT_KEY, "tenant-b"));
         assert!(!env_has_value("", TENANT_KEY, "tenant-a"));
+    }
+
+    /// `WP_GLOBAL_TAGS` 里的 tenant_id 是否已就位（旧 `.env` 升级后靠它判漂移）。
+    #[test]
+    fn env_has_global_tag_reads_both_kv_and_json_forms() {
+        let kv = "WIST_TENANT_ID=t-1\nWP_GLOBAL_TAGS=env=dev,tenant_id=t-1\n";
+        assert!(env_has_global_tag(kv, TENANT_TAG_KEY, "t-1"));
+        assert!(!env_has_global_tag(kv, TENANT_TAG_KEY, "t-2"));
+        // 旧现场：只有 WIST_TENANT_ID，没有全局 tag → 必须判缺（否则永远不重写）。
+        assert!(!env_has_global_tag(
+            "WIST_TENANT_ID=t-1\n",
+            TENANT_TAG_KEY,
+            "t-1"
+        ));
+        // JSON 形式与带引号的 dotenv 值都要能读。
+        assert!(env_has_global_tag(
+            "WP_GLOBAL_TAGS={\"tenant_id\":\"t-1\"}\n",
+            TENANT_TAG_KEY,
+            "t-1"
+        ));
+        assert!(env_has_global_tag(
+            "WP_GLOBAL_TAGS=\"env=dev,tenant_id=t-1\"\n",
+            TENANT_TAG_KEY,
+            "t-1"
+        ));
     }
 
     fn temp_work_dir(name: &str) -> std::path::PathBuf {

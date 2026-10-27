@@ -3,6 +3,15 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.18.3-alpha] - 2026-10-27
+
+### 修复
+
+- **升级后不会自动补上全局 tag**：启动自检原来只看 `.env` 里的 `WIST_TENANT_ID`，
+  于是「旧 `.env`（没有 `WP_GLOBAL_TAGS`）+ 新 gwlinkd」会直接判成“一致”并 return ——
+  绑定的值永远进不了数据面。现在两份都校：`WIST_TENANT_ID` **与** `WP_GLOBAL_TAGS.tenant_id`，
+  任一缺失/不一致就重写 `.env` 并重跑生效动作（升级 → 重启 gwlinkd 即自愈，不需重新绑定）。
+
 ## [0.18.2-alpha] - 2026-10-27
 
 ### 修复

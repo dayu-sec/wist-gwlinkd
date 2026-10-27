@@ -832,11 +832,18 @@ pub async fn reconcile_business_identity(config: &Config) {
         Ok(false) => {}
         Err(error) => log::warn!("event=TenantBindingEnvModeAlignFailed error={error}"),
     }
+    // 两份都要对：`WIST_TENANT_ID`（兼容）与 `WP_GLOBAL_TAGS` 里的 `tenant_id`（主路）。
+    // 只看前者会让「旧 `.env`（没有全局 tag）+ 新 gwlinkd」永远不重写 —— 绑定的值
+    // 永远进不了数据面（2026-10-27 现场就是这么卡住的）。
     let env_matches = std::fs::read_to_string(work_dir.join(crate::wparse_env::ENV_FILE))
         .map(|text| {
             crate::wparse_env::env_has_value(
                 &text,
                 crate::wparse_env::TENANT_KEY,
+                &identity.tenant_id,
+            ) && crate::wparse_env::env_has_global_tag(
+                &text,
+                crate::wparse_env::TENANT_TAG_KEY,
                 &identity.tenant_id,
             )
         })
