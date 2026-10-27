@@ -3,6 +3,21 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.18.4-alpha] - 2026-10-27
+
+### 变更
+
+- **全局 tag 字段名按现场约定收成两个**：`tenant_id` + **`wist-gw_id`**
+  （原 `gateway_id` / `instance_id` 两个键合并成一个，值就是实例 ID `X4/inst-1792230480`）。
+  现场形态：
+
+  ```dotenv
+  WP_GLOBAL_TAGS=tenant_id=DEV-X4,wist-gw_id=X4/inst-1792230480
+  ```
+
+  - 写入时顺手**清掉**旧键 `gateway_id` / `instance_id`（已升级过的现场不会两个名字并存）；
+  - 启动自检也校 `wist-gw_id`：实例 ID 变了（重装）会重写 `.env` 并重跑生效动作。
+
 ## [0.18.3-alpha] - 2026-10-27
 
 ### 修复

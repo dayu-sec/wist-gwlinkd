@@ -647,16 +647,17 @@ async fn apply_business_identity(
         record_event(task, "bind.failed", &error);
         return ApplyOutcome::Failed { status: 500, error };
     }
-    // 主路 `WP_GLOBAL_TAGS`（tenant_id / gateway_id / instance_id）+ 兼容 `WIST_TENANT_ID`。
+    // 主路 `WP_GLOBAL_TAGS`（tenant_id / wist-gw_id）+ 兼容 `WIST_TENANT_ID`。
+    // `wist-gw_id` 用**实例 ID**（`<gateway_id>/inst-<boot>`）：没有它时才退回网关 ID。
     let instance_id =
         crate::state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)
             .unwrap_or_default();
-    if let Err(error) = crate::wparse_env::write_business_tags(
-        &work_dir,
-        tenant_id,
-        &config.gateway_id,
-        &instance_id,
-    ) {
+    let gw_id = if instance_id.is_empty() {
+        config.gateway_id.trim().to_string()
+    } else {
+        instance_id
+    };
+    if let Err(error) = crate::wparse_env::write_business_tags(&work_dir, tenant_id, &gw_id) {
         record_event(task, "bind.env_failed", &error);
         return ApplyOutcome::Failed {
             status: 500,
@@ -667,8 +668,7 @@ async fn apply_business_identity(
         task,
         "bind.stored",
         &format!(
-            "tenant_id={tenant_id} gateway_id={} instance_id={instance_id} revision={revision} env={}",
-            config.gateway_id,
+            "tenant_id={tenant_id} wist-gw_id={gw_id} revision={revision} env={}",
             work_dir.join(crate::wparse_env::ENV_FILE).display()
         ),
     );
@@ -832,9 +832,17 @@ pub async fn reconcile_business_identity(config: &Config) {
         Ok(false) => {}
         Err(error) => log::warn!("event=TenantBindingEnvModeAlignFailed error={error}"),
     }
-    // 两份都要对：`WIST_TENANT_ID`（兼容）与 `WP_GLOBAL_TAGS` 里的 `tenant_id`（主路）。
+    // 两份都要对：`WIST_TENANT_ID`（兼容）与 `WP_GLOBAL_TAGS` 里的 `tenant_id` / `wist-gw_id`（主路）。
     // 只看前者会让「旧 `.env`（没有全局 tag）+ 新 gwlinkd」永远不重写 —— 绑定的值
     // 永远进不了数据面（2026-10-27 现场就是这么卡住的）。
+    let instance_id =
+        crate::state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)
+            .unwrap_or_default();
+    let gw_id = if instance_id.is_empty() {
+        config.gateway_id.trim().to_string()
+    } else {
+        instance_id
+    };
     let env_matches = std::fs::read_to_string(work_dir.join(crate::wparse_env::ENV_FILE))
         .map(|text| {
             crate::wparse_env::env_has_value(
@@ -845,7 +853,12 @@ pub async fn reconcile_business_identity(config: &Config) {
                 &text,
                 crate::wparse_env::TENANT_TAG_KEY,
                 &identity.tenant_id,
-            )
+            ) && (gw_id.is_empty()
+                || crate::wparse_env::env_has_global_tag(
+                    &text,
+                    crate::wparse_env::GW_ID_TAG_KEY,
+                    &gw_id,
+                ))
         })
         .unwrap_or(false);
     if identity.wparse_applied && env_matches {
@@ -864,15 +877,9 @@ pub async fn reconcile_business_identity(config: &Config) {
             log::warn!("event=TenantBindingFlagPersistFailed error={err}");
         }
     }
-    let instance_id =
-        crate::state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)
-            .unwrap_or_default();
-    if let Err(error) = crate::wparse_env::write_business_tags(
-        &work_dir,
-        &identity.tenant_id,
-        &config.gateway_id,
-        &instance_id,
-    ) {
+    if let Err(error) =
+        crate::wparse_env::write_business_tags(&work_dir, &identity.tenant_id, &gw_id)
+    {
         log::warn!("event=TenantBindingReconcileEnvFailed error={error}");
         return;
     }
