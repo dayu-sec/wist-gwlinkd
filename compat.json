@@ -1,0 +1,9 @@
+{
+  "component": "wist-gwlinkd",
+  "requires": { "wist-center": ">=0.24.0" },
+  "supports": { "wist-gateway": ">=0.26.0" },
+  "coexists_with": { "wist-center": ">=0.22.0" },
+  "compat_mode": true,
+  "bridge": [],
+  "reversible": false
+}

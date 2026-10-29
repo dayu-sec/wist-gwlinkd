@@ -3,6 +3,16 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.18.5-alpha] - 2026-10-29
+
+### 变更（发版带上升级兼容声明）
+
+- 新增仓根 `compat.json`：`requires: { "wist-center": ">=0.24.0" }`、
+  `supports: { "wist-gateway": ">=0.26.0" }`、`compat_mode=true` +
+  `coexists_with: { "wist-center": ">=0.22.0" }`。
+- 发布流水线把它打进 tarball（单二进制 + `compat.json`），并**校验包内有它**
+  （缺了就拒绝发布）——中心发布 / 网关入库时据此判定兼容性，不再只靠人工看版本。
+
 ## [0.18.4-alpha] - 2026-10-27
 
 ### 变更
