@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime};
 
 use orion_error::prelude::*;
-use wist_control::{DateTime, ReportGatewayStatus};
+use wist_control::{DateTime, ReportAgentStatus, ReportGatewayStatus};
 use wist_gwlinkd::agent_package::{AgentPackageClient, AgentPackageItem};
 use wist_gwlinkd::center::{self, CenterClient};
 use wist_gwlinkd::config::{
@@ -19,6 +19,7 @@ use wist_gwlinkd::error::{
     OpLoggable, StateReason, chain_one_line, logged_op,
 };
 use wist_gwlinkd::executor::{DEFAULT_ON_FAILURE, DEFAULT_UPGRADER_PROGRAM, GopsExecutor};
+use wist_gwlinkd::gateway_agents::GatewayAgentsClient;
 use wist_gwlinkd::host_mode::{mount_policy, set_mode};
 use wist_gwlinkd::identity;
 use wist_gwlinkd::knowledge_package::KnowledgePackageClient;
@@ -40,6 +41,8 @@ use wist_gwlinkd::upgrade::{
 
 /// 运行期状态上报周期（秒）。
 const STATUS_INTERVAL_SECS: u64 = 30;
+/// agent 明细上报周期（秒）：机队变化慢、一次全量，比状态上报疏一档。
+const AGENTS_INTERVAL_SECS: u64 = 60;
 /// 退避初始值（秒）：renew / status 被拒后指数退避，避免猛击中心。
 const BACKOFF_BASE_SECS: u64 = 60;
 /// 退避上限（秒）。
@@ -472,6 +475,14 @@ async fn run(
         ),
         None => None,
     };
+    // 「Agent 明细」环回拉取（机队运行态），再转报中心：同环回面 + 同一信任锚。
+    let gateway_agents_client = match config.gateway_self_endpoint.as_deref() {
+        Some(base) => Some(
+            GatewayAgentsClient::with_trust(base, config.gateway_self_ca.as_deref())
+                .map_err(|err| GwlinkdReason::system_error().err(err))?,
+        ),
+        None => None,
+    };
     let renew_lead = config.renew_lead_seconds.unwrap_or(3600);
     let mut driver = UpgradeDriver::new(
         GopsExecutor::new(
@@ -550,6 +561,8 @@ async fn run(
     let mut next_renew_at = Instant::now();
     let mut status_backoff = Duration::ZERO;
     let mut next_status_at = Instant::now();
+    let mut agents_backoff = Duration::ZERO;
+    let mut next_agents_at = Instant::now();
     // 轮换收尾的三态对齐标记（内存 credential / 磁盘 / mTLS 客户端）：失败则下一轮自愈重试。
     let mut credential_dirty = false;
     let mut client_stale = false;
@@ -1018,6 +1031,54 @@ async fn run(
                     linkd_state = STATE_DEGRADED.to_string();
                     linkd_last_error = Some(format!("状态上报失败：{err}"));
                     log::error!("event=StatusReportFailed error={}", chain_one_line(&err));
+                }
+            }
+        }
+
+        // 上报 agent 明细（→ 中心「网关详情 → Agent 状态」页）：环回拉网关机队，mTLS 转报中心。
+        // 未配环回面（老部署）则跳过；拉不到机队（网关没起 / 够不到）只记日志，下一档重试。
+        if Instant::now() >= next_agents_at
+            && let Some(agents_client) = &gateway_agents_client
+        {
+            match agents_client.fetch(&config.gateway_id).await {
+                Ok(agents) => {
+                    let payload = ReportAgentStatus {
+                        gateway_id: config.gateway_id.clone(),
+                        agents,
+                    };
+                    match client.report_agent_status(&payload).await {
+                        Ok(accepted) => {
+                            agents_backoff = Duration::ZERO;
+                            next_agents_at =
+                                Instant::now() + Duration::from_secs(AGENTS_INTERVAL_SECS);
+                            log::info!(
+                                "event=AgentStatusReported gateway_id={} agents={}",
+                                config.gateway_id,
+                                accepted.agents_accepted
+                            );
+                        }
+                        Err(err) if err.is_unauthorized() => {
+                            // 客户端证书被拒：退避（与状态上报同口径），不每拍猛击中心。
+                            agents_backoff = back_off(agents_backoff);
+                            next_agents_at = Instant::now() + agents_backoff;
+                            log::error!(
+                                "event=AgentStatusRejected gateway_id={} backoff={agents_backoff:?}（客户端证书已失效；需管理员在中心重置该实例）error={}",
+                                config.gateway_id,
+                                chain_one_line(&err)
+                            );
+                        }
+                        Err(err) => {
+                            agents_backoff = back_off(agents_backoff);
+                            next_agents_at = Instant::now() + agents_backoff;
+                            log::error!(
+                                "event=AgentStatusReportFailed error={}",
+                                chain_one_line(&err)
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    log::warn!("event=AgentFleetFetchFailed error={}", chain_one_line(&err));
                 }
             }
         }

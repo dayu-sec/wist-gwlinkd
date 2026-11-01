@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use orion_error::prelude::*;
 use wist_control::{
-    DateTime, GatewayCredentialBundle, GatewayEnrollmentResult, GatewayInitialConfig,
-    GatewayStatusAccepted, GatewayUpgradePlan, RegisterGateway, RenewGatewayCredential,
-    ReportGatewayStatus, ReportGatewayUpgradeResult,
+    AgentStatusAcceptedReturned, DateTime, GatewayCredentialBundle, GatewayEnrollmentResult,
+    GatewayInitialConfig, GatewayStatusAccepted, GatewayUpgradePlan, RegisterGateway,
+    RenewGatewayCredential, ReportAgentStatus, ReportGatewayStatus, ReportGatewayUpgradeResult,
 };
 
 use crate::error::{CenterError, CenterReason, CenterResult};
@@ -284,6 +284,24 @@ impl CenterClient {
             .await
             .source_raw_err(CenterReason::Http, "status 请求失败")?;
         decode(response, "status").await
+    }
+
+    /// 上报 agent 明细：`POST /api/v1/gateway/agents/status`（客户端证书 mTLS 鉴权）。
+    ///
+    /// 报文为契约 `ReportAgentStatus`（`gateway_id` + `agents`）。返回中心回执（含 `agents_accepted`）。
+    pub async fn report_agent_status(
+        &self,
+        payload: &ReportAgentStatus,
+    ) -> CenterResult<AgentStatusAcceptedReturned> {
+        let url = format!("{}/api/v1/gateway/agents/status", self.endpoint);
+        let response = self
+            .http
+            .post(url)
+            .json(payload)
+            .send()
+            .await
+            .source_raw_err(CenterReason::Http, "agents/status 请求失败")?;
+        decode(response, "agents/status").await
     }
 
     /// 轮换：`POST /api/v1/gateway/credentials:renew`（以当前证书证明身份 + 新 CSR → 新证书；旧证书作废）。
@@ -1024,6 +1042,54 @@ mod tests {
                 .unwrap_or_default()
                 .contains("transport error"),
             "{sent}"
+        );
+    }
+
+    /// agent 明细上报：`POST /api/v1/gateway/agents/status`，body 是契约 `ReportAgentStatus`
+    /// （`gateway_id` + `agents`）；中心回执解析出 `agents_accepted`。
+    #[tokio::test]
+    async fn report_agent_status_posts_the_center_contract() {
+        let (endpoint, captured) =
+            capture_server("200 OK", r#"{"gateway_id":"gw-1","agents_accepted":2}"#).await;
+        let client = CenterClient::new(endpoint);
+        let agent = |agent_id: &str, status: &str| wist_control::AgentRuntimeStatus {
+            agent_id: agent_id.into(),
+            instance_id: format!("inst-{agent_id}"),
+            version: "0.4.0".into(),
+            status: status.into(),
+            health: "healthy".into(),
+            last_seen_at: DateTime::now(),
+            memory_bytes: Some(1024),
+            cpu_percent: Some(1.5),
+            admin_latency_ms: Some(8),
+            node_id: Some("node-1".into()),
+            hostname: Some("host-1".into()),
+            ip_addresses: Some(vec!["en0 192.168.1.5/24".into()]),
+        };
+        let payload = ReportAgentStatus {
+            gateway_id: "gw-1".into(),
+            agents: vec![agent("agent-1", "online"), agent("agent-2", "offline")],
+        };
+        let accepted = client.report_agent_status(&payload).await.expect("ok");
+        assert_eq!(accepted.agents_accepted, 2);
+        let request = captured.await.expect("request");
+        assert!(
+            request
+                .to_lowercase()
+                .starts_with("post /api/v1/gateway/agents/status"),
+            "{request}"
+        );
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let sent: ReportAgentStatus = serde_json::from_str(body)
+            .unwrap_or_else(|err| panic!("body 不是合法契约: {err}; {body}"));
+        assert_eq!(sent.gateway_id, "gw-1");
+        assert_eq!(sent.agents.len(), 2);
+        assert_eq!(sent.agents[0].agent_id, "agent-1");
+        // 机器身份随报文一起走：中心页据此显示“这是哪台机器”。
+        assert_eq!(sent.agents[0].hostname.as_deref(), Some("host-1"));
+        assert_eq!(
+            sent.agents[0].ip_addresses.as_deref(),
+            Some(&["en0 192.168.1.5/24".to_string()][..])
         );
     }
 }

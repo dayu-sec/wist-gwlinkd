@@ -3,6 +3,19 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.19.0-alpha] - 2026-10-31
+
+### 新增（代报网关机队到中心）
+
+- 新增 `gateway_agents`：以环回面拉 `GET /api/v1/gateway/agents`，**60s 一档**转报中心
+  `POST /api/v1/gateway/agents/status`（mTLS 客户端证书鉴权）。中心「网关详情 → Agent 状态」
+  页由此有真实机队数据。
+- 上报失败按既有退避（`BACKOFF_BASE_SECS` 起、上限 `BACKOFF_MAX_SECS`）：401/403 记
+  `AgentStatusRejected`，其它记 `AgentStatusReportFailed`；环回拉不到只记
+  `AgentFleetFetchFailed`，**不影响**状态上报与升级链路。
+- 未配环回面（老部署）自动跳过；`gateway_id` 一律以本机配置覆写（不信任环回面回显）。
+- 依赖 `wist-control 0.19`（机器身份三字段可选）。
+
 ## [0.18.5-alpha] - 2026-10-29
 
 ### 变更（发版带上升级兼容声明）
