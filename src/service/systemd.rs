@@ -57,12 +57,21 @@ pub fn unit_text(spec: &ServiceSpec) -> String {
         "ExecStart={} run\n",
         systemd_arg(&spec.bin.display().to_string())
     ));
-    // 服务 PATH 带运行用户的 ~/bin 与 ~/.local/bin：gops / gx 由安装脚本装在那里，
+    // 服务 PATH 带运行身份的 ~/bin 与 ~/.local/bin：`gops` / `gx` 的历史默认就装在那里，
     // systemd 的默认 PATH 不含用户目录（否则升级执行器 spawn 时 ENOENT）。
     text.push_str(&format!(
         "Environment=PATH={}\n",
         systemd_arg(&super::service_path(spec))
     ));
+    // `HOME` 必须显式给：systemd 默认不设它，而 `gops` 的项目模板按 `HOME` 展开
+    // （如 `ops-prj.yml` 的 `backup.target: ${HOME}/.backups`）——缺了就落到项目的
+    // **字面量** `${HOME}/` 目录里（2026-11-04 的网关升级现场）。
+    if let Some(home) = super::service_home(spec) {
+        text.push_str(&format!(
+            "Environment=HOME={}\n",
+            systemd_arg(&home.display().to_string())
+        ));
+    }
     text.push_str(&format!(
         "Environment={}={}\n",
         CONFIG_ENV,
@@ -235,6 +244,34 @@ mod tests {
         assert!(
             text.contains(&format!("Environment=PATH={}\n", systemd_arg(&path))),
             "unit PATH 未带上运行用户的 ~/bin：\n{text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit_carries_home_and_the_user_bin_dirs_even_without_run_as() {
+        // system 作用域没给 `--run-as` = 以 **root** 跑，而 systemd 仍然不给 HOME / 用户 bin 目录。
+        // 缺 PATH 里的 `~/bin`：升级执行器拉起的 `gx` spawn 时 ENOENT（2026-11-04 现场）。
+        // 缺 HOME：`gops` 的项目模板 `${HOME}/.backups` 不展开，备份落进项目里的字面量目录。
+        let spec = ServiceSpec::new(
+            ServiceScope::System,
+            PathBuf::from("/usr/local/bin/wist-gwlinkd"),
+            PathBuf::from("/etc/wist-gwlinkd/gwlinkd.toml"),
+        );
+        let home = crate::service::service_home(&spec).expect("system 作用域应解析出 root 家目录");
+        let path = crate::service::service_path(&spec);
+        assert_eq!(path.split(':').count(), 8, "PATH 应含 ~/bin：{path}");
+        let text = unit_text(&spec);
+        assert!(
+            text.contains(&format!("Environment=PATH={}\n", systemd_arg(&path))),
+            "unit PATH 未带上 root 的 ~/bin：\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "Environment=HOME={}\n",
+                systemd_arg(&home.display().to_string())
+            )),
+            "unit 未带上 HOME（HOME 类占位不会展开）：\n{text}"
         );
     }
 

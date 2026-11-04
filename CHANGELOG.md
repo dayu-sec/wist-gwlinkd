@@ -3,6 +3,24 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.19.1-alpha] - 2026-11-04
+
+### 修复
+
+- **root 部署的网关升级不再半路失败**：服务定义里的 PATH 现在总是带上运行身份的 `~/bin` /
+  `~/.local/bin`。原先只有显式 `--run-as` 才加，root 安装（unit 无 `User=`）时缺 `/root/bin` ——
+  升级执行器 `gops` 能跑，它派生的 `gx run localize` 却 `No such file or directory`，
+  整次升级以「阶段流程 localize 未执行」回滚。
+- **服务定义补上 `HOME`**：systemd / launchd 默认不给服务设它，`gops` 项目里 `${HOME}`
+  这类占位（如 `ops-prj.yml` 的 `backup.target`）不会展开 —— 升级前的备份会落到项目的
+  字面量 `${HOME}/` 目录，`/root/.backups` 永远空着。
+
+### 升级注意
+
+- **已有服务定义不会自动更新**（同 0.12.1）：要拿到新的 PATH / HOME，请重跑一次
+  `wist-gwlinkd service install --system [--run-as <部署用户>] --bin … --config … --pub-config … --force`，
+  或重跑中心的网关安装脚本。自更新只换二进制，**不重渲 unit**。
+
 ## [0.19.0-alpha] - 2026-10-31
 
 ### 新增（代报网关机队到中心）

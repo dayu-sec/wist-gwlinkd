@@ -117,12 +117,21 @@ pub fn plist_text(spec: &ServiceSpec, log_dir_override: Option<&Path>) -> String
     ));
     text.push_str("  <key>EnvironmentVariables</key>\n  <dict>\n");
     text.push_str("    <key>PATH</key>\n");
-    // 服务 PATH 带运行用户的 ~/bin 与 ~/.local/bin：gops / gx 由安装脚本装在那里，
+    // 服务 PATH 带运行身份的 ~/bin 与 ~/.local/bin：`gops` / `gx` 的历史默认就装在那里，
     // launchd 的默认 PATH 不含用户目录（否则升级执行器 spawn 时 ENOENT）。
     text.push_str(&format!(
         "    <string>{}</string>\n",
         escape_xml(&super::service_path(spec))
     ));
+    // `HOME` 必须显式给：launchd 也不会给服务设它，而 `gops` 的项目模板按 `HOME` 展开
+    // （如 `ops-prj.yml` 的 `backup.target: ${HOME}/.backups`）。
+    if let Some(home) = super::service_home(spec) {
+        text.push_str("    <key>HOME</key>\n");
+        text.push_str(&format!(
+            "    <string>{}</string>\n",
+            escape_xml(&home.display().to_string())
+        ));
+    }
     text.push_str(&format!("    <key>{CONFIG_ENV}</key>\n"));
     text.push_str(&format!(
         "    <string>{}</string>\n",
@@ -312,6 +321,33 @@ mod tests {
         assert!(
             text.contains(&escape_xml(&path)),
             "plist PATH 未带上运行用户的 ~/bin：\n{text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plist_carries_home_and_the_user_bin_dirs_even_without_run_as() {
+        // 与 systemd 同口径：system 作用域以 root 跑时，launchd 也不给 HOME / 用户 bin 目录。
+        let spec = ServiceSpec::new(
+            ServiceScope::System,
+            PathBuf::from("/usr/local/bin/wist-gwlinkd"),
+            PathBuf::from("/etc/wist-gwlinkd/gwlinkd.toml"),
+        );
+        let home = crate::service::service_home(&spec).expect("system 作用域应解析出 root 家目录");
+        let path = crate::service::service_path(&spec);
+        assert_eq!(path.split(':').count(), 8, "PATH 应含 ~/bin：{path}");
+        let text = plist_text(&spec, None);
+        assert!(
+            text.contains(&escape_xml(&path)),
+            "plist PATH 未带上 root 的 ~/bin：\n{text}"
+        );
+        assert!(
+            text.contains("<key>HOME</key>"),
+            "plist 未带上 HOME（HOME 类占位不会展开）：\n{text}"
+        );
+        assert!(
+            text.contains(&escape_xml(&home.display().to_string())),
+            "plist HOME 值不对：\n{text}"
         );
     }
 }

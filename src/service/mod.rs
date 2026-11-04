@@ -226,11 +226,12 @@ pub fn home_dir() -> ServiceResult<PathBuf> {
         .ok_or_else(|| ServiceReason::MissingEnv.err("HOME 未设置；请显式给 --config / --bin"))
 }
 
-/// 服务进程的 PATH：系统目录 + 运行用户的 `~/bin` / `~/.local/bin`。
+/// 服务进程的 PATH：系统目录 + 运行身份的 `~/bin` / `~/.local/bin`。
 ///
-/// 为什么必须带后两者：安装脚本把 `gops` / `gx` 装到 `$HOME/bin`，而 launchd / systemd 的
-/// 默认 PATH 只有系统目录。gwlinkd 的升级执行器（`gops`）以及 gops 拉起的 gx 流程都靠 PATH
-/// 解析；不带就会在 spawn 时以 `os error 2` 失败（相对名 `gops` 配了也没用）。
+/// 为什么必须带后两者：`gops` / `gx` 的**历史**默认装在 `$HOME/bin`（新安装脚本改落
+/// `/usr/local/bin`，那本就在系统目录里），而 launchd / systemd 的默认 PATH 没有用户目录。
+/// gwlinkd 的升级执行器（`gops`）以及 gops 拉起的 `gx` 流程都靠 PATH 解析；不带就会在 spawn
+/// 时以 `os error 2` 失败（2026-11-04 的网关升级现场：`gx` 找不到 → localize 失败 → 整工程回滚）。
 pub(crate) fn service_path(spec: &ServiceSpec) -> String {
     let mut parts = vec![
         // 与 systemd 的默认 PATH 保持同一组系统目录（launchd 旧版少了 sbin，补回来不丢东西）。
@@ -241,7 +242,7 @@ pub(crate) fn service_path(spec: &ServiceSpec) -> String {
         "/sbin".to_string(),
         "/bin".to_string(),
     ];
-    if let Some(home) = run_as_home(spec) {
+    if let Some(home) = service_home(spec) {
         parts.push(home.join("bin").display().to_string());
         parts.push(home.join(".local/bin").display().to_string());
     }
@@ -249,12 +250,20 @@ pub(crate) fn service_path(spec: &ServiceSpec) -> String {
 }
 
 /// 服务实际运行身份的家目录：user 作用域 = 本人；system + `--run-as` = 目标用户；
-/// system 无 `--run-as` = root（不额外加用户目录）。
-fn run_as_home(spec: &ServiceSpec) -> Option<PathBuf> {
-    if spec.scope == ServiceScope::User {
-        return home_dir().ok();
+/// system 无 `--run-as` = **root**（服务实际就以 root 跑）。
+///
+/// 为什么 system 作用域不能返回 `None`：`HOME` 不只是 `~/bin` 的前缀 —— `gops` 的项目模板
+/// 按它展开（如 `ops-prj.yml` 的 `backup.target: ${HOME}/.backups`），而 systemd **默认不设
+/// `HOME`**。缺了它，备份会落到项目的**字面量** `${HOME}/` 目录里（2026-11-04 的网关升级现场）。
+pub(crate) fn service_home(spec: &ServiceSpec) -> Option<PathBuf> {
+    match spec.scope {
+        ServiceScope::User => home_dir().ok(),
+        ServiceScope::System => spec
+            .run_as
+            .as_deref()
+            .and_then(user_home)
+            .or_else(|| user_home("root")),
     }
-    spec.run_as.as_deref().and_then(user_home)
 }
 
 #[cfg(unix)]
