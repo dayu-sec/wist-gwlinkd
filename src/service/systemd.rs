@@ -41,14 +41,6 @@ pub fn unit_text(spec: &ServiceSpec) -> String {
     text.push_str("StartLimitBurst=10\n");
     text.push('\n');
     text.push_str("[Service]\n");
-    // system 作用域可选**非 root 运行**（`--run-as`）：身份材料回写、gops 升级都在部署用户下完成。
-    // user 作用域不加（那本就以本人运行；系统 also 不接受 User= 与自身冲突）。
-    if let Some(user) = spec.run_as_identity() {
-        text.push_str(&format!("User={}\n", systemd_arg(user)));
-        if let Some(group) = spec.run_as_group.as_deref() {
-            text.push_str(&format!("Group={}\n", systemd_arg(group)));
-        }
-    }
     text.push_str("Type=simple\n");
     // 单实例闸门是**机器级**的：锁文件在宿主 `/tmp/wist-gwlinkd.lock`。`PrivateTmp=yes` 会把
     // `/tmp` 变成服务私有命名空间，闸门就退化成「按服务实例」—— 别加（测试会管着）。
@@ -224,60 +216,6 @@ mod tests {
         assert_eq!(
             unit_path(ServiceScope::System).expect("unit path"),
             PathBuf::from("/etc/systemd/system/wist-gwlinkd.service")
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unit_path_includes_the_run_as_users_bin_dirs() {
-        // gops / gx 由安装脚本装在 ~/bin；systemd 默认 PATH 不含用户目录，
-        // 不带就会在升级执行器 spawn 时 ENOENT（os error 2）。
-        let spec = ServiceSpec::new(
-            ServiceScope::System,
-            PathBuf::from("/usr/local/bin/wist-gwlinkd"),
-            PathBuf::from("/etc/wist-gwlinkd/gwlinkd.toml"),
-        )
-        .with_run_as(Some("root".to_string()), None);
-        let path = crate::service::service_path(&spec);
-        assert_eq!(path.split(':').count(), 8, "PATH 应含用户 bin：{path}");
-        let text = unit_text(&spec);
-        assert!(
-            text.contains(&format!("Environment=PATH={}\n", systemd_arg(&path))),
-            "unit PATH 未带上运行用户的 ~/bin：\n{text}"
-        );
-        // `HOME` 也要跟 **--run-as 的运行身份**（不是安装者的）。
-        let home = crate::service::service_home(&spec).expect("运行身份的家目录");
-        assert!(
-            text.contains(&format!(
-                "Environment=HOME={}\n",
-                systemd_arg(&home.display().to_string())
-            )),
-            "unit HOME 不对：\n{text}"
-        );
-    }
-
-    /// `--run-as` 指到一个不存在的用户：**不补** HOME / 用户 bin 目录。
-    /// 不能静默拿 root 的家目录充数 —— 那与实际运行身份不符，会把路径引到别人家里。
-    #[cfg(unix)]
-    #[test]
-    fn unit_omits_home_when_the_run_as_user_is_unknown() {
-        let spec = ServiceSpec::new(
-            ServiceScope::System,
-            PathBuf::from("/usr/local/bin/wist-gwlinkd"),
-            PathBuf::from("/etc/wist-gwlinkd/gwlinkd.toml"),
-        )
-        .with_run_as(Some("no-such-user-for-test".to_string()), None);
-        assert!(crate::service::service_home(&spec).is_none());
-        let path = crate::service::service_path(&spec);
-        assert_eq!(
-            path.split(':').count(),
-            6,
-            "未知运行身份不补用户目录：{path}"
-        );
-        let text = unit_text(&spec);
-        assert!(
-            !text.contains("Environment=HOME="),
-            "未知运行身份不该写 HOME：\n{text}"
         );
     }
 

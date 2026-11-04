@@ -1,7 +1,18 @@
 # 更新日志
 
-本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
+本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
+
+## [0.20.0-alpha] - 2026-11-04
+
+### 变更（不兼容）
+
+- **删除 `--run-as` / `--run-as-group`**：gwlinkd 是宿主侧常驻，职责就是写栈文件、`chown` 挂载点
+  （`gops sys perms`）、自更新覆盖 `/usr/local/lib` —— 这些都要 root，没有「非 root 运行」的需求。
+  `service install` 不再接受这两个参数（给了会报「未知参数」），服务定义里也不再写
+  `User=` / `Group=` / `UserName` / `GroupName`；system 作用域固定以 root 运行、`HOME` 取 root 家目录。
+  - **升级注意**：老现场的服务定义**不需要**改（本来就没带身份行）；只有「当初用 `--run-as` 装的」
+    现场要保持非 root，得改用 `--user` 作用域。
 
 ## [0.19.2-alpha] - 2026-11-04
 

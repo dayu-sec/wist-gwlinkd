@@ -2402,7 +2402,7 @@ fn report_unlink(report: &UnlinkReport) {
 fn run_service(args: &[String]) -> ExitCode {
     let Some(action) = args.first().map(String::as_str) else {
         eprintln!(
-            "用法：wist-gwlinkd service <print|install|uninstall|status> [--system|--user] [--bin PATH] [--config PATH] [--pub-config PATH] [--run-as USER] [--run-as-group GROUP] [--force] [--no-activate]"
+            "用法：wist-gwlinkd service <print|install|uninstall|status> [--system|--user] [--bin PATH] [--config PATH] [--pub-config PATH] [--force] [--no-activate]"
         );
         return ExitCode::from(2);
     };
@@ -2423,8 +2423,6 @@ fn service_command(action: &str, rest: &[String]) -> GwlinkdResult<()> {
     let mut bin: Option<PathBuf> = None;
     let mut config: Option<PathBuf> = None;
     let mut pub_config: Option<PathBuf> = None;
-    let mut run_as: Option<String> = None;
-    let mut run_as_group: Option<String> = None;
     let mut force = false;
     let mut activate = true;
     let mut i = 0;
@@ -2437,14 +2435,6 @@ fn service_command(action: &str, rest: &[String]) -> GwlinkdResult<()> {
             "--user" => {
                 scope = Some(service::ServiceScope::User);
                 i += 1;
-            }
-            "--run-as" => {
-                run_as = Some(need_arg(rest, i + 1, "--run-as")?);
-                i += 2;
-            }
-            "--run-as-group" => {
-                run_as_group = Some(need_arg(rest, i + 1, "--run-as-group")?);
-                i += 2;
             }
             "--force" => {
                 force = true;
@@ -2472,14 +2462,6 @@ fn service_command(action: &str, rest: &[String]) -> GwlinkdResult<()> {
 
     // 默认 system（正式运行即系统级常驻）；要用户级就显式 --user。
     let scope = scope.unwrap_or(service::ServiceScope::System);
-    // --run-as 只在 system 作用域有意义：systemd `User=` / launchd `UserName` 让系统服务**以非 root 运行**。
-    if run_as.is_some() && scope != service::ServiceScope::System {
-        return Err(GwlinkdReason::InvalidArgs
-            .err("--run-as 只对 --system 作用域有效（--user 本就以本人运行）"));
-    }
-    if run_as_group.is_some() && run_as.is_none() {
-        return Err(GwlinkdReason::InvalidArgs.err("--run-as-group 需要同时给 --run-as"));
-    }
     // `service status` 是只读的：`--bin` / `--config` / `--pub-config` 没给时，回落到**已装定义**里
     // 那份，而不是 `/etc/wist-gwlinkd/gwlinkd.toml` 这类作用域默认值 —— 它报的才是「这个服务」的真相。
     // 只落到 `status`：`install` 是写操作，不能拿旧定义当缺省去重写它自己。
@@ -2505,9 +2487,7 @@ fn service_command(action: &str, rest: &[String]) -> GwlinkdResult<()> {
         None => service::default_config_path(scope)?,
     };
     let layout = service::ServiceLayout::resolve(platform, scope)?;
-    let spec = service::ServiceSpec::new(scope, bin, config)
-        .with_run_as(run_as, run_as_group)
-        .with_pub_config(pub_config);
+    let spec = service::ServiceSpec::new(scope, bin, config).with_pub_config(pub_config);
 
     match action {
         "print" => {

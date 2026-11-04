@@ -38,35 +38,6 @@ pub fn log_dir(scope: ServiceScope) -> ServiceResult<PathBuf> {
     }
 }
 
-/// 把 stdio 落点交给**运行身份**（`system` + `--run-as` 才有意义）。
-///
-/// 为什么必须做：带 `UserName` 的 LaunchDaemon，launchd 会用**该用户**去打开 `StandardOutPath` /
-/// `StandardErrorPath`；而 `service install` 是经 `sudo` 以 **root** 跑的，`create_dir_all` 建出来的
-/// 目录是 `root:wheel`（0755）—— 用户写不了这两个文件，于是
-/// `posix_spawn` 直接失败：`Service could not initialize: posix_spawn(...) error 0xd - Permission denied`，
-/// 而且**应用日志永远是空的**（launchd 连文件都没建），现场极易误判成「配置/二进制不对」。
-///
-/// 一并处理**已存在**的 stdio 文件：老安装是由 root 建的（那时服务可能以 root 在跑），
-/// 打开「已存在但写不了」的文件一样 EACCES。
-pub(super) fn hand_log_dir_to_run_as(log_dir: &Path, spec: &ServiceSpec) -> ServiceResult<()> {
-    // user 作用域本就以本人运行，目录天然可写。
-    if spec.scope != ServiceScope::System {
-        return Ok(());
-    }
-    let Some(user) = spec.run_as.as_deref() else {
-        return Ok(());
-    };
-    let identity = super::resolve_user(user, spec.run_as_group.as_deref())?;
-    super::chown_path(log_dir, identity, "launchd 日志目录")?;
-    for name in [STDOUT_FILE, STDERR_FILE] {
-        let file = log_dir.join(name);
-        if file.exists() {
-            super::chown_path(&file, identity, "launchd stdio 文件")?;
-        }
-    }
-    Ok(())
-}
-
 /// 渲染 plist 文本。`log_dir_override` 为 `None` 时回退到作用域默认日志目录。
 pub fn plist_text(spec: &ServiceSpec, log_dir_override: Option<&Path>) -> String {
     let working_dir = match spec.scope {
@@ -83,14 +54,6 @@ pub fn plist_text(spec: &ServiceSpec, log_dir_override: Option<&Path>) -> String
     text.push_str("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n");
     text.push_str("<plist version=\"1.0\">\n<dict>\n");
     text.push_str(&kv_string("Label", LAUNCHD_LABEL));
-    // LaunchDaemon（system 作用域）可选**非 root 运行**：身份回写 / gops 升级在部署用户下完成。
-    // UserAgent（user 作用域）不加（那本就以本人运行）。
-    if let Some(user) = spec.run_as_identity() {
-        text.push_str(&kv_string("UserName", user));
-        if let Some(group) = spec.run_as_group.as_deref() {
-            text.push_str(&kv_string("GroupName", group));
-        }
-    }
     text.push_str("  <key>ProgramArguments</key>\n  <array>\n");
     text.push_str(&format!(
         "    <string>{}</string>\n",
@@ -301,49 +264,6 @@ mod tests {
         assert_eq!(
             plist_path(ServiceScope::System).expect("plist path"),
             PathBuf::from("/Library/LaunchDaemons/com.dayu-sec.wist-gwlinkd.plist")
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn plist_path_includes_the_run_as_users_bin_dirs() {
-        // gops / gx 由安装脚本装在 ~/bin；launchd 默认 PATH 不含用户目录，
-        // 不带就会在升级执行器 spawn 时 ENOENT（os error 2）。
-        let spec = ServiceSpec::new(
-            ServiceScope::System,
-            PathBuf::from("/usr/local/bin/wist-gwlinkd"),
-            PathBuf::from("/etc/wist-gwlinkd/gwlinkd.toml"),
-        )
-        .with_run_as(Some("root".to_string()), None);
-        let path = crate::service::service_path(&spec);
-        assert_eq!(path.split(':').count(), 8, "PATH 应含用户 bin：{path}");
-        let text = plist_text(&spec, None);
-        assert!(
-            text.contains(&escape_xml(&path)),
-            "plist PATH 未带上运行用户的 ~/bin：\n{text}"
-        );
-        // `HOME` 也要跟 **--run-as 的运行身份**。
-        let home = crate::service::service_home(&spec).expect("运行身份的家目录");
-        assert!(
-            text.contains(&escape_xml(&home.display().to_string())),
-            "plist HOME 不对：\n{text}"
-        );
-    }
-
-    /// `--run-as` 指到不存在的用户：不写 `HOME`（与 systemd 同口径）。
-    #[cfg(unix)]
-    #[test]
-    fn plist_omits_home_when_the_run_as_user_is_unknown() {
-        let spec = ServiceSpec::new(
-            ServiceScope::System,
-            PathBuf::from("/usr/local/bin/wist-gwlinkd"),
-            PathBuf::from("/etc/wist-gwlinkd/gwlinkd.toml"),
-        )
-        .with_run_as(Some("no-such-user-for-test".to_string()), None);
-        assert!(crate::service::service_home(&spec).is_none());
-        assert!(
-            !plist_text(&spec, None).contains("<key>HOME</key>"),
-            "未知运行身份不该写 HOME"
         );
     }
 

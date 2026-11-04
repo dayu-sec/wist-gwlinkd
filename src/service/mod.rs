@@ -145,14 +145,6 @@ pub struct ServiceSpec {
     /// （主配置是渲染物，重渲会把它抹掉），而它不一定与主配置同目录（栈布局下在
     /// `identity/gwlinkd/`）。不给就只能靠同目录约定名 —— 那条在栈布局下找不到。
     pub pub_config: Option<PathBuf>,
-    /// `system` 作用域下**以该用户身份运行**（systemd `User=` / launchd `UserName`）。
-    /// `None` = 沿用默认（system 作用域 = root）。
-    /// 为什么要它：gwlinkd 会回写 `gwlinkd.toml`（接入券）、在 `state_dir` 落身份/凭据，
-    /// 且 `upgrader` 会在 `upgrade_project_dir` 里跑 `gops prj upgrade` —— 这些都应是**部署用户**
-    /// 的属主，不能是 root。`user` 作用域无此字段（那本就以本人运行）。
-    pub run_as: Option<String>,
-    /// 与 [`Self::run_as`] 配套的组（systemd `Group=` / launchd `GroupName`）；`None` = 用户主组。
-    pub run_as_group: Option<String>,
 }
 
 impl ServiceSpec {
@@ -162,8 +154,6 @@ impl ServiceSpec {
             bin,
             config_path,
             pub_config: None,
-            run_as: None,
-            run_as_group: None,
         }
     }
 
@@ -171,21 +161,6 @@ impl ServiceSpec {
     pub fn with_pub_config(mut self, pub_config: Option<PathBuf>) -> Self {
         self.pub_config = pub_config;
         self
-    }
-
-    /// 设置 `system` 作用域的运行身份（`--run-as` / `--run-as-group`）。
-    pub fn with_run_as(mut self, run_as: Option<String>, run_as_group: Option<String>) -> Self {
-        self.run_as = run_as;
-        self.run_as_group = run_as_group;
-        self
-    }
-
-    /// 运行身份是否完整可用（systemd `User=` 才认；user 作用域忽略该字段）。
-    pub fn run_as_identity(&self) -> Option<&str> {
-        match self.scope {
-            ServiceScope::System => self.run_as.as_deref(),
-            ServiceScope::User => None,
-        }
     }
 
     /// systemd 服务管理器操作的 scope 参数（user 作用域需要 `--user`）。
@@ -249,21 +224,18 @@ pub(crate) fn service_path(spec: &ServiceSpec) -> String {
     parts.join(":")
 }
 
-/// 服务实际运行身份的家目录：user 作用域 = 本人；system + `--run-as` = 目标用户；
-/// system 无 `--run-as` = **root**（服务实际就以 root 跑）。
+/// 服务实际运行身份的家目录：user 作用域 = 本人；system 作用域 = **root**。
 ///
-/// 为什么 system 作用域不能返回 `None`：`HOME` 不只是 `~/bin` 的前缀 —— `gops` 的项目模板
-/// 按它展开（如 `ops-prj.yml` 的 `backup.target: ${HOME}/.backups`），而 systemd **默认不设
+/// system 作用域没有「非 root 运行」这回事（`--run-as` 已取消）：gwlinkd 要做的是
+/// 写栈文件、 `chown` 挂载点（`gops sys perms`）、自更新覆盖 `/usr/local/lib` —— 都需要 root。
+///
+/// 为什么要它：`HOME` 不只是 `~/bin` 的前缀 —— `gops` 的项目模板按它展开
+/// （如 `ops-prj.yml` 的 `backup.target: ${HOME}/.backups`），而 systemd **默认不设
 /// `HOME`**。缺了它，备份会落到项目的**字面量** `${HOME}/` 目录里（2026-11-04 的网关升级现场）。
 pub(crate) fn service_home(spec: &ServiceSpec) -> Option<PathBuf> {
     match spec.scope {
         ServiceScope::User => home_dir().ok(),
-        // `--run-as` 的用户查不到就不给 HOME（不要静默拿 root 的家目录充数：那会让路径
-        // 与真实运行身份不符，且 `service install` 在别处对未知用户是报错的）。
-        ServiceScope::System => match spec.run_as.as_deref() {
-            Some(user) => user_home(user),
-            None => user_home("root"),
-        },
+        ServiceScope::System => user_home("root"),
     }
 }
 
@@ -367,19 +339,12 @@ pub fn install(
         format!("建目录 {} 失败", parent.display()),
     )?;
 
-    // 日志目录（launchd 系统级还要交给运行身份）—— 放在写定义**之前**：
-    // `--run-as` 查不到用户 / 目录建不出来时，就该在这里失败，别留个「定义写好了但起不来」的现场。
+    // 日志目录 —— 放在写定义**之前**：建不出来时就该在这里失败，别留个「定义写好了但起不来」的现场。
     if let Some(log_dir) = layout.log_dir.as_ref() {
         fs::create_dir_all(log_dir).source_err(
             ServiceReason::Io,
             format!("建日志目录 {} 失败", log_dir.display()),
         )?;
-        // launchd 会用 **`UserName`** 去打开 stdio 文件，而这里是以 root 建的目录（0755 root:wheel）——
-        // 交给运行身份，否则带 `--run-as` 的 LaunchDaemon 根本拉不起来（`posix_spawn` EACCES，
-        // 且**应用日志永远是空的**）。
-        if layout.platform == ServicePlatform::Launchd {
-            launchd::hand_log_dir_to_run_as(log_dir, spec)?;
-        }
     }
 
     // 原子写：先写临时文件再 rename，避免留下半截的服务定义。
@@ -766,74 +731,6 @@ fn current_uid() -> u32 {
     }
 }
 
-/// 把 `--run-as` / `--run-as-group` 的**用户名 / 组名**解析成 `(uid, gid)`。
-///
-/// 名字进 unit / plist 是对的（launchd / systemd 都按名字解析），但本进程要把目录**交出去**，
-/// 就得自己查一遍 —— 查不到（用户/组不存在）在这里直接报错，别留个「定义写好了但起不来」的现场。
-#[cfg(unix)]
-fn resolve_user(user: &str, group: Option<&str>) -> ServiceResult<(u32, u32)> {
-    let user_c = std::ffi::CString::new(user)
-        .map_err(|_| ServiceReason::InvalidArgs.err(format!("用户名非法：{user:?}")))?;
-    // `getpwnam` / `getgrnam` 返回**静态缓冲**、非线程安全。本仓只有本处（`install` 的准备阶段）
-    // 调它，没有并发查询 —— 若将来要在并发路径上查用户/组，得换成 `getpwnam_r` / `getgrnam_r`。
-    let passwd = unsafe { libc::getpwnam(user_c.as_ptr()) };
-    if passwd.is_null() {
-        return Err(ServiceReason::InvalidArgs.err(format!("查不到用户：{user}（--run-as）")));
-    }
-    let (uid, default_gid) = unsafe { ((*passwd).pw_uid, (*passwd).pw_gid) };
-    let gid = match group {
-        Some(group) => resolve_group(group)?,
-        None => default_gid,
-    };
-    Ok((uid, gid))
-}
-
-#[cfg(unix)]
-fn resolve_group(group: &str) -> ServiceResult<u32> {
-    let group_c = std::ffi::CString::new(group)
-        .map_err(|_| ServiceReason::InvalidArgs.err(format!("组名非法：{group:?}")))?;
-    let entry = unsafe { libc::getgrnam(group_c.as_ptr()) };
-    if entry.is_null() {
-        return Err(
-            ServiceReason::InvalidArgs.err(format!("查不到用户组：{group}（--run-as-group）"))
-        );
-    }
-    Ok(unsafe { (*entry).gr_gid })
-}
-
-#[cfg(not(unix))]
-fn resolve_user(_user: &str, _group: Option<&str>) -> ServiceResult<(u32, u32)> {
-    Err(ServiceReason::InvalidArgs.err("--run-as 只支持 Unix 平台"))
-}
-
-/// 把某个路径的属主改成 `(uid, gid)`（`what` 只用于报错时说清是什么东西）。
-///
-/// 用 `chown`（**跟随**符号链接）而不是 `lchown`：我们要的是**被打开的那个文件**可写 ——
-/// launchd 写 `StandardOutPath` 时会跟随链接，只改链接本身的属主等于没改。前提也成立：
-/// 这些目录是 `service install`（root）建的、不是人人可写，不存在被塞符号链接的余地。
-#[cfg(unix)]
-fn chown_path(path: &Path, identity: (u32, u32), what: &str) -> ServiceResult<()> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let (uid, gid) = identity;
-    let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| ServiceReason::InvalidArgs.err(format!("路径含 NUL：{}", path.display())))?;
-    let rc = unsafe { libc::chown(path_c.as_ptr(), uid, gid) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(ServiceReason::Io.err(format!(
-            "把{what} {} 交给运行身份（uid={uid}, gid={gid}）失败：{err}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn chown_path(_path: &Path, _identity: (u32, u32), _what: &str) -> ServiceResult<()> {
-    Ok(())
-}
-
 /// 只读探测某个路径是否存在（供状态输出使用）。
 pub fn path_state(path: &Path) -> String {
     if path.exists() {
@@ -987,51 +884,6 @@ mod tests {
     }
 
     #[test]
-    fn systemd_render_sets_run_as_user_and_group_for_system_scope() {
-        let layout = ServiceLayout::for_paths(
-            ServicePlatform::Systemd,
-            ServiceScope::System,
-            PathBuf::from("/etc/systemd/system/wist-gwlinkd.service"),
-            None,
-        );
-        let spec = spec(ServiceScope::System)
-            .with_run_as(Some("deploy".to_string()), Some("deploy".to_string()));
-        let text = render(&layout, &spec);
-        assert!(text.contains("User=deploy"), "{text}");
-        assert!(text.contains("Group=deploy"), "{text}");
-        // 仍是一个 system 级 unit（而非 user 级）。
-        assert!(text.contains("WantedBy=multi-user.target"), "{text}");
-    }
-
-    #[test]
-    fn systemd_render_omits_run_as_for_user_scope() {
-        // user 作用域本就以本人运行，不接受 User=（会与 user manager 冲突）。
-        let layout = ServiceLayout::for_paths(
-            ServicePlatform::Systemd,
-            ServiceScope::User,
-            PathBuf::from("/home/deploy/.config/systemd/user/wist-gwlinkd.service"),
-            None,
-        );
-        let spec = spec(ServiceScope::User).with_run_as(Some("deploy".to_string()), None);
-        let text = render(&layout, &spec);
-        assert!(!text.contains("User="), "{text}");
-    }
-
-    #[test]
-    fn launchd_render_sets_user_name_for_system_scope() {
-        let layout = ServiceLayout::for_paths(
-            ServicePlatform::Launchd,
-            ServiceScope::System,
-            PathBuf::from("/Library/LaunchDaemons/com.dayu-sec.wist-gwlinkd.plist"),
-            Some(PathBuf::from("/var/log/wist-gwlinkd")),
-        );
-        let spec = spec(ServiceScope::System).with_run_as(Some("deploy".to_string()), None);
-        let text = render(&layout, &spec);
-        assert!(text.contains("<key>UserName</key>"), "{text}");
-        assert!(text.contains("<string>deploy</string>"), "{text}");
-    }
-
-    #[test]
     fn launchd_render_keeps_alive_and_config_env() {
         let layout = ServiceLayout::for_paths(
             ServicePlatform::Launchd,
@@ -1078,47 +930,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn resolve_user_reads_identity_from_passwd() {
-        // root 一定存在，且 uid / 主组都是 0（root / wheel）—— 两个平台都成立。
-        assert_eq!(resolve_user("root", None).expect("root"), (0, 0));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn resolve_user_rejects_unknown_user_or_group() {
-        assert!(resolve_user("gwlinkd-no-such-user-zzz", None).is_err());
-        assert!(resolve_user("root", Some("gwlinkd-no-such-group-zzz")).is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn chown_path_accepts_current_identity() {
-        // 把属主改成**自己**（同 uid/gid）是允许的 —— 所以这条能在普通用户下跑、真过一遍 syscall
-        // （能捉到 CString / OsStrExt 那段的错）。
-        let dir = std::env::temp_dir().join(format!("gwlinkd-svc-chown-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("dir");
-        let file = dir.join("gwlinkd.err");
-        fs::write(&file, b"").expect("file");
-
-        let me = (current_uid(), unsafe { libc::getgid() });
-        chown_path(&dir, me, "测试目录").expect("chown dir");
-        chown_path(&file, me, "测试文件").expect("chown file");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn hand_log_dir_skips_without_run_as_or_for_user_scope() {
-        // 目录**故意不存在**：这两种情形必须在真正碰文件系统之前就返回。
-        let missing = std::env::temp_dir().join("gwlinkd-svc-logdir-does-not-exist");
-        assert!(launchd::hand_log_dir_to_run_as(&missing, &spec(ServiceScope::System)).is_ok());
-        let user_scope = spec(ServiceScope::User).with_run_as(Some("root".to_string()), None);
-        assert!(launchd::hand_log_dir_to_run_as(&missing, &user_scope).is_ok());
-    }
-
     #[test]
     fn read_definition_paths_dispatches_by_platform_and_tolerates_missing_files() {
         let dir = std::env::temp_dir().join(format!("gwlinkd-svc-defs-{}", std::process::id()));
@@ -1158,37 +969,6 @@ mod tests {
         // 文件不存在 → `None`（不是「空落点」——调用方靠这个 `None` 决定不回落）。
         let missing = dir.join("nope.service");
         assert!(read_definition_paths(ServicePlatform::Systemd, &missing).is_none());
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn hand_log_dir_rejects_unknown_run_as_before_touching_the_fs() {
-        // 查不到用户要**前置失败**（别留「定义写好了但起不来」的现场）—— 所以目录故意不存在：
-        // 在 chown 之前就该返回 Err，才不会建出一个谁都写不了的目录。
-        let missing = std::env::temp_dir().join("gwlinkd-svc-unknown-user-dir");
-        let spec = spec(ServiceScope::System)
-            .with_run_as(Some("gwlinkd-no-such-user-zzz".to_string()), None);
-        assert!(launchd::hand_log_dir_to_run_as(&missing, &spec).is_err());
-        assert!(!missing.exists(), "前置失败不该建目录");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn hand_log_dir_yields_dir_and_stdio_files_to_run_as() {
-        // 把自己当运行身份：chown 到同 uid/gid 是允许的 —— 于是整条路径（含两个 stdio 文件）
-        // 能在普通用户下真跑一遍。拿不到用户名（精简环境 / CI）就跳过。
-        let Some(me) = std::env::var("USER").ok().filter(|value| !value.is_empty()) else {
-            return;
-        };
-        let dir = std::env::temp_dir().join(format!("gwlinkd-svc-hand-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("dir");
-        fs::write(dir.join(launchd::STDERR_FILE), b"").expect("stderr file");
-        fs::write(dir.join(launchd::STDOUT_FILE), b"").expect("stdout file");
-
-        let spec = spec(ServiceScope::System).with_run_as(Some(me), None);
-        launchd::hand_log_dir_to_run_as(&dir, &spec).expect("交给运行身份");
 
         let _ = fs::remove_dir_all(&dir);
     }

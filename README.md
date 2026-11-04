@@ -79,26 +79,21 @@ sudo install -m 0755 wist-gwlinkd /usr/local/bin/
 sudo wist-gwlinkd service install --system --bin /usr/local/bin/wist-gwlinkd \
      --config /etc/wist-gwlinkd/gwlinkd.toml
 
-# 系统级、但**以非 root 的部署用户运行**（推荐）：仍是开机即起的系统服务，
-# 但进程属主 = 部署用户 —— 身份回写 / gops 升级都落在部署用户属主下（不会被 root 污染）。
-# 注意：`--config` 与 `state_dir` 必须该用户**可读写**（gwlinkd 会回写配置），典型放 `~/.wist-gwlinkd/`。
-sudo wist-gwlinkd service install --system --run-as deploy \
-     --bin /usr/local/bin/wist-gwlinkd --config /home/deploy/.wist-gwlinkd/gwlinkd.toml
-
 # macOS（LaunchDaemon: /Library/LaunchDaemons/com.dayu-sec.wist-gwlinkd.plist，KeepAlive）
 sudo wist-gwlinkd service install --system ...
 ```
 
-> 非 root 运行的部署要做**自更新**，真实二进制必须放在运行用户**可写**的目录（原子 `rename` 需要目录可写，
-> 只给文件写权限不够）：典型是 `/usr/local/lib/wist-gwlinkd/wist-gwlinkd`，而 `/usr/local/bin/wist-gwlinkd`
-> 只做指向它的**符号链接**。中心的 `install-all` / `install-linkd` 已按这个布局安装；手工装时也请照做。
+> 系统作用域固定以 **root** 运行（要写栈文件、`chown` 挂载点、自更新覆盖二进制，
+> 故不提供 `--run-as`）。要「以本人身份跑」就用 `--user` 作用域。
 
-- `--system`（默认）= 系统级（开机即起；Linux `multi-user.target` / macOS `LaunchDaemons`）；
-  `--user` = 登录后起（`~/.config/systemd/user` / `~/Library/LaunchAgents`）。
-- `--run-as <USER>`（配 `--run-as-group <GROUP>`，可选）：**系统级的非 root 运行身份** ——
-  systemd 写 `User=`/`Group=`、launchd 写 `UserName`/`GroupName`。用它的前提是 `--config`（`gwlinkd.toml`）
-  与 `state_dir` **该用户可读写**（gwlinkd 要回写接入券、落客户端证书）。**只对 `--system` 有效**
-  （`--user` 本就以本人运行；给了会报错）。不给 = 沿用 root。
+> **自更新**要求真实二进制所在**目录**对运行身份可写（原子 `rename`，只给文件写权限不够）。
+> 系统作用域固定以 root 运行，直接放在 `/usr/local/bin` 也能自更新；中心仍按
+> `/usr/local/lib/wist-gwlinkd/wist-gwlinkd`（真身）+ `/usr/local/bin/wist-gwlinkd`（符号链接）布局安装，
+> 两种都可用。
+
+- `--system`（默认）= 系统级（开机即起；Linux `multi-user.target` / macOS `LaunchDaemons`），
+  进程以 **root** 运行（无 `--run-as`：gwlinkd 要写栈文件、`chown` 挂载点、自更新覆盖二进制）；
+  `--user` = 登录后起且**以本人身份运行**（`~/.config/systemd/user` / `~/Library/LaunchAgents`）。
 - 配置走 **绝对路径**（`--config`，落进 `WIST_GWLINKD_CONFIG`；默认 system `/etc/wist-gwlinkd/gwlinkd.toml`、
   user `~/.wist-gwlinkd/gwlinkd.toml`）—— 服务启动时工作目录不确定，不能用相对的 `gwlinkd.toml`。
 - 日志：Linux → journald（`journalctl -u wist-gwlinkd -f`）；macOS → `/var/log/wist-gwlinkd/gwlinkd.err`
