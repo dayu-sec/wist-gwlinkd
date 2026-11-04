@@ -1590,4 +1590,22 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn an_absolute_tool_path_not_yet_on_disk_says_first_install() {
+        // 绝对路径 + 父目录在、文件尚不存在 = 「等中心派一版就落盘」的正常前置，
+        // 不能报成「不在 PATH」（那会让人去查装错）。仍是 WARN：确实还没装。
+        let dir = temp_dir("tool-first-install");
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("mkdir");
+        let target = bin_dir.join("gx");
+        let mut cfg = config(&dir);
+        cfg.upgrade.component = vec![tool_component("galaxy-flow", target.to_str())];
+        let report = diagnose(&cfg);
+        let check = report.find("upgrade.tool").expect("check");
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("尚未落盘"), "{}", check.detail);
+        assert!(!check.detail.contains("不在 PATH"), "{}", check.detail);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

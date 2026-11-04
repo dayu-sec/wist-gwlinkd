@@ -718,6 +718,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 绝对路径已存在（普通文件）→ 就把它当落点，**不去查 PATH**
+    /// （避免“配了 /usr/local/bin，结果覆盖了 PATH 上更靠前的同名副本”）。
+    #[test]
+    fn preflight_takes_the_configured_path_as_is_when_it_exists() {
+        let dir = temp_dir("preflight-existing-path");
+        let target = dir.join("bin").join("gops");
+        std::fs::create_dir_all(target.parent().expect("bin")).expect("mkdir");
+        write_exec(&target, b"OLD");
+        let (_, landed) = installer(&dir, "galaxy-ops", &target)
+            .preflight("galaxy-ops")
+            .expect("existing path");
+        assert_eq!(landed, target);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 配的路径已存在但是个目录 → 拒（不要尝试把目录重命名掉）。
+    #[test]
+    fn preflight_rejects_a_configured_path_that_is_a_directory() {
+        let dir = temp_dir("preflight-path-is-dir");
+        let target = dir.join("bin");
+        std::fs::create_dir_all(&target).expect("mkdir");
+        let err = installer(&dir, "galaxy-ops", &target)
+            .preflight("galaxy-ops")
+            .expect_err("directory is not a target");
+        assert!(err.contains("不是普通文件"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 父目录存在但是**文件** → 拒（与「目录不存在」同一道前置）。
+    #[test]
+    fn preflight_rejects_a_configured_path_whose_parent_is_a_file() {
+        let dir = temp_dir("preflight-parent-is-file");
+        let parent = dir.join("not-a-dir");
+        std::fs::write(&parent, b"x").expect("write");
+        let err = installer(&dir, "galaxy-ops", &parent.join("gops"))
+            .preflight("galaxy-ops")
+            .expect_err("parent is a file");
+        assert!(err.contains("目标目录不存在"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// 首次落盘：没有旧文件就不备份，说明文案也换成「已安装」。
     #[tokio::test]
     async fn install_creates_the_binary_at_a_configured_path_without_a_backup() {
@@ -734,6 +775,17 @@ mod tests {
             .expect("install");
         assert_eq!(std::fs::read(&target).expect("read"), b"NEW");
         assert!(detail.contains("首次落盘"), "{detail}");
+        // 首次落盘也要带可执行位（否则“装上了但跑不了”）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o755, "新二进制应带可执行位");
+        }
         // 没有旧版就不该产生备份（tool-backups 目录可以不存在，存在也应为空）。
         let backups = dir.join("tool-backups");
         let empty = !backups.exists()

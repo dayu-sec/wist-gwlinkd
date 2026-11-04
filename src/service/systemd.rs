@@ -245,6 +245,40 @@ mod tests {
             text.contains(&format!("Environment=PATH={}\n", systemd_arg(&path))),
             "unit PATH 未带上运行用户的 ~/bin：\n{text}"
         );
+        // `HOME` 也要跟 **--run-as 的运行身份**（不是安装者的）。
+        let home = crate::service::service_home(&spec).expect("运行身份的家目录");
+        assert!(
+            text.contains(&format!(
+                "Environment=HOME={}\n",
+                systemd_arg(&home.display().to_string())
+            )),
+            "unit HOME 不对：\n{text}"
+        );
+    }
+
+    /// `--run-as` 指到一个不存在的用户：**不补** HOME / 用户 bin 目录。
+    /// 不能静默拿 root 的家目录充数 —— 那与实际运行身份不符，会把路径引到别人家里。
+    #[cfg(unix)]
+    #[test]
+    fn unit_omits_home_when_the_run_as_user_is_unknown() {
+        let spec = ServiceSpec::new(
+            ServiceScope::System,
+            PathBuf::from("/usr/local/bin/wist-gwlinkd"),
+            PathBuf::from("/etc/wist-gwlinkd/gwlinkd.toml"),
+        )
+        .with_run_as(Some("no-such-user-for-test".to_string()), None);
+        assert!(crate::service::service_home(&spec).is_none());
+        let path = crate::service::service_path(&spec);
+        assert_eq!(
+            path.split(':').count(),
+            6,
+            "未知运行身份不补用户目录：{path}"
+        );
+        let text = unit_text(&spec);
+        assert!(
+            !text.contains("Environment=HOME="),
+            "未知运行身份不该写 HOME：\n{text}"
+        );
     }
 
     #[cfg(unix)]

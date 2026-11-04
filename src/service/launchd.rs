@@ -322,6 +322,29 @@ mod tests {
             text.contains(&escape_xml(&path)),
             "plist PATH 未带上运行用户的 ~/bin：\n{text}"
         );
+        // `HOME` 也要跟 **--run-as 的运行身份**。
+        let home = crate::service::service_home(&spec).expect("运行身份的家目录");
+        assert!(
+            text.contains(&escape_xml(&home.display().to_string())),
+            "plist HOME 不对：\n{text}"
+        );
+    }
+
+    /// `--run-as` 指到不存在的用户：不写 `HOME`（与 systemd 同口径）。
+    #[cfg(unix)]
+    #[test]
+    fn plist_omits_home_when_the_run_as_user_is_unknown() {
+        let spec = ServiceSpec::new(
+            ServiceScope::System,
+            PathBuf::from("/usr/local/bin/wist-gwlinkd"),
+            PathBuf::from("/etc/wist-gwlinkd/gwlinkd.toml"),
+        )
+        .with_run_as(Some("no-such-user-for-test".to_string()), None);
+        assert!(crate::service::service_home(&spec).is_none());
+        assert!(
+            !plist_text(&spec, None).contains("<key>HOME</key>"),
+            "未知运行身份不该写 HOME"
+        );
     }
 
     #[cfg(unix)]

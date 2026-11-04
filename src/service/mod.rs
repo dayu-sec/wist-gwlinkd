@@ -258,11 +258,12 @@ pub(crate) fn service_path(spec: &ServiceSpec) -> String {
 pub(crate) fn service_home(spec: &ServiceSpec) -> Option<PathBuf> {
     match spec.scope {
         ServiceScope::User => home_dir().ok(),
-        ServiceScope::System => spec
-            .run_as
-            .as_deref()
-            .and_then(user_home)
-            .or_else(|| user_home("root")),
+        // `--run-as` 的用户查不到就不给 HOME（不要静默拿 root 的家目录充数：那会让路径
+        // 与真实运行身份不符，且 `service install` 在别处对未知用户是报错的）。
+        ServiceScope::System => match spec.run_as.as_deref() {
+            Some(user) => user_home(user),
+            None => user_home("root"),
+        },
     }
 }
 
