@@ -632,7 +632,11 @@ fn upgrade_tools_check(config: &Config) -> Check {
             Some(path) => lines.push(format!("{} → {binary}（{}）", entry.name, path.display())),
             None => {
                 has_missing = true;
-                lines.push(format!("{} → {binary} 不在 PATH", entry.name));
+                lines.push(if binary.contains('/') {
+                    format!("{} → {binary} 尚未落盘（首次安装时创建）", entry.name)
+                } else {
+                    format!("{} → {binary} 不在 PATH", entry.name)
+                });
             }
         }
     }
@@ -648,7 +652,7 @@ fn upgrade_tools_check(config: &Config) -> Check {
         )
     } else if has_missing {
         Check::warn("upgrade.tool", "无状态工具未装到 PATH", detail).with_hint(
-            "tool-copy 就地覆盖 PATH 上的原二进制：先把工具装上，或把 binary 指向绝对路径",
+            "tool-copy 就地覆盖已存在的二进制；`binary` 写成绝对路径时首次安装会直接落盘（父目录需已存在）",
         )
     } else {
         Check::ok(

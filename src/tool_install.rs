@@ -90,10 +90,15 @@ impl ToolInstaller {
         self.binaries.contains_key(component)
     }
 
-    /// 发之前的前置校验：组件有目录项、`binary` 非空、且在 `PATH` 上能定位到**原位置**。
+    /// 发之前的前置校验：组件有目录项、`binary` 非空，且能定出**落点**。
     ///
-    /// 返回 `(二进制名, 原位置)`。任何一步不成立 → `Err(可读原因)`（**别发** —— 发出去只会
-    /// 以不可读的方式失败），驱动把它落成可读失败并回执。
+    /// 返回 `(二进制名, 落点)`。落点有两种形态：
+    /// - **裸名**（如 `gx`）：按 `$HOME/bin` → `PATH` 找**已存在**的原位置，找不到就报错；
+    /// - **含 `/` 的路径**（如 `/usr/local/bin/gops`）：运维**指定的落点** —— 已存在就就地覆盖，
+    ///   尚不存在就**首次落盘**（父目录必须已在：不替调用方创建系统目录）。
+    ///
+    /// 任何一步不成立 → `Err(可读原因)`（**别发** —— 发出去只能以不可读的方式失败），
+    /// 驱动把它落成可读失败并回执。
     pub fn preflight(&self, component: &str) -> UpgradeResult<(String, PathBuf)> {
         let binary = self.binaries.get(component).ok_or_else(|| {
             UpgradeReason::Preflight.err(format!("组件 {component} 不在本机组件目录里"))
@@ -103,9 +108,31 @@ impl ToolInstaller {
                 "组件 {component} 标了 install=tool-copy 却没配 binary：无法定位要覆盖的二进制"
             )));
         }
+        if binary.contains('/') {
+            let target = PathBuf::from(binary);
+            if target.exists() && !target.is_file() {
+                return Err(UpgradeReason::Preflight
+                    .err(format!("binary 指向的路径已存在但不是普通文件：{binary}")));
+            }
+            if !target.exists() {
+                let dir = target
+                    .parent()
+                    .filter(|dir| !dir.as_os_str().is_empty())
+                    .ok_or_else(|| {
+                        UpgradeReason::Preflight.err(format!("binary 没有父目录：{binary}"))
+                    })?;
+                if !dir.is_dir() {
+                    return Err(UpgradeReason::Preflight.err(format!(
+                        "binary 的目标目录不存在：{} —— 不替调用方创建目录，请先建好",
+                        dir.display()
+                    )));
+                }
+            }
+            return Ok((binary.clone(), target));
+        }
         let existing = which(binary).ok_or_else(|| {
             UpgradeReason::Preflight.err(format!(
-                "PATH 上找不到 {binary} 的原位置：无法就地覆盖安装（工具需已存在于 PATH）"
+                "PATH 上找不到 {binary} 的原位置：无法就地覆盖安装（工具需已存在于 PATH，或把 binary 写成绝对路径）"
             ))
         })?;
         Ok((binary.clone(), existing))
@@ -147,7 +174,7 @@ impl ToolInstaller {
         artifact: &str,
         expected_sha256: Option<&str>,
     ) -> UpgradeResult<String> {
-        if !existing.is_file() {
+        if component == crate::upgrade::SELF_COMPONENT && !existing.is_file() {
             return Err(UpgradeReason::Preflight.err(format!(
                 "组件 {component} 的自更新目标不存在或不是文件：{}",
                 existing.display()
@@ -323,15 +350,25 @@ fn replace_binary(
     )?;
     // 解析软链：覆盖的是**真身**，不是链接本身（否则会把链接换成普通文件）。
     let target = std::fs::canonicalize(existing).unwrap_or_else(|_| existing.to_path_buf());
-    // 备份名用**末段**（`binary` 可能是绝对路径，直接入名会把 `join` 拉回绝对路径）。
-    let backup = backup_dir.join(format!("{package_name}.{}", now_stamp()));
-    std::fs::copy(&target, &backup).map_err(|err| {
-        UpgradeReason::Io.err(format!(
-            "备份旧版失败 {} -> {}: {err}",
-            target.display(),
-            backup.display()
-        ))
-    })?;
+    // 旧版备份：只有真的存在旧文件才备（`binary` 写成绝对路径时的**首次落盘**没有旧版）。
+    let backup = if target.is_file() {
+        std::fs::create_dir_all(backup_dir).source_err(
+            UpgradeReason::Io,
+            format!("建备份目录失败 {}", backup_dir.display()),
+        )?;
+        // 备份名用**末段**（`binary` 可能是绝对路径，直接入名会把 `join` 拉回绝对路径）。
+        let backup = backup_dir.join(format!("{package_name}.{}", now_stamp()));
+        std::fs::copy(&target, &backup).map_err(|err| {
+            UpgradeReason::Io.err(format!(
+                "备份旧版失败 {} -> {}: {err}",
+                target.display(),
+                backup.display()
+            ))
+        })?;
+        Some(backup)
+    } else {
+        None
+    };
 
     // 原子替换：同目录写临时文件（同文件系统）→ rename 覆盖，读者要么看到旧、要么看到新。
     let new_bytes = std::fs::read(&source).source_err(
@@ -359,12 +396,19 @@ fn replace_binary(
             tmp.display()
         )));
     }
-    Ok(format!(
-        "已就地覆盖 {package_name}：{} ← {}（旧版备份 {}）",
-        target.display(),
-        source.display(),
-        backup.display()
-    ))
+    Ok(match backup {
+        Some(backup) => format!(
+            "已就地覆盖 {package_name}：{} ← {}（旧版备份 {}）",
+            target.display(),
+            source.display(),
+            backup.display()
+        ),
+        None => format!(
+            "已安装 {package_name}：{} ← {}（首次落盘，无旧版备份）",
+            target.display(),
+            source.display()
+        ),
+    })
 }
 
 /// gzip + tar 解包到 `staging`（`tar::Archive::unpack` 自带路径穿越防护）。
@@ -628,18 +672,26 @@ mod tests {
     #[test]
     fn preflight_reports_a_missing_binary_as_a_readable_failure() {
         let dir = temp_dir("preflight-missing");
+        // 裸名：$HOME/bin / PATH 里都找不到（用一个不会存在的名字）→ 拒（别发）。
         let installer = ToolInstaller::new(
-            BTreeMap::from([("galaxy-ops".to_string(), "/nonexistent/gops".to_string())]),
+            BTreeMap::from([("galaxy-ops".to_string(), "gops-absent-test-bin".to_string())]),
             dir.clone(),
             reqwest::Client::new(),
         );
         // 目录里没有的组件 → 拒。
         assert!(installer.preflight("galaxy-flow").is_err());
-        // 目录里有、但原位置不存在 → 拒（别发）。
         let err = installer
             .preflight("galaxy-ops")
             .expect_err("missing binary");
-        assert!(err.contains("PATH"), "{err}");
+        assert!(err.contains("PATH 上找不到"), "{err}");
+        // 绝对路径但父目录不存在 → 拒（不替调用方创建系统目录）。
+        let rooted = ToolInstaller::new(
+            BTreeMap::from([("galaxy-ops".to_string(), "/nonexistent/gops".to_string())]),
+            dir.clone(),
+            reqwest::Client::new(),
+        );
+        let err = rooted.preflight("galaxy-ops").expect_err("missing dir");
+        assert!(err.contains("目标目录不存在"), "{err}");
         // 空 binary → 拒。
         let blank = ToolInstaller::new(
             BTreeMap::from([("galaxy-ops".to_string(), String::new())]),
@@ -649,6 +701,47 @@ mod tests {
         assert!(blank.preflight("galaxy-ops").is_err());
         assert!(installer.handles("galaxy-ops"));
         assert!(!installer.handles("galaxy-flow"));
+    }
+
+    /// 绝对路径形态的 `binary`：目标还不存在但父目录在 → 允许**首次落盘**（center 直接装到
+    /// `/usr/local/bin` 就靠这条，不必先由安装脚本把文件放好）。
+    #[test]
+    fn preflight_accepts_a_configured_path_that_does_not_exist_yet() {
+        let dir = temp_dir("preflight-first-install");
+        let target = dir.join("bin").join("gops");
+        std::fs::create_dir_all(target.parent().expect("bin")).expect("mkdir");
+        let installer = installer(&dir, "galaxy-ops", &target);
+        let (binary, landed) = installer.preflight("galaxy-ops").expect("first install");
+        assert_eq!(binary, target.to_string_lossy());
+        assert_eq!(landed, target);
+        assert!(!landed.exists(), "前置只定落点，不碰盘");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 首次落盘：没有旧文件就不备份，说明文案也换成「已安装」。
+    #[tokio::test]
+    async fn install_creates_the_binary_at_a_configured_path_without_a_backup() {
+        let dir = temp_dir("first-install");
+        let target = dir.join("bin").join("gops");
+        std::fs::create_dir_all(target.parent().expect("bin")).expect("mkdir");
+        let artifact = dir.join("galaxy-ops-0.1.0-aarch64-apple-darwin.tar.gz");
+        let bytes = tool_archive("galaxy-ops-0.1.0-aarch64-apple-darwin/gops", b"NEW");
+        std::fs::write(&artifact, &bytes).expect("artifact");
+
+        let detail = installer(&dir, "galaxy-ops", &target)
+            .install("galaxy-ops", &artifact.to_string_lossy())
+            .await
+            .expect("install");
+        assert_eq!(std::fs::read(&target).expect("read"), b"NEW");
+        assert!(detail.contains("首次落盘"), "{detail}");
+        // 没有旧版就不该产生备份（tool-backups 目录可以不存在，存在也应为空）。
+        let backups = dir.join("tool-backups");
+        let empty = !backups.exists()
+            || std::fs::read_dir(&backups)
+                .expect("read backup dir")
+                .next()
+                .is_none();
+        assert!(empty, "首次安装不应产生备份：{}", backups.display());
         let _ = std::fs::remove_dir_all(dir);
     }
 

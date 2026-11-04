@@ -3,6 +3,17 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.19.2-alpha] - 2026-11-04
+
+### 新增
+
+- **`tool-copy` 支持首次落盘**：`[[upgrade.component]]` 的 `binary` 写成**绝对路径**
+  （如 `/usr/local/bin/gops`）时，目标不存在也能由中心派一版就装上去（父目录必须已在；
+  不替调用方创建系统目录）。裸名（`gops` / `gx`）行为不变：仍按 `$HOME/bin` → `PATH`
+  找已存在的原位置。这样「装在哪」由配置决定，不必先靠安装脚本把文件放好。
+- `binary` 指向的路径已存在但不是普通文件（目录 / 设备）→ 前置拒装。
+- `wist-gwlinkd diagnose` 对「绝对路径尚未落盘」报“首次安装时创建”，不再混成“不在 PATH”。
+
 ## [0.19.1-alpha] - 2026-11-04
 
 ### 修复

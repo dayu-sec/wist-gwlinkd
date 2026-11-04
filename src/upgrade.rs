@@ -2485,7 +2485,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// 标了 `tool-copy` 但 `binary` 在 `PATH` 上找不到 → **发之前**就落可读失败（不静默回落 gops）。
+    /// 标了 `tool-copy` 但 `binary` 在 `PATH` 上找不到（裸名）→ **发之前**就落可读失败（不静默回落 gops）。
+    /// 绝对路径形态不适用：那是运维指定的落点，允许首次落盘（见 tool_install 的用例）。
     #[tokio::test]
     async fn a_tool_copy_component_without_a_located_binary_fails_before_install() {
         use std::collections::BTreeMap;
@@ -2493,7 +2494,7 @@ mod tests {
         let dir = temp_dir("tool-preflight");
         let gops = GopsExecutor::new(arg_recording_script(&dir, 0).to_string_lossy().to_string());
         let tools = ToolInstaller::new(
-            BTreeMap::from([("galaxy-flow".to_string(), "/nonexistent/gx".to_string())]),
+            BTreeMap::from([("galaxy-flow".to_string(), "gx-absent-test-bin".to_string())]),
             &dir,
             reqwest::Client::new(),
         );
@@ -2502,7 +2503,7 @@ mod tests {
             .start("w-tool", "0.0.1", "0.1.0", Some("galaxy-flow"), None, None)
             .await
             .expect_err("preflight must fail");
-        assert!(err.contains("PATH"), "{err}");
+        assert!(err.contains("PATH 上找不到"), "{err}");
         let record = state::read_upgrade_record(&dir).expect("record");
         assert_eq!(record.status, "failed");
         assert_eq!(record.step, "preflight");
