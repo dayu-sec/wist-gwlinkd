@@ -18,11 +18,22 @@ use crate::config::Config;
 use crate::state;
 use crate::sys_root::control_workdir;
 use crate::task_log::{self, TaskLog};
-use crate::wparse_env::{is_tag_safe, value_preview};
+use crate::wparse_env::{is_tag_safe, resolve_work_dir, value_preview};
 
 const STATUS_PATH: &str = "/admin/v1/runtime/status";
 const RELOAD_PATH: &str = "/admin/v1/reloads/model";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// 上游 `error` 字段带进回执时最多保留这么多字符（原文可能很长，中心侧只用于展示）。
+const UPSTREAM_ERROR_LIMIT: usize = 400;
+/// 「磁盘快满」判定：可用空间低于 64 MiB，或占比低于 2% **且**不足 1 GiB。
+///
+/// 只看占比会误报大容量磁盘（1 TB 盘剩 18 GiB 也是 1.8%）；只看绝对值又会漏掉小卷。
+/// 磁盘写满时 wparse 往往只回一句与磁盘无关的配置错误（如 `set origin URL failed`），
+/// 这里主动量一下余量，把真正的现场带回中心。
+const LOW_DISK_BYTES: u64 = 64 * 1024 * 1024;
+const LOW_DISK_PERCENT: f64 = 2.0;
+const LOW_DISK_PERCENT_CEILING: u64 = 1024 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
 /// 请求体在日志里只留这么多字节的头部预览。
 ///
 /// 发布命令的 body 是整套模型（可能几百 KB）：整段写盘会（1）把 `output.log` 的 4 MiB
@@ -185,6 +196,17 @@ pub async fn run(
             .await
         };
         let (ok, status, mut error) = outcome(&result);
+        // 只在**上游调用本身失败**（5xx / 传输错误）时补磁盘余量：本地拒绝（路径白名单 /
+        // 载荷不合法等 4xx）与磁盘写满无关，别把排障带偏。
+        if !ok
+            && result.status_code >= 500
+            && let Some(note) = low_disk_note(&config)
+        {
+            error = Some(match error {
+                Some(err) => format!("{err}；{note}"),
+                None => note,
+            });
+        }
         // 收尾在回执**之前**：失败时要把日志目录带回中心（升级链路同口径）。
         let log_dir = task
             .as_ref()
@@ -285,11 +307,108 @@ fn body_field(body: &Option<serde_json::Value>, key: &str) -> Option<String> {
 fn outcome(result: &UpstreamResult) -> (bool, &'static str, Option<String>) {
     let rejected = result.status_code >= 400;
     let ok = result.error.is_none() && !rejected;
-    let error = result
-        .error
-        .clone()
-        .or_else(|| rejected.then(|| format!("wparse 上游返回 {}", result.status_code)));
+    let error = result.error.clone().or_else(|| {
+        rejected.then(|| {
+            let mut message = format!("wparse 上游返回 {}", result.status_code);
+            // 只报状态码会把上游真正的失败原因丢掉：磁盘满时 wparse 回的就是这句
+            // `update_failed` + 一段配置错误原文，中心侧完全看不到。
+            if let Some(detail) = upstream_error_detail(&result.body) {
+                message.push_str(": ");
+                message.push_str(&detail);
+                if let Some(hint) = write_failure_hint(&detail) {
+                    message.push('（');
+                    message.push_str(hint);
+                    message.push('）');
+                }
+            }
+            message
+        })
+    });
     (ok, if ok { "ok" } else { "failed" }, error)
+}
+
+/// 上游响应体里的 `error` 字段（单行、有限长度）。
+///
+/// wparse 管理面的失败响应是 `{"request_id":…,"error":"…"}`；多行错误压成一行，
+/// 免得回执 / journald 的一行日志被换行拆开。
+fn upstream_error_detail(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let detail = value.get("error")?.as_str()?.trim();
+    if detail.is_empty() {
+        return None;
+    }
+    let flat = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = flat.chars();
+    let bounded: String = chars.by_ref().take(UPSTREAM_ERROR_LIMIT).collect();
+    Some(if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    })
+}
+
+/// wparse 把「本地写盘失败」包成了很难懂的一句话；原文照传之外再补一句可操作的提示。
+fn write_failure_hint(detail: &str) -> Option<&'static str> {
+    // 只认稳定的短语（不区分大小写）：wparse 的文案随版本可能微调，硬匹配整句很容易失效。
+    detail
+        .to_ascii_lowercase()
+        .contains("origin url")
+        .then_some("wparse 写仓库配置失败：常见原因是 work 目录所在磁盘写满、只读挂载或权限不足")
+}
+
+/// 磁盘余量不足时的补充说明（量不出 / 空间充足 → `None`，不污染正常回执）。
+fn low_disk_note(config: &Config) -> Option<String> {
+    // 优先量 wparse 真正要写的 work 目录；解析不出时退回状态目录（通常同一块盘）。
+    let path = resolve_work_dir(config).unwrap_or_else(|_| config.state_dir.clone());
+    let (available, total) = disk_space(&path)?;
+    if !is_low_disk(available, total) {
+        return None;
+    }
+    let percent = if total == 0 {
+        0.0
+    } else {
+        available as f64 / total as f64 * 100.0
+    };
+    Some(format!(
+        "本机磁盘（{}）可用 {} MiB / {} MiB（{percent:.1}%），疑似磁盘写满",
+        path.display(),
+        available / MIB,
+        total / MIB
+    ))
+}
+
+/// 可用空间是否已到「快满」程度。
+fn is_low_disk(available: u64, total: u64) -> bool {
+    let percent = if total == 0 {
+        0.0
+    } else {
+        available as f64 / total as f64 * 100.0
+    };
+    available < LOW_DISK_BYTES
+        || (percent < LOW_DISK_PERCENT && available < LOW_DISK_PERCENT_CEILING)
+}
+
+/// 目录所在文件系统的（可用, 总量）字节数。
+fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statvfs` 只写调用方提供的 `stat`；路径已转成 NUL 结尾的 C 字符串。
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let unit = if stat.f_frsize == 0 {
+        // POSIX 允许 `f_frsize` 未定义（0）：退回 `f_bsize`，否则会算出 0/0。
+        stat.f_bsize as u64
+    } else {
+        stat.f_frsize as u64
+    };
+    if unit == 0 {
+        return None;
+    }
+    Some((stat.f_bavail as u64 * unit, stat.f_blocks as u64 * unit))
 }
 
 /// 把日志目录拼进回执错误。
@@ -1963,7 +2082,11 @@ mod tests {
         let (ok, status, error) = outcome(&result);
         assert!(!ok);
         assert_eq!(status, "failed");
-        assert_eq!(error.as_deref(), Some("wparse 上游返回 422"));
+        assert_eq!(
+            error.as_deref(),
+            Some("wparse 上游返回 422: invalid model"),
+            "上游真正的失败原因要带回回执"
+        );
 
         let ok_result = UpstreamResult {
             status_code: 200,
@@ -1981,6 +2104,86 @@ mod tests {
         assert!(!ok);
         assert_eq!(status, "failed");
         assert!(error.unwrap().contains("refused"));
+    }
+
+    #[test]
+    fn upstream_error_detail_is_one_line_and_bounded() {
+        // 现场原文：多行，“configuration error << core config” + 缩进的 Info。
+        let body = serde_json::json!({
+            "request_id": "cmd-1",
+            "accepted": false,
+            "result": "update_failed",
+            "error": "configuration error << core config\n  -> Info: set origin URL failed",
+        })
+        .to_string();
+        assert_eq!(
+            upstream_error_detail(&body).as_deref(),
+            Some("configuration error << core config -> Info: set origin URL failed")
+        );
+
+        assert_eq!(upstream_error_detail("not json"), None);
+        assert_eq!(upstream_error_detail(r#"{"error":"  "}"#), None);
+        assert_eq!(upstream_error_detail(r#"{"error":42}"#), None);
+
+        let long = "字".repeat(UPSTREAM_ERROR_LIMIT + 10);
+        let detail = upstream_error_detail(&serde_json::json!({ "error": long }).to_string())
+            .expect("detail");
+        assert_eq!(detail.chars().count(), UPSTREAM_ERROR_LIMIT + 1); // + 省略号
+        assert!(detail.ends_with('…'), "{detail}");
+    }
+
+    #[test]
+    fn a_write_failure_gets_an_actionable_hint() {
+        // 磁盘满时 wparse 只回这句 —— 回执要同时给出原因和可操作的下一步。
+        let body = r#"{"request_id":"cmd-1","accepted":false,"result":"update_failed","error":"configuration error << core config\n  -> Info: set origin URL failed"}"#;
+        let result = UpstreamResult {
+            status_code: 500,
+            body: body.to_string(),
+            error: None,
+        };
+        let (ok, _, error) = outcome(&result);
+        assert!(!ok);
+        let error = error.expect("error");
+        assert!(error.contains("set origin URL failed"), "{error}");
+        assert!(error.contains("磁盘写满"), "{error}");
+
+        let unrelated = UpstreamResult {
+            status_code: 500,
+            body: r#"{"error":"model invalid"}"#.to_string(),
+            error: None,
+        };
+        let (_, _, error) = outcome(&unrelated);
+        assert!(!error.unwrap().contains("磁盘写满"));
+
+        // wparse 的文案大小写 / 措辞可能变：只认稳定的 `origin URL` 短语。
+        let upper = UpstreamResult {
+            status_code: 500,
+            body: r#"{"error":"CONFIGURATION ERROR: SET ORIGIN URL FAILED"}"#.to_string(),
+            error: None,
+        };
+        let (_, _, error) = outcome(&upper);
+        assert!(error.unwrap().contains("磁盘写满"));
+    }
+
+    #[test]
+    fn disk_space_reads_a_real_filesystem() {
+        let state = temp_state("disk");
+        let (available, total) = disk_space(&state).expect("statvfs");
+        assert!(total > 0, "total={total}");
+        assert!(available <= total, "available={available} total={total}");
+    }
+
+    #[test]
+    fn low_disk_is_about_headroom_not_just_percentage() {
+        const GIB: u64 = 1024 * MIB;
+        // 大容量磁盘剩 18 GiB（1.8%）不属于“写不进去”。
+        assert!(!is_low_disk(18 * GIB, 1024 * GIB));
+        assert!(!is_low_disk(50 * GIB, 1024 * GIB));
+        // 小卷只剩 9 MiB（1.8%）则真的要报。
+        assert!(is_low_disk(9 * MIB, 500 * MIB));
+        // 绝对余量太小，无论占比如何都要报。
+        assert!(is_low_disk(10 * MIB, 1024 * GIB));
+        assert!(is_low_disk(0, 1024 * GIB));
     }
 
     #[test]

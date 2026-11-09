@@ -104,6 +104,67 @@ pub struct UpgradeDriver {
     restart_requested: Arc<AtomicBool>,
 }
 
+/// 目标组件在本机的**已装版本**（升级记录 / 回执里的 `from_version`）。
+///
+/// 为什么要读盘：`from_version` 的语义是“**现在装的是哪版**”。它以前被游标里的
+/// `last_to_version` 顶替 —— 那是“上一次**计划要去的**版本”：计划失败、或现场后来被手工
+/// 换过版本，这个值就与事实不符（2026-11-08 现场：实际装的是 `0.8.41`，回执写成
+/// `v0.29.0-beta`，于是一次正常升级在台账上看起来像“降级”）。
+///
+/// 口径（**先精确、后推断，不猜**）：
+/// - 自身（[`SELF_COMPONENT`]）：进程就是它，直接自报；
+/// - 显式配了 `upgrade_project_name`：它**必须**对上系统（与 `GopsExecutor::resolve_name`
+///   同口径：对不上就前置失败）—— 这里同样直接 `None`，**不**换一个系统记版本；
+/// - 否则按计划里的**组件名**定位系统根；
+/// - 两者都没点名：工程里**唯一**的系统才敢认，多个交给调用方回落；
+/// - 定位不到 / 没有 `version.txt`：`None`，由调用方决定回落。
+///
+/// **不要**用 gwlinkd 自身版本去顶替其它组件：版本空间不同。`tool-copy` 组件同理，
+/// 见 [`UpgradeDriver::from_version`]。
+pub fn installed_version(
+    project_root: Option<&Path>,
+    project_name: Option<&str>,
+    component: Option<&str>,
+) -> Option<String> {
+    if component == Some(SELF_COMPONENT) {
+        return Some(crate::VERSION.to_string());
+    }
+    let root = project_root?;
+    let systems = crate::sys_root::systems_under(root);
+    let find = |name: &str| {
+        systems
+            .iter()
+            .find(|sys| crate::sys_root::system_matches(sys, name))
+    };
+
+    // 显式工程名优先，且**必须**对得上：继续用组件名去找，会把版本记到另一个系统名下。
+    if let Some(name) = named(project_name) {
+        return find(name).and_then(|dir| read_version_txt(dir));
+    }
+    if let Some(name) = named(component) {
+        return find(name).and_then(|dir| read_version_txt(dir));
+    }
+    // 都没点名：只有唯一系统才敢认，多个交给调用方回落。
+    match systems.as_slice() {
+        [only] => read_version_txt(only),
+        _ => None,
+    }
+}
+
+/// 非空的名字（空白与未配置同义）。
+fn named(name: Option<&str>) -> Option<&str> {
+    name.map(str::trim).filter(|name| !name.is_empty())
+}
+
+/// `<系统根>/version.txt`（与栈“这套部署是哪版”同一个来源）。
+///
+/// 只取**第一个非空行**：文件被写坏成多行时别把整段带进回执。
+fn read_version_txt(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("version.txt")).ok()?;
+    let version = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    Some(version.to_string())
+}
+
 impl UpgradeDriver {
     /// 建驱动：给定执行器适配器与状态目录。
     pub fn new(executor: impl UpgradeExecutor + 'static, state_dir: impl Into<PathBuf>) -> Self {
@@ -137,6 +198,29 @@ impl UpgradeDriver {
     pub fn with_tools(mut self, tools: ToolInstaller) -> Self {
         self.tools = Some(Arc::new(tools));
         self
+    }
+
+    /// 升级回执里的 `from_version`：**本机实装版本**；`None` = 无从得知（调用方回落游标）。
+    ///
+    /// 与 [`installed_version`] 的差别只有一条：`tool-copy` 组件是**宿主无状态工具**，
+    /// 不是栈的一部分（版本空间不同）—— 绝不拿栈的 `version.txt` 顶替它，宁可回落。
+    pub fn from_version(
+        &self,
+        project_root: Option<&Path>,
+        project_name: Option<&str>,
+        component: Option<&str>,
+    ) -> Option<String> {
+        if component.is_some_and(|component| self.is_tool_component(component)) {
+            return None;
+        }
+        installed_version(project_root, project_name, component)
+    }
+
+    /// 该组件是否由本机的 `tool-copy` 安装器处理。
+    fn is_tool_component(&self, component: &str) -> bool {
+        self.tools
+            .as_ref()
+            .is_some_and(|tools| tools.handles(component))
     }
 
     /// 声明自更新目标（服务定义里的二进制 + 当前进程）。
@@ -1235,6 +1319,132 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         dir
+    }
+
+    /// 造一个最小工程：`<root>/<sys>/sys/sys_model.yml` + `version.txt`。
+    fn project_with_system(root: &Path, dir_name: &str, version: Option<&str>) {
+        let sys = root.join(dir_name);
+        std::fs::create_dir_all(sys.join("sys")).expect("sys dir");
+        std::fs::write(
+            sys.join("sys/sys_model.yml"),
+            format!("name: {dir_name}\nkind: docker-compose\n"),
+        )
+        .expect("model");
+        if let Some(version) = version {
+            std::fs::write(sys.join("version.txt"), format!("{version}\n")).expect("version");
+        }
+    }
+
+    /// 回归（2026-11-08）：回执里的 `from_version` 必须是**实际已装版本**，
+    /// 不是游标里的「上次计划目标」——后者会把一次正常升级写成“降级”。
+    #[test]
+    fn installed_version_reads_system_version_txt() {
+        let root = temp_dir("installed-version");
+        project_with_system(&root, "wist-gateway-stack", Some("0.8.41"));
+
+        // 计划里带组件名（现场这种）
+        assert_eq!(
+            installed_version(Some(&root), None, Some("wist-gateway-stack")).as_deref(),
+            Some("0.8.41")
+        );
+        // 只配了工程名（工程名优先）
+        assert_eq!(
+            installed_version(Some(&root), Some("wist-gateway-stack"), None).as_deref(),
+            Some("0.8.41")
+        );
+        // 显式工程名对不上：直接 None，**不**改用组件名换一个系统记版本
+        assert_eq!(
+            installed_version(
+                Some(&root),
+                Some("no-such-system"),
+                Some("wist-gateway-stack")
+            ),
+            None
+        );
+        // 都没点名、工程里只有一个系统 → 就认它
+        assert_eq!(
+            installed_version(Some(&root), None, None).as_deref(),
+            Some("0.8.41")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn installed_version_is_none_when_unknown() {
+        let root = temp_dir("installed-version-none");
+        project_with_system(&root, "wist-gateway-stack", None);
+        // 没有 version.txt
+        assert_eq!(
+            installed_version(Some(&root), None, Some("wist-gateway-stack")),
+            None
+        );
+        // 不是工程里的系统（例如 tool-copy 组件）
+        assert_eq!(
+            installed_version(Some(&root), None, Some("wist-wparse")),
+            None
+        );
+        // 没有工程根（未配置 `upgrade_project_dir`）
+        assert_eq!(
+            installed_version(None, None, Some("wist-gateway-stack")),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn installed_version_reports_self() {
+        assert_eq!(
+            installed_version(None, None, Some(SELF_COMPONENT)).as_deref(),
+            Some(crate::VERSION)
+        );
+    }
+
+    /// 版本文件被写坏成多行时，只取第一个非空行（别把整段带进回执）。
+    #[test]
+    fn version_txt_uses_the_first_non_empty_line() {
+        let root = temp_dir("installed-version-first-line");
+        project_with_system(&root, "wist-gateway-stack", None);
+        std::fs::write(
+            root.join("wist-gateway-stack/version.txt"),
+            "\n  0.8.41  \nsecond-line\n",
+        )
+        .expect("version");
+        assert_eq!(
+            installed_version(Some(&root), None, Some("wist-gateway-stack")).as_deref(),
+            Some("0.8.41")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `tool-copy` 组件（宿主无状态工具）与栈不是同一版本空间：
+    /// 即使在同一个工程里，也不拿栈的 `version.txt` 顶替它。
+    #[test]
+    fn from_version_never_borrows_the_stack_version_for_a_tool() {
+        use std::collections::BTreeMap;
+
+        let root = temp_dir("from-version-tool");
+        project_with_system(&root, "wist-gateway-stack", Some("0.8.41"));
+        let tools = ToolInstaller::new(
+            BTreeMap::from([("galaxy-ops".to_string(), "gops".to_string())]),
+            root.join("state"),
+            reqwest::Client::new(),
+        );
+        let driver =
+            UpgradeDriver::new(GopsExecutor::new("true".to_string()), &root).with_tools(tools);
+
+        assert_eq!(
+            driver.from_version(Some(&root), None, Some("galaxy-ops")),
+            None,
+            "工具版本不能取栈的 version.txt"
+        );
+        // 工程里的系统照旧读得到。
+        assert_eq!(
+            driver
+                .from_version(Some(&root), None, Some("wist-gateway-stack"))
+                .as_deref(),
+            Some("0.8.41")
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 写一个忽略参数、按给定码退出的脚本（跨平台无关：只靠 `sh`）。

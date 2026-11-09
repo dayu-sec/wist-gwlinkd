@@ -748,12 +748,6 @@ async fn run(
                     // **只有升级**必须有目标版本；包下发（agent / 知识库）与未识动作也要进来：
                     // 否则空版本的计划会每轮重试且永远没有回执。
                     if !already {
-                        // 从版本取游标记的「上次目标」；不知道就 unknown（**不再拿 gwlinkd 自身版本硬比** —— 版本空间不同）。
-                        let from_version = if cursor.last_to_version.is_empty() {
-                            "unknown".to_string()
-                        } else {
-                            cursor.last_to_version.clone()
-                        };
                         log::info!(
                             "event=UpgradeDriven plan_id={:?} action={action} to_version={to_version} component={:?} sha256={}",
                             plan.plan_id,
@@ -829,6 +823,22 @@ async fn run(
                             )
                             .await;
                         } else if intent == PlanIntent::Upgrade {
+                            // `from_version` = **本机实装版本**（自身用进程版本；gops 系统读它的
+                            // `version.txt`）。`tool-copy` 工具与栈版本空间不同，**不**拿栈的版本顶替；
+                            // 读不到才回落游标里的「上次计划目标」，再不知道就是 unknown。
+                            let from_version = driver
+                                .from_version(
+                                    config.upgrade_project_dir.as_deref(),
+                                    config.upgrade_project_name.as_deref(),
+                                    plan.component.as_deref(),
+                                )
+                                .unwrap_or_else(|| {
+                                    if cursor.last_to_version.is_empty() {
+                                        "unknown".to_string()
+                                    } else {
+                                        cursor.last_to_version.clone()
+                                    }
+                                });
                             let reporter = UpgradeReporter {
                                 client: client.clone(),
                                 state_dir: config.state_dir.clone(),
