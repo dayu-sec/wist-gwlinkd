@@ -11,10 +11,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::time::MissedTickBehavior;
-use wist_control::DesiredBusinessIdentity;
+use wist_control::{DesiredBusinessIdentity, ReportAgentStatus};
 
 use crate::center::{CenterClient, WparseCommand, build_mtls_http_client};
 use crate::config::Config;
+use crate::gateway_agents::GatewayAgentsClient;
 use crate::state;
 use crate::sys_root::control_workdir;
 use crate::task_log::{self, TaskLog};
@@ -183,7 +184,13 @@ pub async fn run(
         }
 
         let result = if command.is_control() {
-            execute_control(&config, &command, task.as_deref()).await
+            // `report-agents` 需要 CenterClient（它既拉网关又转报中心），与其它本机控制命令不同，
+            // 所以在轮询循环里分派；`execute_control` 仍只管不碰中心的那些。
+            if command.kind == "report-agents" {
+                run_report_agents(&config, client, task.as_deref()).await
+            } else {
+                execute_control(&config, &command, task.as_deref()).await
+            }
         } else {
             execute(
                 &http,
@@ -533,6 +540,9 @@ async fn execute(
 /// 目前有 `diagnose` / `restart-gateway` / `restart-gwlinkd` / `bind-tenant`。未知 kind 一律**明确失败**
 /// （而不是静默当成功）—— 中心派了新命令但本机 gwlinkd 太旧时，要让人能从回执里看出来。
 ///
+/// `report-agents` 不在这里：它需要 `CenterClient`（拉网关 + 转报中心），在轮询循环里单独分派
+/// （见 [`run_report_agents`]）。
+///
 /// **指令规则**：「是否让数据面生效」是**指令的语义**，不是配置项：
 /// - `bind-tenant` 的语义就是「让这个租户生效」⇒ 一定写 `.env` 并跑生效动作；
 ///   `wparse_apply_command` 只能决定**怎么做**（重启方式），关不掉它。
@@ -553,6 +563,82 @@ async fn execute_control(
             record_event(task, "reject", &error);
             UpstreamResult {
                 status_code: 400,
+                body: String::new(),
+                error: Some(error),
+            }
+        }
+    }
+}
+
+/// `report-agents`：立即把 Agent 明细 / 数据清单上报中心一次。
+///
+/// 与 `main.rs` 的 60s 周期上报**同一内核**：环回读网关机队 → mTLS 转报中心。
+/// 周期是兜底，这条命令让中心可以「现在就要一份」（页面刷新 / 刚授权后核对）。
+async fn run_report_agents(
+    config: &Config,
+    center: &CenterClient,
+    task: Option<&TaskLog>,
+) -> UpstreamResult {
+    let Some(base) = config.gateway_self_endpoint.as_deref() else {
+        let error = "未配置 [gateway_self] endpoint，无法环回读取 Agent 明细".to_string();
+        record_event(task, "reject", &error);
+        return UpstreamResult {
+            status_code: 500,
+            body: String::new(),
+            error: Some(error),
+        };
+    };
+    let agents_client =
+        match GatewayAgentsClient::with_trust(base, config.gateway_self_ca.as_deref()) {
+            Ok(client) => client,
+            Err(err) => {
+                let error = format!("环回客户端初始化失败：{err}");
+                record_event(task, "reject", &error);
+                return UpstreamResult {
+                    status_code: 500,
+                    body: String::new(),
+                    error: Some(error),
+                };
+            }
+        };
+    let agents = match agents_client.fetch(&config.gateway_id).await {
+        Ok(agents) => agents,
+        Err(err) => {
+            let error = format!("拉取网关 Agent 明细失败：{err}");
+            record_event(task, "fetch.failed", &error);
+            return UpstreamResult {
+                status_code: 502,
+                body: String::new(),
+                error: Some(error),
+            };
+        }
+    };
+    let payload = ReportAgentStatus {
+        gateway_id: config.gateway_id.clone(),
+        agents,
+    };
+    match center.report_agent_status(&payload).await {
+        Ok(accepted) => {
+            record_event(
+                task,
+                "reported",
+                &format!("agents={}", accepted.agents_accepted),
+            );
+            UpstreamResult {
+                status_code: 200,
+                body: json!({
+                    "gateway_id": accepted.gateway_id,
+                    "agents_accepted": accepted.agents_accepted,
+                })
+                .to_string(),
+                error: None,
+            }
+        }
+        Err(err) => {
+            let error = format!("上报中心失败：{err}");
+            record_event(task, "report.failed", &error);
+            UpstreamResult {
+                status_code: 502,
                 body: String::new(),
                 error: Some(error),
             }
@@ -1717,6 +1803,94 @@ mod tests {
         assert!(command.is_control());
         assert!(should_record(&command), "控制类命令必须落任务目录");
         assert!(!should_record(&super::tests::command("GET", STATUS_PATH)));
+    }
+
+    /// `report-agents` 缺环回面时**明确失败**（不静默成功，也不去碰中心网络）。
+    #[test]
+    fn report_agents_without_a_loopback_endpoint_fails_closed() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let state = temp_state("report-agents-no-loopback");
+        let config = control_config(&state, &state, None, "/bin/false");
+        let center = CenterClient::new("http://127.0.0.1:1");
+        let result = runtime.block_on(run_report_agents(&config, &center, None));
+        assert_eq!(result.status_code, 500);
+        assert!(
+            result.error.unwrap_or_default().contains("gateway_self"),
+            "要指出缺的是环回面配置"
+        );
+    }
+
+    /// `report-agents` 成功路径：环回拉机队 → 原样 mTLS 转报中心。
+    #[tokio::test]
+    async fn report_agents_fetches_the_loopback_and_reports_the_fleet() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// 一次性 HTTP 服务：回固定响应，并把收到的**原始请求**回传。
+        async fn one_shot(
+            status: &'static str,
+            body: &'static str,
+        ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buffer = [0_u8; 8192];
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    let _ = tx.send(String::from_utf8_lossy(&buffer[..read]).to_string());
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                }
+            });
+            (format!("http://{addr}"), rx)
+        }
+
+        let state = temp_state("report-agents-ok");
+        let gateway_body = r#"{"gateway_id":"gw-1","agents":[{"agent_id":"agent-1","instance_id":"i","version":"0.4.0","status":"online","health":"healthy","last_seen_at":"2026-01-01T00:00:00Z"}]}"#;
+        let (gateway_url, gateway_request) = one_shot("200 OK", gateway_body).await;
+        let (center_url, center_request) =
+            one_shot("200 OK", r#"{"gateway_id":"gw-1","agents_accepted":1}"#).await;
+
+        let config_path = state.join("gwlinkd-report-agents.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "control_center_endpoint = \"{center_url}\"\ngateway_id = \"gw-1\"\nstate_dir = \"{}\"\ngateway_self_endpoint = \"{gateway_url}\"\n",
+                state.display()
+            ),
+        )
+        .expect("write config");
+        let config = Config::load(&config_path).expect("config");
+        let center = CenterClient::new(center_url);
+
+        let result = run_report_agents(&config, &center, None).await;
+        assert_eq!(result.status_code, 200, "{:?}", result.error);
+        assert!(
+            result.body.contains("\"agents_accepted\":1"),
+            "回执要带回中心确认的台数：{}",
+            result.body
+        );
+
+        let gateway_request = gateway_request.await.expect("gateway request");
+        assert!(
+            gateway_request.starts_with("GET /api/v1/gateway/agents?gateway_id=gw-1 "),
+            "{gateway_request}"
+        );
+        let center_request = center_request.await.expect("center request");
+        assert!(
+            center_request.starts_with("POST /api/v1/gateway/agents/status "),
+            "{center_request}"
+        );
+        assert!(
+            center_request.contains("\"agent_id\":\"agent-1\""),
+            "要把网关的机队原样转报：{center_request}"
+        );
     }
 
     #[test]

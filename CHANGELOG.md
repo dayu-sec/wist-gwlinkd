@@ -3,6 +3,19 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.21.0-alpha] - 2026-11-09
+
+### 新增
+
+- **`report-agents` 控制命令**：中心可以要求网关**立即**上报一次 Agent 明细 / 数据清单
+  （60s 周期仍是兜底）。gwlinkd 环回读网关机队后 mTLS 转报中心，回执带 `agents_accepted`。
+  需要 `[wparse_relay] enabled` + `gateway_self_endpoint`；缺任一项明确失败。
+
+### 兼容性
+
+- `data_manifest` 随上报透传：旧网关不报时为 `null`。
+- 旧中心不会下发 `report-agents`（未知 kind）；周期上报不受影响。
+
 ## [0.20.1-alpha] - 2026-11-09
 
 ### 修复

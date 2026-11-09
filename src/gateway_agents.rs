@@ -131,6 +131,18 @@ mod tests {
         assert!(report.agents.is_empty());
     }
 
+    /// 数据清单（采集授权 + 调查数据）随 Agent 明细透传：gwlinkd 只做搬运，不解释内容。
+    #[test]
+    fn parses_the_agent_data_manifest() {
+        let report: ReportAgentStatus = serde_json::from_str(
+            r#"{"gateway_id":"gw-1","agents":[{"version":"0.4.0","health":"healthy","instance_id":"inst-1","agent_id":"agent-1","status":"online","last_seen_at":"2026-10-04T00:00:00Z","data_manifest":{"collected_at":"2026-10-04T00:00:00Z","collection":[{"family":"HostMetrics","work_id":"w-1","status":"active","plan_version":1,"acknowledged_version":null,"collection_status":"ok","collection_detail":null,"inputs":[{"kind":"MetricInterval","target":"15s"}]}],"investigations":[]}}]}"#,
+        )
+        .expect("parse manifest");
+        let manifest = report.agents[0].data_manifest.as_ref().expect("manifest");
+        assert_eq!(manifest.collection[0].family, "HostMetrics");
+        assert_eq!(manifest.collection[0].inputs[0].kind, "MetricInterval");
+    }
+
     #[tokio::test]
     async fn fetch_gets_the_loopback_endpoint_and_returns_agents() {
         let (endpoint, captured) = one_shot_capturing("200 OK", GATEWAY_AGENTS_JSON).await;

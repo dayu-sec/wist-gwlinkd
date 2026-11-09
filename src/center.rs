@@ -1065,6 +1065,7 @@ mod tests {
             node_id: Some("node-1".into()),
             hostname: Some("host-1".into()),
             ip_addresses: Some(vec!["en0 192.168.1.5/24".into()]),
+            data_manifest: None,
         };
         let payload = ReportAgentStatus {
             gateway_id: "gw-1".into(),
