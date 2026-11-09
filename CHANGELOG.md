@@ -3,6 +3,23 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.22.0-alpha] - 2026-11-09
+
+### 新增
+
+- **`investigate-agent` 控制命令**：中心下发的一次调查由 gwlinkd 环回转发到网关
+  （`POST /api/v1/gateway/agents/{agent_id}/investigations`，mTLS）。
+  `command_id` 由中心铸并原样透传（它要一路贯通到报告与证据库），gwlinkd **只搬运**，
+  不解释题目、不铸号。网关的 4xx（未授权 / 能力不支持 / 在飞）**原文回传**，
+  中心靠它给出处置建议。需要 `gateway_self_endpoint`；缺失时明确失败。
+- 机队上报里的 `investigations`（任务状态）随 `AgentRuntimeStatus` 透传（依赖 control 0.21）。
+
+### 兼容性
+
+- 依赖 `wist-control 0.21`（`AgentRuntimeStatus.investigations`）—— **编译期**字段新增，
+  旧中心 / 旧网关报文仍可解析（缺字段 = 空表）。
+- 旧中心不会下发 `investigate-agent`（未知 kind 会被拒绝并说清楚）。
+
 ## [0.21.0-alpha] - 2026-11-09
 
 ### 新增

@@ -73,6 +73,91 @@ impl GatewayAgentsClient {
         })?;
         Ok(report.agents)
     }
+
+    /// 发起一次调查：`POST /api/v1/gateway/agents/{agent_id}/investigations`（环回，mTLS）。
+    ///
+    /// 返回网关的**原始状态码与响应体**（含 4xx）：回执要把网关的话原样带给中心，
+    /// 中心不靠 gwlinkd 翻译第二遍。只有传输层失败才是 `Err`。
+    pub async fn launch_investigation(
+        &self,
+        payload: &InvestigateAgentPayload,
+    ) -> CenterResult<(u16, String)> {
+        let url = format!(
+            "{}/api/v1/gateway/agents/{}/investigations",
+            self.endpoint,
+            payload.agent_id.trim()
+        );
+        let response = self
+            .http
+            .post(url)
+            .json(&payload.forward_body())
+            .header("accept", "application/json")
+            .send()
+            .await
+            .source_raw_err(CenterReason::Http, "gateway investigation 请求失败")?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .source_raw_err(CenterReason::Http, "读取 gateway investigation 响应体失败")?;
+        Ok((status, body))
+    }
+}
+
+/// 中心 `gateway.agent-investigate` 的 payload。
+///
+/// 与网关 gateway-plane 请求体同形，多一个 `agent_id`（它进 URL，不进 body）。
+/// `command_id` / `agent_id` 必填：缺任何一个都**明确失败** —— 没有 id 就没有可关联的报告。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct InvestigateAgentPayload {
+    pub command_id: String,
+    pub agent_id: String,
+    #[serde(default)]
+    pub topic: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub top: Option<u32>,
+    #[serde(default)]
+    pub min_size: Option<u64>,
+    #[serde(default)]
+    pub depth: Option<u32>,
+    #[serde(default)]
+    pub max_seconds: Option<u64>,
+    /// 审计用来源（中心传 `center:<actor>`）；缺省由网关回落成 `center`。
+    #[serde(default)]
+    pub requested_by: Option<String>,
+}
+
+impl InvestigateAgentPayload {
+    /// 转给网关的 body：去掉 `agent_id`（它在 URL 里），其余字段原样搬运。
+    fn forward_body(&self) -> serde_json::Value {
+        serde_json::json!({
+            "command_id": &self.command_id,
+            "topic": &self.topic,
+            "path": &self.path,
+            "top": self.top,
+            "min_size": self.min_size,
+            "depth": self.depth,
+            "max_seconds": self.max_seconds,
+            "requested_by": &self.requested_by,
+        })
+    }
+}
+
+/// `agent_id` 要拼进 URL 路径段：只允许安全字符，并拒掉 `.` / `..`。
+///
+/// 不清洗而是拒绝：这个值是中心给的，清洗会把一个错误变成一个「另一台机器」。
+/// `..` 仍然是合法的路径段，所以单独判。
+pub fn is_path_safe_agent_id(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
 }
 
 #[cfg(test)]
@@ -167,6 +252,109 @@ mod tests {
         let err = client.fetch("gw-1").await.expect_err("must fail");
         assert!(err.contains("403"), "{err}");
         assert!(err.contains("loopback-only"), "{err}");
+    }
+
+    /// 调查载荷：`agent_id` 进 URL，其余字段原样转给网关；缺 id 直接解析失败。
+    #[test]
+    fn investigate_payload_requires_ids_and_drops_agent_id_when_forwarded() {
+        let payload: InvestigateAgentPayload = serde_json::from_str(
+            r#"{"command_id":"cmd-1","agent_id":"agent-1","topic":"disk","top":10}"#,
+        )
+        .expect("payload");
+        let body = payload.forward_body();
+        assert!(
+            body.get("agent_id").is_none(),
+            "agent_id 在 URL 里，不该再进 body"
+        );
+        assert_eq!(body["command_id"], "cmd-1");
+        assert_eq!(body["topic"], "disk");
+        assert_eq!(body["top"], 10);
+        // 中心不开放扫描路径：转给网关的 body 里它就是 null（网关拒绝非空值）。
+        assert!(body["path"].is_null());
+        assert!(body["requested_by"].is_null());
+
+        assert!(
+            serde_json::from_str::<InvestigateAgentPayload>(r#"{"agent_id":"a","topic":"disk"}"#)
+                .is_err(),
+            "缺 command_id 必须拒绝"
+        );
+        assert!(
+            serde_json::from_str::<InvestigateAgentPayload>(r#"{"command_id":"c","topic":"disk"}"#)
+                .is_err(),
+            "缺 agent_id 必须拒绝"
+        );
+    }
+
+    /// `agent_id` 会拼进 URL：`..` / 分隔符一律不是合法段。
+    #[test]
+    fn agent_ids_must_be_a_safe_path_segment() {
+        assert!(is_path_safe_agent_id("agent-host-a55a338d7723"));
+        assert!(is_path_safe_agent_id("agent_1.2:3"));
+        assert!(!is_path_safe_agent_id("."));
+        assert!(!is_path_safe_agent_id(".."));
+        assert!(!is_path_safe_agent_id("a/b"));
+        assert!(!is_path_safe_agent_id("a b"));
+        assert!(!is_path_safe_agent_id(""));
+        assert!(!is_path_safe_agent_id(&"x".repeat(129)));
+    }
+
+    #[tokio::test]
+    async fn launch_investigation_posts_to_the_agent_scoped_route() {
+        let (endpoint, captured) = one_shot_capturing(
+            "202 Accepted",
+            r#"{"agent_id":"agent-1","command_id":"cmd-1","topic":"disk","requested_by":"center"}"#,
+        )
+        .await;
+        let client = GatewayAgentsClient::new(endpoint);
+        let payload: InvestigateAgentPayload =
+            serde_json::from_str(r#"{"command_id":"cmd-1","agent_id":"agent-1","topic":"disk"}"#)
+                .expect("payload");
+        let (status, body) = client
+            .launch_investigation(&payload)
+            .await
+            .expect("http response");
+        assert_eq!(status, 202);
+        assert!(body.contains("cmd-1"));
+
+        let request = captured.await.expect("request captured");
+        assert!(
+            request.starts_with("POST /api/v1/gateway/agents/agent-1/investigations "),
+            "{request}"
+        );
+    }
+
+    /// 4xx 不吞：原状态码 + 原文回给调用方（回执靠它把网关的话带给中心）。
+    #[tokio::test]
+    async fn launch_investigation_surfaces_4xx_verbatim() {
+        let (endpoint, _captured) = one_shot_capturing(
+            "409 Conflict",
+            r#"{"error":{"code":"investigation_in_flight","message":"still running"}}"#,
+        )
+        .await;
+        let client = GatewayAgentsClient::new(endpoint);
+        let payload: InvestigateAgentPayload =
+            serde_json::from_str(r#"{"command_id":"cmd-2","agent_id":"agent-1"}"#)
+                .expect("payload");
+        let (status, body) = client
+            .launch_investigation(&payload)
+            .await
+            .expect("4xx 仍是正常 HTTP 响应");
+        assert_eq!(status, 409);
+        assert!(body.contains("investigation_in_flight"), "{body}");
+    }
+
+    /// 机队上报里的 `investigations` 也要能解（契约 0.21 起）：gwlinkd 只搬运。
+    #[test]
+    fn parses_the_investigation_task_status() {
+        let report: ReportAgentStatus = serde_json::from_str(
+            r#"{"gateway_id":"gw-1","agents":[{"version":"0.4.0","health":"healthy","instance_id":"inst-1","agent_id":"agent-1","status":"online","last_seen_at":"2026-10-04T00:00:00Z","investigations":[{"command_id":"cmd-1","topic":"disk","requested_at":"2026-10-04T00:00:00Z","claimed_at":null,"acked_at":null,"outcome":null,"detail":null}]}]}"#,
+        )
+        .expect("parse investigations");
+        let tasks = &report.agents[0].investigations;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].command_id, "cmd-1");
+        assert_eq!(tasks[0].topic, "disk");
+        assert!(tasks[0].outcome.is_none(), "未回执时 outcome 必须是 None");
     }
 
     #[test]

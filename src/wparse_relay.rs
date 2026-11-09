@@ -184,12 +184,14 @@ pub async fn run(
         }
 
         let result = if command.is_control() {
-            // `report-agents` 需要 CenterClient（它既拉网关又转报中心），与其它本机控制命令不同，
-            // 所以在轮询循环里分派；`execute_control` 仍只管不碰中心的那些。
-            if command.kind == "report-agents" {
-                run_report_agents(&config, client, task.as_deref()).await
-            } else {
-                execute_control(&config, &command, task.as_deref()).await
+            // `report-agents` / `investigate-agent` 需要网关环回面（一个只读、一个写命令），
+            // 所以在轮询循环里分派；`execute_control` 仍只管不碰网关网络的那些。
+            match command.kind.as_str() {
+                "report-agents" => run_report_agents(&config, client, task.as_deref()).await,
+                "investigate-agent" => {
+                    run_investigate_agent(&config, &command, task.as_deref()).await
+                }
+                _ => execute_control(&config, &command, task.as_deref()).await,
             }
         } else {
             execute(
@@ -644,6 +646,147 @@ async fn run_report_agents(
             }
         }
     }
+}
+
+/// `investigate-agent`：把中心的一次调查下发给网关（环回 `POST /api/v1/gateway/agents/{id}/investigations`）。
+///
+/// 本命令**只搬运**：不解释题目、不铸号（`command_id` 由中心铸，要一路贯通到报告与证据库）。
+/// 网关的 4xx **原文回传**（状态码 + 响应体）—— 中心靠它给出「没授权 / 能力不支持 / 在飞」的处置。
+/// 未配置环回面时**明确失败**，不静默当成功。
+async fn run_investigate_agent(
+    config: &Config,
+    command: &WparseCommand,
+    task: Option<&TaskLog>,
+) -> UpstreamResult {
+    let Some(body) = command.body.as_ref() else {
+        let error = "investigate-agent 缺少 body".to_string();
+        record_event(task, "reject", &error);
+        return UpstreamResult {
+            status_code: 400,
+            body: String::new(),
+            error: Some(error),
+        };
+    };
+    let payload: crate::gateway_agents::InvestigateAgentPayload =
+        match serde_json::from_value(body.clone()) {
+            Ok(payload) => payload,
+            Err(err) => {
+                let error =
+                    format!("investigate-agent body 解析失败（缺 command_id / agent_id？）：{err}");
+                record_event(task, "reject", &error);
+                return UpstreamResult {
+                    status_code: 400,
+                    body: String::new(),
+                    error: Some(error),
+                };
+            }
+        };
+    if payload.command_id.trim().is_empty() || payload.agent_id.trim().is_empty() {
+        let error = "investigate-agent 的 command_id / agent_id 不得为空".to_string();
+        record_event(task, "reject", &error);
+        return UpstreamResult {
+            status_code: 400,
+            body: String::new(),
+            error: Some(error),
+        };
+    }
+    // `agent_id` 会拼进 URL 路径段：挡住 `.` / `..` / 分隔符，不让它变成一个“另一台机器”
+    // 或另一条环回端点。
+    if !crate::gateway_agents::is_path_safe_agent_id(&payload.agent_id) {
+        let error = format!(
+            "investigate-agent 的 agent_id 不是安全的路径段：{}",
+            value_preview(payload.agent_id.trim())
+        );
+        record_event(task, "reject", &error);
+        return UpstreamResult {
+            status_code: 400,
+            body: String::new(),
+            error: Some(error),
+        };
+    }
+    let Some(base) = config.gateway_self_endpoint.as_deref() else {
+        let error = "未配置 [gateway_self] endpoint，无法把调查下发给网关".to_string();
+        record_event(task, "reject", &error);
+        return UpstreamResult {
+            status_code: 500,
+            body: String::new(),
+            error: Some(error),
+        };
+    };
+    let client = match GatewayAgentsClient::with_trust(base, config.gateway_self_ca.as_deref()) {
+        Ok(client) => client,
+        Err(err) => {
+            let error = format!("环回客户端初始化失败：{err}");
+            record_event(task, "reject", &error);
+            return UpstreamResult {
+                status_code: 500,
+                body: String::new(),
+                error: Some(error),
+            };
+        }
+    };
+    match client.launch_investigation(&payload).await {
+        Ok((status_code, body)) => {
+            let error = if (200..300).contains(&status_code) {
+                record_event(
+                    task,
+                    "investigation.dispatched",
+                    &format!(
+                        "agent_id={} command_id={} topic={} status={}",
+                        payload.agent_id,
+                        payload.command_id,
+                        payload.topic.as_deref().unwrap_or("disk"),
+                        status_code
+                    ),
+                );
+                None
+            } else {
+                // 网关的 4xx 是**给人看的**：代码 + 文案原样回去，别让中心只能看到“调用失败”。
+                let detail = gateway_error_detail(&body).unwrap_or_else(|| body.trim().to_string());
+                let message = if detail.is_empty() {
+                    format!("网关拒绝调查（{status_code}）")
+                } else {
+                    format!("网关拒绝调查（{status_code}）：{detail}")
+                };
+                record_event(task, "investigation.rejected", &message);
+                Some(message)
+            };
+            UpstreamResult {
+                status_code,
+                body,
+                error,
+            }
+        }
+        Err(err) => {
+            let error = format!("下发调查到网关失败：{err}");
+            record_event(task, "investigation.failed", &error);
+            UpstreamResult {
+                status_code: 502,
+                body: String::new(),
+                error: Some(error),
+            }
+        }
+    }
+}
+
+/// 网关错误体是 `{"error":{"code","message"}}`（与 wparse 的 `{"error":"…"}` 不同）。
+/// 把它压成一行 `code: message`，长度上限与上游错误一致。
+fn gateway_error_detail(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    let message = error.get("message").and_then(|value| value.as_str())?;
+    let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let detail = match error.get("code").and_then(|value| value.as_str()) {
+        Some(code) => format!("{code}: {message}"),
+        None => message,
+    };
+    let mut chars = detail.chars();
+    let bounded: String = chars.by_ref().take(UPSTREAM_ERROR_LIMIT).collect();
+    Some(if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    })
 }
 
 /// `bind-tenant` 载荷：Center 绑定表里的 `customer_id` 在数据面叫 `tenant_id`。
@@ -1891,6 +2034,205 @@ mod tests {
             center_request.contains("\"agent_id\":\"agent-1\""),
             "要把网关的机队原样转报：{center_request}"
         );
+    }
+
+    // ---- 控制类命令（kind=investigate-agent）----
+
+    fn investigate_command() -> WparseCommand {
+        WparseCommand {
+            command_id: "cmd-center-1".to_string(),
+            kind: "investigate-agent".to_string(),
+            method: String::new(),
+            path: String::new(),
+            body: Some(json!({
+                "command_id": "cmd-center-1",
+                "agent_id": "agent-1",
+                "topic": "disk",
+            })),
+            lease_expires_at: "2026-10-20T12:00:00Z".to_string(),
+        }
+    }
+
+    /// 未配置环回面 → 明确失败（不能静默当成功：中心会以为调查发了）。
+    #[tokio::test]
+    async fn investigate_agent_without_a_loopback_endpoint_fails_closed() {
+        let state = temp_state("investigate-no-loopback");
+        let config = control_config(&state, &state, None, "/bin/false");
+        let result = run_investigate_agent(&config, &investigate_command(), None).await;
+        assert_eq!(result.status_code, 500);
+        assert!(
+            result.error.unwrap_or_default().contains("gateway_self"),
+            "要指出缺的是环回面配置"
+        );
+    }
+
+    /// `command_id` 是报告与证据库的关联键：缺了就不该往下走。
+    #[tokio::test]
+    async fn investigate_agent_requires_both_ids() {
+        let state = temp_state("investigate-missing-id");
+        let config = control_config(&state, &state, None, "/bin/false");
+
+        let mut no_command_id = investigate_command();
+        no_command_id.body = Some(json!({ "agent_id": "agent-1", "topic": "disk" }));
+        let result = run_investigate_agent(&config, &no_command_id, None).await;
+        assert_eq!(result.status_code, 400);
+        assert!(
+            result.error.unwrap_or_default().contains("command_id"),
+            "错误要说清楚缺哪个字段"
+        );
+
+        let mut blank_agent = investigate_command();
+        blank_agent.body = Some(json!({ "command_id": "cmd-1", "agent_id": "  " }));
+        let result = run_investigate_agent(&config, &blank_agent, None).await;
+        assert_eq!(result.status_code, 400);
+    }
+
+    /// `agent_id` 不是安全路径段 → 400，且不发起任何网络请求。
+    #[tokio::test]
+    async fn investigate_agent_rejects_unsafe_agent_ids() {
+        let state = temp_state("investigate-bad-agent");
+        let config = control_config(&state, &state, None, "/bin/false");
+        let mut command = investigate_command();
+        command.body = Some(json!({
+            "command_id": "cmd-center-1",
+            "agent_id": "../knowledge-package",
+            "topic": "disk",
+        }));
+        let result = run_investigate_agent(&config, &command, None).await;
+        assert_eq!(result.status_code, 400);
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("不是安全的路径段"),
+            "要说清楚拒绝的是 agent_id"
+        );
+    }
+
+    /// 成功路径：直接把中心载荷 POST 到网关环回面，而不是让中心直连网关。
+    #[tokio::test]
+    async fn investigate_agent_forwards_the_payload_to_the_gateway() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn one_shot(
+            status: &'static str,
+            body: &'static str,
+        ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buffer = [0_u8; 8192];
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    let _ = tx.send(String::from_utf8_lossy(&buffer[..read]).to_string());
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                }
+            });
+            (format!("http://{addr}"), rx)
+        }
+
+        let state = temp_state("investigate-ok");
+        let (gateway_url, gateway_request) = one_shot(
+            "202 Accepted",
+            r#"{"agent_id":"agent-1","command_id":"cmd-center-1","topic":"disk","requested_by":"center"}"#,
+        )
+        .await;
+        let config_path = state.join("gwlinkd-investigate.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "gateway_id = \"gw-1\"\nstate_dir = \"{}\"\ngateway_self_endpoint = \"{gateway_url}\"\n",
+                state.display()
+            ),
+        )
+        .expect("write config");
+        let config = Config::load(&config_path).expect("config");
+
+        let result = run_investigate_agent(&config, &investigate_command(), None).await;
+        assert_eq!(result.status_code, 202, "{:?}", result.error);
+        assert!(result.error.is_none(), "2xx 不应带错误");
+        assert!(result.body.contains("cmd-center-1"));
+
+        let request = gateway_request.await.expect("gateway request");
+        assert!(
+            request.starts_with("POST /api/v1/gateway/agents/agent-1/investigations "),
+            "{request}"
+        );
+        assert!(
+            request.contains("\"command_id\":\"cmd-center-1\""),
+            "{request}"
+        );
+        assert!(
+            !request.contains("\"agent_id\""),
+            "agent_id 进 URL，不该再塞 body"
+        );
+    }
+
+    /// 网关 4xx **原文回传**：代码 + 文案都要带到回执（中心靠它给人处置建议）。
+    #[tokio::test]
+    async fn investigate_agent_relays_the_gateway_error_verbatim() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0_u8; 8192];
+                let _ = socket.read(&mut buffer).await;
+                let body = r#"{"error":{"code":"investigation_in_flight","message":"agent agent-1 still has an unacknowledged investigation"}}"#;
+                let response = format!(
+                    "HTTP/1.1 409 Conflict\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+
+        let state = temp_state("investigate-409");
+        let config_path = state.join("gwlinkd-investigate-409.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "gateway_id = \"gw-1\"\nstate_dir = \"{}\"\ngateway_self_endpoint = \"http://{addr}\"\n",
+                state.display()
+            ),
+        )
+        .expect("write config");
+        let config = Config::load(&config_path).expect("config");
+
+        let result = run_investigate_agent(&config, &investigate_command(), None).await;
+        assert_eq!(result.status_code, 409);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("investigation_in_flight"), "{error}");
+        assert!(error.contains("unacknowledged investigation"), "{error}");
+    }
+
+    #[test]
+    fn gateway_error_detail_is_one_line_and_bounded() {
+        let body = json!({
+            "error": {
+                "code": "investigation_not_granted",
+                "message": "topic \"disk\" is not granted\n  to agent a",
+            }
+        })
+        .to_string();
+        assert_eq!(
+            gateway_error_detail(&body).as_deref(),
+            Some("investigation_not_granted: topic \"disk\" is not granted to agent a")
+        );
+        assert_eq!(gateway_error_detail("not json"), None);
+        assert_eq!(gateway_error_detail(r#"{"error":{"code":"x"}}"#), None);
     }
 
     #[test]

@@ -1066,6 +1066,7 @@ mod tests {
             hostname: Some("host-1".into()),
             ip_addresses: Some(vec!["en0 192.168.1.5/24".into()]),
             data_manifest: None,
+            investigations: Vec::new(),
         };
         let payload = ReportAgentStatus {
             gateway_id: "gw-1".into(),
