@@ -3,6 +3,23 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.23.0-alpha] - 2026-11-10
+
+### 变更（依赖）
+
+- 对齐 `wist-control 0.22`：采集结果的多字段（`collection_prerequisites` /
+  `collection_result` / `collection_reasons`）随 `ReportAgentStatus` **原样转报中心**。
+
+### 为什么必须同步升
+
+- gwlinkd 把网关报文**解成强类型再序列化**转报中心（不是字节透传）。
+  停在 control 0.21 时，新字段会被静默丢弃：中心与页面看到的一直是旧的三态
+  `collection_status`，「缺 smartctl」仍然显示成采集失败。
+
+### 兼容性
+
+- 纯依赖跟进，接口与行为不变；不含新字段的旧报文照旧可解。
+
 ## [0.22.0-alpha] - 2026-11-09
 
 ### 新增
