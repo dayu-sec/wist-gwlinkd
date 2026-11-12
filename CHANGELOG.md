@@ -3,6 +3,18 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.24.0-alpha] - 2026-11-12
+
+### 变更（依赖）
+
+- 跟随 `wist-control 0.23.0`：`AgentDataManifest` 新增 `investigation_granted` /
+  `investigation_capabilities`。gwlinkd 是**强类型转报**（解成 control 类型再序列化），
+  不跟版会把新字段静默丢掉，中心就会把「已上报」看成「没上报」。
+
+### 兼容性
+
+- 纯依赖对齐；报文形状由 control 决定。
+
 ## [0.23.0-alpha] - 2026-11-10
 
 ### 变更（依赖）
