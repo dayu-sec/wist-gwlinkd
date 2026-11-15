@@ -18,6 +18,10 @@ use crate::error::{StateError, StateReason, StateResult};
 /// 心跳超过该时长即判死（与 `wist-agentd` 同量级）。
 pub const UPGRADER_DEAD_AFTER: Duration = Duration::from_secs(60);
 
+/// 续期提前量的**兜底**（秒）：只在证书没带 `not_before` / `not_after`（算不出有效期）时用。
+/// 正常路径见 [`StoredCredential::renew_lead_seconds`]（= 本证书有效期的一半）。
+pub const FALLBACK_RENEW_LEAD_SECS: i64 = 3600;
+
 /// 升级记录文件名（字段对齐 `wist-agentd` / `gops` 的 `upgrade.json`）。
 pub const UPGRADE_RECORD_FILE: &str = "upgrade.json";
 /// 升级器心跳文件。
@@ -284,14 +288,92 @@ impl StoredCredential {
         Ok(hex_lower(cert.raw_serial()))
     }
 
-    /// 距离证书到期还剩多少秒（无 `not_after` → `i64::MAX`，不触发轮换）。
-    pub fn seconds_remaining(&self) -> i64 {
-        self.bundle
-            .not_after
-            .as_ref()
-            .map(|expires| wist_control::DateTime::now().seconds_until(expires))
-            .unwrap_or(i64::MAX)
+    /// 续期提前量（秒）：显式配置优先，否则取**本证书有效期的一半**。
+    ///
+    /// 为什么是一半而不是固定 1 小时：中心签的客户端证书是 30 天，而**过期即不可再续**
+    /// （`credentials:renew` 要用旧证书证明身份，中心在握手期就按有效期拒）。提前量太短时，
+    /// 「到期前那一小段」只要机器休眠 / 网络或中心不可达，证书就永久失效、只能换 `gateway_id` 重接。
+    /// 取一半 ⇒ 有半个有效期的离线容忍（30 天证书 = 15 天）。
+    ///
+    /// 显式配置**只能用来缩短**：
+    /// - `> 半个有效期` 会被夹到一半 —— 配大了（比如照 TTL 抄了 `2592000`）会在续期成功后
+    ///   立即又满足条件，每拍都去换证（每次换证都作废上一张）；
+    /// - `<= 0` 视为未配置 —— 否则等于把续期关掉，证书到期就永久失联。
+    pub fn renew_lead_seconds(&self, configured: Option<i64>) -> i64 {
+        let half = self
+            .lifetime_seconds()
+            .map(|lifetime| lifetime / 2)
+            .filter(|half| *half > 0);
+        match (configured.filter(|lead| *lead > 0), half) {
+            (Some(lead), Some(half)) => lead.min(half),
+            (Some(lead), None) => lead,
+            (None, Some(half)) => half,
+            (None, None) => FALLBACK_RENEW_LEAD_SECS,
+        }
     }
+
+    /// 证书自身有效期（秒）：`not_after - not_before`；算不出来或非正 → `None`。
+    pub fn lifetime_seconds(&self) -> Option<i64> {
+        let (not_before, not_after) = self.validity_unix()?;
+        let lifetime = not_after - not_before;
+        (lifetime > 0).then_some(lifetime)
+    }
+
+    /// 距离证书到期还剩多少秒（无可用有效期 → `i64::MAX`，不触发轮换）。
+    pub fn seconds_remaining(&self) -> i64 {
+        let Some((_, not_after)) = self.validity_unix() else {
+            return i64::MAX;
+        };
+        (not_after - now_unix()).max(0)
+    }
+
+    /// 到期时刻（RFC3339）：与 [`Self::seconds_remaining`] **同源**（以证书本体为准），
+    /// 供体检 / 上报展示 —— 不能一边说「已过期」一边把回执里那个错的 `not_after` 摆给人看。
+    pub fn not_after_rfc3339(&self) -> Option<String> {
+        let (_, not_after) = self.validity_unix()?;
+        Some(
+            chrono::DateTime::from_timestamp(not_after, 0)?
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+    }
+
+    /// 证书有效期（unix 秒）：**以证书本体为准**，本体解析不出来才回落到回执里的
+    /// `not_before`（缺了用 `issued_at`）/ `not_after`。
+    ///
+    /// 为什么不信回执：老中心可能不带 `not_after`，而「不知道有效期」会让续期与体检**都**
+    /// 变成「一切正常且永不续期」—— 正是提前量要消灭的那种静默失效。
+    fn validity_unix(&self) -> Option<(i64, i64)> {
+        if let Some((not_before, not_after)) = self.cert_validity_unix() {
+            return Some((not_before, not_after));
+        }
+        let not_after = self.bundle.not_after.as_ref()?.to_chrono().timestamp();
+        let not_before = self
+            .bundle
+            .not_before
+            .as_ref()
+            .unwrap_or(&self.bundle.issued_at)
+            .to_chrono()
+            .timestamp();
+        Some((not_before, not_after))
+    }
+
+    /// 从**证书本体**（DER）读有效期：解析失败（测试夹具 / 文件被裁）→ `None`。
+    fn cert_validity_unix(&self) -> Option<(i64, i64)> {
+        use x509_parser::prelude::{FromDer, X509Certificate};
+        let (_, pem) = x509_parser::pem::parse_x509_pem(self.bundle.certificate.as_bytes()).ok()?;
+        let (_, cert) = X509Certificate::from_der(&pem.contents).ok()?;
+        let validity = cert.validity();
+        let (not_before, not_after) = (
+            validity.not_before.timestamp(),
+            validity.not_after.timestamp(),
+        );
+        (not_after > not_before).then_some((not_before, not_after))
+    }
+}
+
+/// 当前 unix 秒。
+fn now_unix() -> i64 {
+    wist_control::DateTime::now().to_chrono().timestamp()
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -633,6 +715,59 @@ mod tests {
         assert!(serial.chars().all(|c| c.is_ascii_hexdigit()), "{serial}");
     }
 
+    /// 有效期**以证书本体为准**：回执字段缺失/说谎时不能变成「永不续期」。
+    #[test]
+    fn validity_is_read_from_the_certificate_not_the_echoed_metadata() {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params = rcgen::CertificateParams::new(vec!["gw-1".to_string()]).expect("params");
+        params.not_before = rcgen::date_time_ymd(2026, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2026, 2, 1); // 31 天前就已过期
+        let cert = params.self_signed(&key).expect("cert");
+
+        let credential = StoredCredential {
+            bundle: GatewayCredentialBundle {
+                certificate: cert.pem(),
+                // 回执字段故意写错（老中心不带 / 元数据与证书不一致）。
+                issued_at: ts("2999-01-01T00:00:00Z"),
+                not_before: Some(ts("2999-01-01T00:00:00Z")),
+                not_after: Some(ts("2999-02-01T00:00:00Z")),
+                ..stored_credential().bundle
+            },
+            private_key_pem: "unused".into(),
+        };
+
+        assert_eq!(credential.lifetime_seconds(), Some(31 * 86_400));
+        assert_eq!(
+            credential.seconds_remaining(),
+            0,
+            "以证书准：2026-02-01 已过期"
+        );
+        // 证据字段也要同源：不能把回执里那个 2999 印出来。
+        assert_eq!(
+            credential.not_after_rfc3339().as_deref(),
+            Some("2026-02-01T00:00:00Z")
+        );
+    }
+
+    /// 真证书路径同样满足「刚签发不落窗内」（回执回落分支已有同名不变式）。
+    #[test]
+    fn a_der_backed_fresh_certificate_sits_outside_the_renewal_window() {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params = rcgen::CertificateParams::new(vec!["gw-1".to_string()]).expect("params");
+        params.not_before = rcgen::date_time_ymd(2999, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2999, 2, 1);
+        let cert = params.self_signed(&key).expect("cert");
+        let credential = StoredCredential {
+            bundle: GatewayCredentialBundle {
+                certificate: cert.pem(),
+                ..stored_credential().bundle
+            },
+            private_key_pem: "unused".into(),
+        };
+        assert_eq!(credential.lifetime_seconds(), Some(31 * 86_400));
+        assert!(credential.seconds_remaining() > credential.renew_lead_seconds(None));
+    }
+
     #[test]
     fn certificate_serial_hex_errors_on_a_non_certificate() {
         let credential = StoredCredential {
@@ -643,6 +778,55 @@ mod tests {
             private_key_pem: "unused".into(),
         };
         assert!(credential.certificate_serial_hex().is_err());
+    }
+
+    #[test]
+    fn renew_lead_defaults_to_half_the_certificate_lifetime() {
+        // 夹具：2026-10-04 → 2026-11-04（31 天）⇒ 提前量 15.5 天 = 1_339_200s。
+        let credential = stored_credential();
+        assert_eq!(credential.renew_lead_seconds(None), 1_339_200);
+        // 显式配置只能**缩短**（现场可提前续，但不能把窗口拉到超过一半）。
+        assert_eq!(credential.renew_lead_seconds(Some(60)), 60);
+        assert_eq!(credential.renew_lead_seconds(Some(9_999_999)), 1_339_200);
+        // `<= 0` 视为未配置：否则等于把续期关掉（证书到期即永久失效）。
+        assert_eq!(credential.renew_lead_seconds(Some(0)), 1_339_200);
+        assert_eq!(credential.renew_lead_seconds(Some(-60)), 1_339_200);
+    }
+
+    /// 按中心真实签发的形状（刚签发、30 天）构造：续期**不能**立刻又满足条件，
+    /// 否则每拍都去换证（每次换证都作废上一张）。这是「取一半」能成立的支点。
+    #[test]
+    fn a_freshly_issued_certificate_sits_outside_the_renewal_window() {
+        let mut credential = stored_credential();
+        credential.bundle.issued_at = wist_control::DateTime::now();
+        credential.bundle.not_before = Some(wist_control::DateTime::now());
+        credential.bundle.not_after = Some(wist_control::DateTime::in_days(30));
+        assert!(
+            credential.seconds_remaining() > credential.renew_lead_seconds(None),
+            "刚签发的证书不应落在续期窗口内"
+        );
+    }
+
+    #[test]
+    fn renew_lead_falls_back_without_a_usable_lifetime() {
+        let mut credential = stored_credential();
+        credential.bundle.not_after = None;
+        assert_eq!(
+            credential.renew_lead_seconds(None),
+            FALLBACK_RENEW_LEAD_SECS
+        );
+
+        // 没有 `not_before` → 用 `issued_at` 算有效期（老中心不填 not_before）。
+        credential.bundle.not_after = Some(ts("2026-11-04T00:00:00Z"));
+        credential.bundle.not_before = None; // issued_at = 2026-10-04
+        assert_eq!(credential.renew_lead_seconds(None), 1_339_200);
+
+        // 有效期为负（数据坏了）→ 兜底，不给出奇怪的负提前量。
+        credential.bundle.not_before = Some(ts("2026-12-04T00:00:00Z"));
+        assert_eq!(
+            credential.renew_lead_seconds(None),
+            FALLBACK_RENEW_LEAD_SECS
+        );
     }
 
     #[test]

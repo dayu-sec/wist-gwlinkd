@@ -114,7 +114,8 @@ state_dir = "/var/lib/wist-gwlinkd/state"
 
 # 可选：
 gateway_self_endpoint = "https://127.0.0.1:3000"   # 网关容器自述面（环回）
-renew_lead_seconds = 3600                          # 凭据续期提前量
+# renew_lead_seconds = 1296000                   # 轮换提前量，缺省 = 证书有效期的一半（30 天 ⇒ 15 天）；
+#                                               # 只在想**缩短**时写（超过一半会被夹到一半，<=0 视为未配置）
 upgrader_program = "gops"                          # 升级执行器
 upgrade_on_failure = "rollback-all"                # gops --on-failure（rollback-all | halt）
 upgrade_health_cmd = "curl -fsS http://127.0.0.1:3000/health"  # 栈外健康检查（给 gops --health-cmd）

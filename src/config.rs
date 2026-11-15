@@ -96,7 +96,9 @@ pub struct Config {
     /// 缺省 12 —— 投放目录是交付中转区，不应无界增长。见 [`Self::agent_package_drop_dir`]。
     #[serde(default)]
     pub agent_package_drop_keep: Option<usize>,
-    /// 客户端证书轮换提前量（秒，缺省 3600）。
+    /// 客户端证书轮换提前量（秒，缺省 = 本证书**有效期的一半**；证书没带有效期时兜底 3600）。
+    /// 过期即不可再续，所以这个窗口要足够长（30 天证书 ⇒ 15 天）。显式配置**只能缩短**：
+    /// 大于一半会被夹到一半（否则续完立即又满足条件，每拍换证）；`<= 0` 视为未配置。
     #[serde(default)]
     pub renew_lead_seconds: Option<i64>,
     /// 升级执行器程序（缺省 `gops`）。

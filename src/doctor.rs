@@ -14,6 +14,14 @@ use crate::state::{self, CredentialStatus};
 /// 中心可达性探测超时（诊断是人手跑的，短超时即可）。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// rustls 收到对端 `CertificateExpired` 告警时的**变体名**（错误链里原样出现）。
+///
+/// 只匹配变体名、不匹配前缀：`received fatal alert: …` 是 rustls 的 `Display` 细节（版本间会改），
+/// 变体名 `CertificateExpired` 是告警本身的语义。
+/// 也不会误伤「**服务端**证书过期」——那是客户端自己判的，显示为
+/// `invalid peer certificate: certificate expired: …`，不带这个变体名。
+const CERTIFICATE_EXPIRED_ALERT: &str = "CertificateExpired";
+
 /// 单条检查的状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -186,6 +194,30 @@ fn trust_check(config: &Config) -> Check {
     }
 }
 
+/// 把秒数写成人能一眼比较的量级（`1339200s` 不如「15 天 12 小时」好判）。
+///
+/// 提前量现在跟着证书有效期走（缺省一半），原始秒数会到七位数 —— 体检输出必须给人看。
+fn human_remaining(seconds: i64) -> String {
+    // `seconds_remaining()` 用 `i64::MAX` 表示「证书没带有效期」——这不是一个时长。
+    if seconds == i64::MAX {
+        return "未知（证书未带有效期）".to_string();
+    }
+    if seconds <= 0 {
+        return "0".to_string();
+    }
+    let (days, hours, minutes) = (
+        seconds / 86_400,
+        (seconds % 86_400) / 3_600,
+        (seconds % 3_600) / 60,
+    );
+    match (days, hours) {
+        (0, 0) => format!("{} 分钟", minutes.max(1)),
+        (0, _) => format!("{hours} 小时"),
+        (_, 0) => format!("{days} 天"),
+        _ => format!("{days} 天 {hours} 小时"),
+    }
+}
+
 /// 读并校验一个 PEM 证书文件（存在为前提）：含 CERTIFICATE 块 + reqwest 可解析。
 /// 错误串带上路径，便于诊断直接展示。
 fn validate_pem_certificate(path: &Path) -> ConfigResult<()> {
@@ -211,31 +243,42 @@ fn credential_check(config: &Config) -> Check {
     match state::credential_status(config.identity_dir()) {
         CredentialStatus::Present(credential) => {
             let remaining = credential.seconds_remaining();
-            let lead = config.renew_lead_seconds.unwrap_or(3600);
+            let lead = credential.renew_lead_seconds(config.renew_lead_seconds);
             let not_after = credential
-                .bundle
-                .not_after
-                .as_ref()
-                .map(|expires| expires.to_chrono().to_rfc3339())
+                .not_after_rfc3339()
                 .unwrap_or_else(|| "unknown".to_string());
-            if remaining <= 0 {
+            if remaining == i64::MAX {
+                // 算不出有效期 ⇒ 条件永远不成立 ⇒ **永不续期**，只能等到过期那天才暴露。
                 Check::warn(
+                    "credential.local",
+                    "算不出证书有效期（不会自动续期）",
+                    format!("not_after={not_after}"),
+                )
+                .with_hint("证书本体与回执都没给出可用的有效期：核对该文件是否完整；掉到中心重新接入换一张")
+            } else if remaining <= 0 {
+                // 不可逆终态：续期也要出示有效证书，一旦过期就只能重接 —— 不能报成「即将过期」那一档。
+                Check::fail(
                     "credential.local",
                     "客户端证书已过期",
                     format!("not_after={not_after}"),
+                    "过期即不可再续（续期要出示有效证书，中心在握手期就拒）：到中心新建实例、\
+                     用它的新 gateway_id 重新接入，或先在中心重置该实例",
                 )
-                .with_hint("等待自动轮换，或在中心重置该实例后重跑")
             } else if remaining <= lead {
                 Check::warn(
                     "credential.local",
                     "客户端证书即将过期",
-                    format!("还剩 {remaining}s（轮换提前量 {lead}s）"),
+                    format!(
+                        "还剩 {}（轮换提前量 {}）",
+                        human_remaining(remaining),
+                        human_remaining(lead)
+                    ),
                 )
             } else {
                 Check::ok(
                     "credential.local",
                     "客户端证书有效",
-                    format!("还剩 {remaining}s"),
+                    format!("还剩 {}", human_remaining(remaining)),
                 )
             }
         }
@@ -697,6 +740,11 @@ fn reachability_check(config: &Config) -> Check {
     // 本机是否已有客户端凭据，决定 401/403 该判 FAIL（证书被拒）还是 WARN（尚未注册）。
     let credential = state::load_credential(config.identity_dir());
     let has_identity = credential.is_some();
+    // 本机凭据是否已过期：过期时中心一定在握手期拒绝，而告警文本可能看不到
+    // （中间设备回 reset / 直接 EOF），所以除了看错误链，也看这个本地事实。
+    let local_expired = credential
+        .as_ref()
+        .is_some_and(|credential| credential.seconds_remaining() <= 0);
     // 探测用的 gateway_id：优先用**已注册凭据**里的身份（中心按客户端证书认人，query 必须与之相符）；
     // 没有凭据时回落配置里的 gateway_id。**只读一次凭据**（别在下面再读一遍）。
     let gateway_id = credential
@@ -751,13 +799,45 @@ fn reachability_check(config: &Config) -> Check {
             reason,
             "检查 trust_bundle 与客户端身份（credential.json）",
         ),
-        Probe::Transport(reason) => Check::fail(
-            "center.reachable",
-            "控制中心不可达（TCP/TLS 失败）",
-            format!("{endpoint}: {reason}"),
-            "核对 scheme：中心开了 TLS 用 https、明文用 http；再查网络 / 证书 / 端口",
-        ),
+        Probe::Transport(reason) => transport_failure_check(endpoint, &reason, local_expired),
     }
+}
+
+/// 连接 / TLS 失败 → 检查项。
+///
+/// **过期要单说**：中心带 `WebPkiClientVerifier`，本机客户端证书过期时它在**握手期**就回
+/// `CertificateExpired` —— HTTP 层收不到请求，也不会有 401。把这种失败归成「核 scheme / 查网络 / 端口」
+/// 会把人带偏：真因是那张不可再生的客户端凭据，且**过期即不可再续**，只能到中心重接。
+///
+/// 判据两路取一：错误链里有告警变体名，**或**本机凭据已过期（告警可能被中间设备吞掉）。
+fn transport_failure_check(endpoint: &str, reason: &str, local_expired: bool) -> Check {
+    // 分类看**完整**错误链，展示才截断：`CertificateExpired` 在链尾，先截断会让分类静默失效。
+    let detail = format!("{endpoint}: {}", truncate_one_line(reason, 300));
+    let expired_hint = "续期也要出示有效证书，过期即不可再续：到中心新建实例、用新 gateway_id 重新接入\
+                        （或先在中心重置该实例）";
+    if reason.contains(CERTIFICATE_EXPIRED_ALERT) {
+        return Check::fail(
+            "center.reachable",
+            "控制中心拒绝本机证书：客户端证书已过期",
+            detail,
+            expired_hint,
+        );
+    }
+    if local_expired {
+        // 告警没看到（代理回 reset / EOF）但本机证书确实过期了：结论一样，但别断言「中心拒绝了」。
+        return Check::fail(
+            "center.reachable",
+            "本机客户端证书已过期（中心会在握手期拒绝）",
+            detail,
+            expired_hint,
+        );
+    }
+    Check::fail(
+        "center.reachable",
+        "控制中心不可达（TCP/TLS 失败）",
+        detail,
+        "核对 scheme：中心开了 TLS 用 https、明文用 http；再查网络 / 证书 / 端口",
+    )
 }
 
 /// 在**专用线程**里做一次阻塞探测：带信任锚（自签必需）与客户端身份（有凭据时），
@@ -811,8 +891,11 @@ fn probe_get(client: &reqwest::blocking::Client, url: String, gateway_id: &str) 
     }
 }
 
-/// 把错误连同**源链**压成一行（reqwest 的 `Display` 只有顶层，真因在 `source()` 里 ——
-/// 「TLS 证书不认」「明文口」这类关键信息都在链上）。
+/// 把错误连同**源链**压成一行（**不截断**）。
+///
+/// 不截断是故意的：判「是不是证书过期」要看错误链**末尾**的那条告警，
+/// 而链头是带完整 URL 的 `error sending request for url (...)`，先截断会让分类静默失效。
+/// 展示时再由调用方 [`truncate_one_line`]。
 fn error_chain_one_line(err: &dyn std::error::Error) -> String {
     let mut parts = vec![err.to_string()];
     let mut cursor = err.source();
@@ -820,7 +903,7 @@ fn error_chain_one_line(err: &dyn std::error::Error) -> String {
         parts.push(source.to_string());
         cursor = source.source();
     }
-    truncate_one_line(&parts.join(" -> "), 300)
+    parts.join(" -> ")
 }
 
 /// 压成单行并截断（诊断展示用；错误串 / 响应体里的换行会让输出难读）。
@@ -922,6 +1005,84 @@ mod tests {
         );
     }
 
+    // ---- 中心可达性：握手期失败的归类 ----
+
+    #[test]
+    fn a_certificate_expired_alert_points_at_the_client_credential() {
+        let check = transport_failure_check(
+            "https://center.example:3100",
+            "error sending request -> client error (SendRequest) -> connection error -> \
+             received fatal alert: CertificateExpired",
+            false,
+        );
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.title.contains("客户端证书已过期"), "{}", check.title);
+        let hint = check.hint.expect("hint");
+        // 不能再把人往 scheme / 网络 / 端口上带。
+        assert!(!hint.contains("scheme"), "{hint}");
+        assert!(hint.contains("gateway_id"), "{hint}");
+    }
+
+    /// 本机凭据已过期时，那怕告警被中间设备吞掉（reset / EOF），也得归到同一条结论上。
+    #[test]
+    fn an_expired_local_credential_classifies_any_transport_failure_as_expired() {
+        let check = transport_failure_check(
+            "https://center.example:3100",
+            "error sending request -> client error (Connect) -> connection reset by peer",
+            true,
+        );
+        assert!(check.title.contains("客户端证书已过期"), "{}", check.title);
+    }
+
+    /// 服务端证书过期是**客户端自验**的错，不带告警变体名 —— 不能误判成本机凭据过期。
+    #[test]
+    fn a_server_certificate_error_is_not_mistaken_for_an_expired_client_credential() {
+        let check = transport_failure_check(
+            "https://center.example:3100",
+            "error sending request -> client error (Connect) -> invalid peer certificate: \
+             certificate expired: verification time is after certificate expires 2026-11-14",
+            false,
+        );
+        assert!(check.title.contains("不可达"), "{}", check.title);
+    }
+
+    /// 分类看**完整**错误链：告警在链尾，先截断（带长 URL 的链头）会静默失效。
+    #[test]
+    fn the_expiry_alert_is_found_beyond_the_display_truncation() {
+        let long_head = format!(
+            "error sending request for url (https://center.example:3100/api/v1/gateway/\
+             upgrade-plan?gateway_id={}&platform=aarch64-apple-darwin)",
+            "x".repeat(300)
+        );
+        let check = transport_failure_check(
+            "https://center.example:3100",
+            &format!(
+                "{long_head} -> client error (SendRequest) -> connection error -> \
+                 received fatal alert: CertificateExpired"
+            ),
+            false,
+        );
+        assert!(check.title.contains("客户端证书已过期"), "{}", check.title);
+        // 展示仍要截断（不能把 300 字的 URL 全摆给人看）。
+        assert!(check.detail.chars().count() < 400, "{}", check.detail);
+    }
+
+    /// 其他传输失败仍按「不可达」报，提示仍是 scheme / 网络 / 端口三件事。
+    #[test]
+    fn other_transport_failures_keep_the_scheme_and_network_hint() {
+        let check = transport_failure_check(
+            "https://center.example:3100",
+            "error sending request -> client error (Connect) -> tcp connect error",
+            false,
+        );
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.title.contains("不可达"), "{}", check.title);
+        assert!(
+            check.hint.expect("hint").contains("scheme"),
+            "generic hint should still mention scheme"
+        );
+    }
+
     /// 缺失身份的建议不该让人去配**已经配好**的 endpoint（上一行刚报过「已配置」）。
     #[test]
     fn a_missing_credential_hint_skips_an_endpoint_that_is_already_configured() {
@@ -953,8 +1114,80 @@ mod tests {
         assert!(hint.contains("control_center_endpoint"), "{hint}");
     }
 
+    #[test]
+    fn human_remaining_speaks_in_days_and_hours() {
+        // 30 天证书的续期提前量（一半 = 15.5 天）：七位数字没人判得了。
+        assert_eq!(human_remaining(1_339_200), "15 天 12 小时");
+        assert_eq!(human_remaining(86_400), "1 天");
+        assert_eq!(human_remaining(7_200), "2 小时");
+        assert_eq!(human_remaining(59), "1 分钟");
+        assert_eq!(human_remaining(0), "0");
+        assert_eq!(human_remaining(-5), "0");
+        // `seconds_remaining()` 用 `i64::MAX` 表示「未带有效期」。
+        assert_eq!(human_remaining(i64::MAX), "未知（证书未带有效期）");
+    }
+
+    /// 过期这条是**不可逆**的：报 FAIL（不是「即将过期」那一档），且提示不能说「等待自动轮换」。
+    #[test]
+    fn an_expired_credential_fails_and_says_it_cannot_be_renewed() {
+        let dir = temp_dir("cred-expired");
+        write_credential_at(&dir, Some("2000-01-01T00:00:00Z"), "2026-10-04T00:00:00Z");
+        let report = diagnose(&config(&dir));
+        let check = report.find("credential.local").expect("check");
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.title.contains("已过期"), "{}", check.title);
+        let hint = check.hint.clone().expect("hint");
+        assert!(!hint.contains("自动轮换"), "{hint}");
+        assert!(hint.contains("不可再续"), "{hint}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 进了续期窗口（还剩 < 半个有效期）但还没过期 → WARN，且剩余时长要写成人能读的。
+    #[test]
+    fn a_credential_inside_the_renewal_window_warns_with_readable_units() {
+        let dir = temp_dir("cred-window");
+        // 有效期 30 天（issued_at = 30 天前，not_after = 1 小时后）⇒ 提前量 15 天，已进窗口。
+        let issued_at = wist_control::DateTime::in_days(-30)
+            .to_chrono()
+            .to_rfc3339();
+        let not_after = wist_control::DateTime::in_days(1).to_chrono().to_rfc3339();
+        write_credential_at(&dir, Some(&not_after), &issued_at);
+        let report = diagnose(&config(&dir));
+        let check = report.find("credential.local").expect("check");
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.title.contains("即将过期"), "{}", check.title);
+        // 提前量 = 31 天的一半（确定值）；剩余时长不得再是七位秒数。
+        assert!(
+            check.detail.contains("（轮换提前量 15 天 12 小时）"),
+            "{}",
+            check.detail
+        );
+        assert!(!check.detail.contains("s（"), "{}", check.detail);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 有效期算不出来（证书本体与回执都无可用 `notAfter`）→ WARN：不会自动续期。
+    #[test]
+    fn an_unknown_validity_warns_that_nothing_will_renew() {
+        let dir = temp_dir("cred-no-validity");
+        write_credential_at(&dir, None, "2026-10-04T00:00:00Z");
+        let report = diagnose(&config(&dir));
+        let check = report.find("credential.local").expect("check");
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.title.contains("不会自动续期"), "{}", check.title);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// 造一份就位的长期身份（落在**身份目录**）。
     fn write_credential(identity_dir: &Path) {
+        write_credential_at(
+            identity_dir,
+            Some("2099-01-01T00:00:00Z"),
+            "2026-10-04T00:00:00Z",
+        );
+    }
+
+    fn write_credential_at(identity_dir: &Path, not_after: Option<&str>, issued_at: &str) {
         let credential = state::StoredCredential {
             bundle: wist_control::GatewayCredentialBundle {
                 credential_id: "cred-test".into(),
@@ -963,12 +1196,10 @@ mod tests {
                 certificate: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
                     .into(),
                 ca_bundle: None,
-                issued_at: wist_control::DateTime::from_rfc3339("2026-10-04T00:00:00Z")
-                    .expect("rfc3339"),
+                issued_at: wist_control::DateTime::from_rfc3339(issued_at).expect("rfc3339"),
                 not_before: None,
-                not_after: Some(
-                    wist_control::DateTime::from_rfc3339("2099-01-01T00:00:00Z").expect("rfc3339"),
-                ),
+                not_after: not_after
+                    .map(|value| wist_control::DateTime::from_rfc3339(value).expect("rfc3339")),
             },
             private_key_pem: "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n"
                 .into(),

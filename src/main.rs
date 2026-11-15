@@ -483,7 +483,6 @@ async fn run(
         ),
         None => None,
     };
-    let renew_lead = config.renew_lead_seconds.unwrap_or(3600);
     let mut driver = UpgradeDriver::new(
         GopsExecutor::new(
             config
@@ -569,6 +568,8 @@ async fn run(
     // gwlinkd 自身状态（心跳）的派生态：默认已接入；有失败转 `Degraded` 并记原因（成功即清）。
     let mut linkd_state = STATE_LINKED.to_string();
     let mut linkd_last_error: Option<String> = None;
+    // 续期失败**单独留痕**：状态上报成功不能把它冲掉（否则面板一直绿，直到证书过期那天）。
+    let mut renew_last_error: Option<String> = None;
     let mut linkd_last_report_at: Option<String> = None;
     // 宿主侧依赖工具（gops / gx，装在 `$HOME/bin`）版本：启动探一次，之后定期刷新。
     let mut tool_versions = ToolVersions::detect(config.upgrader_program.as_deref()).await;
@@ -654,16 +655,23 @@ async fn run(
         }
 
         // 到期前轮换：当场再生成一套密钥对 → 以当前证书证明身份 + 新 CSR → 换新证书（旧证书作废）。
-        if credential.seconds_remaining() <= renew_lead && Instant::now() >= next_renew_at {
+        // 提前量随**本证书有效期**走（缺省 = 一半），不写死 1 小时：过期不可再续，
+        // 提前量太短会让「到期前的那一小段离线」变成永久失效（见 `state::StoredCredential::renew_lead_seconds`）。
+        if credential.seconds_remaining()
+            <= credential.renew_lead_seconds(config.renew_lead_seconds)
+            && Instant::now() >= next_renew_at
+        {
             let keypair = match identity::generate_client_keypair(&config.gateway_id) {
                 Ok(keypair) => keypair,
                 Err(err) => {
                     renew_backoff = back_off(renew_backoff);
                     next_renew_at = Instant::now() + renew_backoff;
+                    let detail = format!("续期密钥生成失败：{err}");
                     linkd_state = STATE_DEGRADED.to_string();
-                    linkd_last_error = Some(format!("续期密钥生成失败：{err}"));
+                    linkd_last_error = Some(detail.clone());
+                    renew_last_error = Some(detail);
                     log::warn!(
-                        "event=RenewFailed backoff={renew_backoff:?} error={}",
+                        "event=RenewFailed backoff={renew_backoff:?} reason=keypair error={}",
                         chain_one_line(&err)
                     );
                     continue;
@@ -710,16 +718,44 @@ async fn run(
                         }
                     }
                     renew_backoff = Duration::ZERO;
-                    next_renew_at = Instant::now();
-                    log::info!("event=CredentialRenewed gateway_id={}", config.gateway_id);
+                    let remaining = credential.seconds_remaining();
+                    let lead = credential.renew_lead_seconds(config.renew_lead_seconds);
+                    // 续完还落在窗内 = 本机时钟前跳 / 中心发了短命证书：**不要**转绿，
+                    // 否则就变成「面板健康、每次冷却到期就换一张证」的静默异常。
+                    if remaining <= lead {
+                        let detail = format!(
+                            "续期未生效（新证书还剩 {remaining}s ≤ 提前量 {lead}s；查本机时钟与中心 TTL）"
+                        );
+                        linkd_state = STATE_DEGRADED.to_string();
+                        linkd_last_error = Some(detail.clone());
+                        renew_last_error = Some(detail);
+                        log::warn!("event=RenewIneffective remaining_s={remaining} lead_s={lead}");
+                    } else {
+                        renew_last_error = None;
+                    }
+                    // 成功后至少冷却一段：时钟跳变 / 证书有效期异常时，「续完立刻又满足条件」
+                    // 会让每拍都去中心换证，而每次换证都**作废上一张**。
+                    next_renew_at = Instant::now() + renew_cooldown(credential.lifetime_seconds());
+                    log::info!(
+                        "event=CredentialRenewed gateway_id={} remaining_s={remaining} lead_s={lead}",
+                        config.gateway_id
+                    );
                 }
                 Err(err) => {
                     renew_backoff = back_off(renew_backoff);
                     next_renew_at = Instant::now() + renew_backoff;
+                    // 把「还剩多久」一并留痕：这是唯一能看出「提前量真的生效了」的地方。
+                    let detail = format!(
+                        "凭据续期失败（还剩 {}s）：{err}",
+                        credential.seconds_remaining()
+                    );
                     linkd_state = STATE_DEGRADED.to_string();
-                    linkd_last_error = Some(format!("凭据续期失败：{err}"));
+                    linkd_last_error = Some(detail.clone());
+                    renew_last_error = Some(detail);
                     log::warn!(
-                        "event=RenewFailed backoff={renew_backoff:?} error={}",
+                        "event=RenewFailed backoff={renew_backoff:?} remaining_s={} lead_s={} error={}",
+                        credential.seconds_remaining(),
+                        credential.renew_lead_seconds(config.renew_lead_seconds),
                         chain_one_line(&err)
                     );
                 }
@@ -1096,6 +1132,14 @@ async fn run(
         // 推 gwlinkd 自身状态（心跳）给网关：页面据此展示「宿主侧常驻在不在跑」。
         if let Some(linkd_client) = &linkd_client {
             let business_identity = state::load_business_identity(config.identity_dir());
+            // 「已接入」只说明上一条上报通了，不代表证书续得上：续期失败是**粘性**的，
+            // 直到一次续期成功才清 —— 否则提前半个月发现问题的价值就没了。
+            // 但**更新的失败**优先（例如 401 拒绝证书），粘性只在没有其他失败时兜底。
+            let (report_state, report_error) = match (&linkd_last_error, &renew_last_error) {
+                (Some(err), _) => (linkd_state.clone(), Some(err.clone())),
+                (None, Some(err)) => (STATE_DEGRADED.to_string(), Some(err.clone())),
+                (None, None) => (linkd_state.clone(), None),
+            };
             let status = GwlinkdStatus {
                 gateway_id: config.gateway_id.clone(),
                 instance_id: instance_id.clone(),
@@ -1103,7 +1147,7 @@ async fn run(
                 gops_version: tool_versions.gops.clone(),
                 gx_version: tool_versions.gx.clone(),
                 center_endpoint: config.control_center_endpoint.clone(),
-                state: linkd_state.clone(),
+                state: report_state,
                 tenant_id: business_identity
                     .as_ref()
                     .map(|identity| identity.tenant_id.clone()),
@@ -1111,13 +1155,9 @@ async fn run(
                     .as_ref()
                     .filter(|identity| identity.wparse_applied)
                     .map(|identity| identity.revision),
-                credential_expires_at: credential
-                    .bundle
-                    .not_after
-                    .as_ref()
-                    .map(|expires| expires.to_chrono().to_rfc3339()),
+                credential_expires_at: credential.not_after_rfc3339(),
                 last_center_report_at: linkd_last_report_at.clone(),
-                last_error: linkd_last_error.clone(),
+                last_error: report_error,
                 reported_at: DateTime::now(),
             };
             if let Err(err) = linkd_client.report_linkd_status(&status).await {
@@ -1805,6 +1845,20 @@ fn back_off(current: Duration) -> Duration {
     } else {
         (current * 2).min(Duration::from_secs(BACKOFF_MAX_SECS))
     }
+}
+
+/// 续期成功后的**冷却**：至少隔这么久才允许再次续期。
+///
+/// 按证书有效期的 1/8 取（恒小于「半个有效期」的提前量，否则下次能续时证书已过期），
+/// 并封顶 24h：30 天证书 ⇒ 24h，4 小时证书 ⇒ 30 分钟。
+///
+/// 它防的是异常输入：本机时钟前跳（新证书的 `remaining` 立刻又落进窗口）、
+/// 显式配置刚到上限时的边界抖动 —— 那会让每拍都去中心换证，而每次换证都**作废上一张**。
+fn renew_cooldown(lifetime_seconds: Option<i64>) -> Duration {
+    // 算不出有效期时按兜底提前量反推 8 倍：宁可短，也不能退化成「没有冷却」。
+    let lifetime = lifetime_seconds.unwrap_or(state::FALLBACK_RENEW_LEAD_SECS.saturating_mul(8));
+    Duration::from_secs((lifetime.max(1) / 8) as u64)
+        .clamp(Duration::from_secs(1), Duration::from_secs(86_400))
 }
 
 /// 配置里的接入券（`gwlinkd.toml` `link_token`）：**空白视为未配置**（`None`）。
@@ -2615,6 +2669,26 @@ fn run_service_commands(commands: Vec<service::ServiceCommand>) -> GwlinkdResult
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renew_cooldown_stays_well_inside_the_certificate_lifetime() {
+        // 30 天证书 → 封顶 1 天；4 小时 → 30 分钟；1 小时 → 7.5 分钟。
+        assert_eq!(
+            renew_cooldown(Some(30 * 86_400)),
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(renew_cooldown(Some(4 * 3_600)), Duration::from_secs(1_800));
+        assert_eq!(renew_cooldown(Some(3_600)), Duration::from_secs(450));
+        // 算不出有效期 → 用兜底提前量反推（1 小时），而不是「没有冷却」。
+        assert_eq!(renew_cooldown(None), Duration::from_secs(3_600));
+        // 不变式：冷却必须小于「半个有效期」—— 否则下次能续期时证书已经过期。
+        for lifetime in [60, 3_600, 86_400, 30 * 86_400, 365 * 86_400] {
+            assert!(
+                renew_cooldown(Some(lifetime)) < Duration::from_secs(lifetime as u64 / 2),
+                "lifetime={lifetime}"
+            );
+        }
+    }
 
     #[test]
     fn back_off_starts_then_doubles_to_the_cap() {
