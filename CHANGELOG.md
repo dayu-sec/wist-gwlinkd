@@ -3,6 +3,30 @@
 本文件记录 `wist-gwlinkd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.25.0-alpha] - 2026-11-15
+
+### 新增
+
+- **`bind-tenant` 携带 `wp_ins_id`**：写 wparse 工作根 `.env` 的 `WP_INS_ID`
+  （`100..=1123`，越界拒绝），并落进 `business-identity.json`；状态回执的
+  `desired_business_identity` 也带同一字段，离线 / 重启后自动补偿。
+- `.env` 自检把 `WP_INS_ID` 纳入比对（人工改掉会被判漂移并重写）。
+
+### 变更
+
+- 依赖 `wist-control 0.24`；旧中心不带 `wp_ins_id` 时**不动**现场已有的实例号。
+
+### 为什么
+
+- wparse 的 `wp_event_id` 实例段决定「多站点共用中心会不会撞 ID」；只下发 tenant
+  不够，车道必须与租户同源管理。
+
+### 兼容性
+
+- 旧中心 / 旧载荷：`wp_ins_id` 缺省 → 不写、不改、不判漂移。
+- 需要与 `wist-control 0.24` / `wist-center 0.37` / 网关栈 0.15.7 同批上线；
+  网关栈已不再向 wparse 注入 `WP_INS_ID` 进程变量。
+
 ## [0.24.0-alpha] - 2026-11-12
 
 ### 变更（依赖）

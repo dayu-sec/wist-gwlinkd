@@ -391,6 +391,10 @@ pub struct BusinessIdentity {
     pub tenant_id: String,
     #[serde(default = "default_business_revision")]
     pub revision: i64,
+    /// wparse 事件号的实例段（`WP_INS_ID`，100..=1123）。
+    /// 旧中心 / 旧身份文件不带 → `None`（不动现场已有的实例号）。
+    #[serde(default)]
+    pub wp_ins_id: Option<i64>,
     /// 是否已写入 wparse `.env` 并触发重启；false = 只落盘、待生效。
     #[serde(default)]
     pub wparse_applied: bool,
@@ -706,6 +710,7 @@ mod tests {
         let identity = BusinessIdentity {
             tenant_id: "tenant-a".into(),
             revision: 2,
+            wp_ins_id: Some(101),
             wparse_applied: true,
         };
         save_business_identity(&dir, &identity).expect("save identity");

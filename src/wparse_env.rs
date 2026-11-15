@@ -32,6 +32,9 @@ pub const GLOBAL_TAGS_KEY: &str = "WP_GLOBAL_TAGS";
 pub const TENANT_TAG_KEY: &str = "tenant_id";
 /// 全局 tag 里的网关标识：值就是**实例 ID**（`<gateway_id>/inst-<boot>`，重装会换新）。
 pub const GW_ID_TAG_KEY: &str = "wist-gw_id";
+/// wparse 事件号的实例段（`WP_INS_ID`，`100..=1123`）：
+/// `wp_event_id = 秒 32 | 实例 10 | 每秒计数器 22`，实例段取 `instance_id - 100`。
+pub const INS_ID_KEY: &str = "WP_INS_ID";
 /// 0.18.2 / 0.18.3 用过的两个键，从 0.18.4 起合并成 [`GW_ID_TAG_KEY`]；写入时顺手清掉，
 /// 免得旧键继续被盖到记录上。
 const LEGACY_GW_TAG_KEYS: [&str; 2] = ["gateway_id", "instance_id"];
@@ -72,6 +75,9 @@ pub fn write_tenant_id(work_dir: &Path, tenant_id: &str) -> Result<PathBuf, Stri
 /// - `tenant_id`：业务身份（= Center 的 `customer_id`）；
 /// - `wist-gw_id`：网关实例标识（`<gateway_id>/inst-<boot>`，重启不变、**重装会换新**）。
 ///
+/// 另外，`wp_ins_id` 为 `Some` 时写 `WP_INS_ID`（wparse 事件号实例段）。 `None` = 上游
+/// （旧中心）没有这个值：**不动**现场已有的 `WP_INS_ID`，否则会把单站点手工配好的车道冲掉。
+///
 /// 为什么要全局 tag 而不是只靠 sink 占位：`topology/` 会被 `project_remote` 从 wp-infra 整体覆盖，
 /// 占位很容易被冲掉；全局 tag 由引擎在解析成功后盖到**所有**记录上，且**覆盖同名规则字段**
 /// （规则里写死的 `tenant_id = chars(...)` 也会被盖掉）。
@@ -79,6 +85,7 @@ pub fn write_business_tags(
     work_dir: &Path,
     tenant_id: &str,
     gw_id: &str,
+    wp_ins_id: Option<i64>,
 ) -> Result<PathBuf, String> {
     let tenant_id = tenant_id.trim();
     if !is_tag_safe(tenant_id) {
@@ -90,6 +97,16 @@ pub fn write_business_tags(
     let gw_id = gw_id.trim();
     // dotenv 是逐行格式：值里出现换行/控制字符等于往 `.env` 里注入新行。**不**放行。
     ensure_single_line("wist-gw_id", gw_id)?;
+    // 实例段是 10 bit：越界 / 非数字会让 wparse 启动失败；写边界先挡住。
+    if let Some(value) = wp_ins_id
+        && !wist_control::is_valid_wp_ins_id(value)
+    {
+        return Err(format!(
+            "wp_ins_id 越界（{}..={}）：{value}",
+            wist_control::WP_INS_ID_MIN,
+            wist_control::WP_INS_ID_MAX
+        ));
+    }
     write_env_with(work_dir, |existing| {
         let mut content = upsert_env_value(existing, TENANT_KEY, tenant_id);
         // `WP_GLOBAL_TAGS` 还可能携带其它 tag（owner_id / env …）：**按 key 合并**，不能整行覆盖。
@@ -100,6 +117,9 @@ pub fn write_business_tags(
         }
         tags = merge_global_tags(&tags, &set, &LEGACY_GW_TAG_KEYS)?;
         content = upsert_env_value(&content, GLOBAL_TAGS_KEY, &tags);
+        if let Some(value) = wp_ins_id {
+            content = upsert_env_value(&content, INS_ID_KEY, &value.to_string());
+        }
         Ok(content)
     })
 }
@@ -772,11 +792,17 @@ mod tests {
             "OTHER=keep\nWP_GLOBAL_TAGS=owner_id=team-a\n",
         )
         .unwrap();
-        let path = write_business_tags(&dir, "2092453428448002048", "X4/inst-1792").expect("write");
+        let path = write_business_tags(&dir, "2092453428448002048", "X4/inst-1792", Some(107))
+            .expect("write");
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("OTHER=keep"), "{text}");
         assert!(
             text.contains("WIST_TENANT_ID=2092453428448002048"),
+            "{text}"
+        );
+        assert_eq!(
+            env_value(&text, INS_ID_KEY).as_deref(),
+            Some("107"),
             "{text}"
         );
         let tags = env_value(&text, GLOBAL_TAGS_KEY).expect("global tags");
@@ -796,7 +822,7 @@ mod tests {
             "WP_GLOBAL_TAGS=gateway_id=X4,instance_id=X4/inst-1,tenant_id=old\n",
         )
         .unwrap();
-        let path = write_business_tags(&dir, "t-1", "X4/inst-1").expect("write");
+        let path = write_business_tags(&dir, "t-1", "X4/inst-1", None).expect("write");
         let text = std::fs::read_to_string(&path).unwrap();
         let tags = env_value(&text, GLOBAL_TAGS_KEY).unwrap();
         assert_eq!(tags, "tenant_id=t-1,wist-gw_id=X4/inst-1", "{tags}");
@@ -807,9 +833,9 @@ mod tests {
     #[test]
     fn write_business_tags_is_idempotent() {
         let dir = temp_work_dir("business-tags-idem");
-        let first = write_business_tags(&dir, "t-1", "X4/inst-1").unwrap();
+        let first = write_business_tags(&dir, "t-1", "X4/inst-1", Some(100)).unwrap();
         let one = std::fs::read_to_string(&first).unwrap();
-        let second = write_business_tags(&dir, "t-1", "X4/inst-1").unwrap();
+        let second = write_business_tags(&dir, "t-1", "X4/inst-1", Some(100)).unwrap();
         let two = std::fs::read_to_string(&second).unwrap();
         assert_eq!(one, two);
         let _ = std::fs::remove_dir_all(dir);
@@ -819,8 +845,8 @@ mod tests {
     #[test]
     fn write_business_tags_replaces_tenant_for_rebinding() {
         let dir = temp_work_dir("business-tags-rebind");
-        write_business_tags(&dir, "t-old", "X4/inst-1").unwrap();
-        let path = write_business_tags(&dir, "t-new", "X4/inst-1").unwrap();
+        write_business_tags(&dir, "t-old", "X4/inst-1", None).unwrap();
+        let path = write_business_tags(&dir, "t-new", "X4/inst-1", None).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("t-old"), "{text}");
         let tags = env_value(&text, GLOBAL_TAGS_KEY).unwrap();
@@ -829,11 +855,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// `wp_ins_id=None`（旧中心）不动现场已有的实例号；`Some` 才改。
+    #[test]
+    fn write_business_tags_keeps_legacy_lane_when_center_omits_it() {
+        let dir = temp_work_dir("business-tags-lane");
+        std::fs::write(dir.join(ENV_FILE), "WP_INS_ID=207\n").unwrap();
+        let path = write_business_tags(&dir, "t-1", "X4/inst-1", None).unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            env_value(&text, INS_ID_KEY).as_deref(),
+            Some("207"),
+            "{text}"
+        );
+
+        let path = write_business_tags(&dir, "t-1", "X4/inst-1", Some(208)).unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            env_value(&text, INS_ID_KEY).as_deref(),
+            Some("208"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 实例段越界 → 写边界直接拒（wparse 拿到会启动失败）。
+    #[test]
+    fn write_business_tags_rejects_out_of_range_lane() {
+        let dir = temp_work_dir("business-tags-lane-range");
+        for invalid in [0, 99, 1124, -1] {
+            let err = write_business_tags(&dir, "t-1", "X4/inst-1", Some(invalid))
+                .expect_err("must reject");
+            assert!(err.contains("wp_ins_id"), "{err}");
+        }
+        assert!(!dir.join(ENV_FILE).exists(), "被拒的值不该落盘");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// `wist-gw_id` 里带换行 = 往 `.env` 注入新行，直接拒。
     #[test]
     fn write_business_tags_rejects_control_chars() {
         let dir = temp_work_dir("business-tags-inject");
-        assert!(write_business_tags(&dir, "t-1", "X4/inst-1\nEVIL=1").is_err());
+        assert!(write_business_tags(&dir, "t-1", "X4/inst-1\nEVIL=1", None).is_err());
         assert!(!dir.join(ENV_FILE).exists(), "被拒的值不该落盘");
         let _ = std::fs::remove_dir_all(dir);
     }

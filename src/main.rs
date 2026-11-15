@@ -2132,14 +2132,23 @@ async fn onboard(
             // 重新接入时**不能降级**：本地已有更新的 revision 就以本地为准（否则一次重接
             // 会把已生效的换绑退回去，还会触发一次整栈重启）。
             let incoming = returned.config.binding_revision.unwrap_or(1);
-            let (persisted_tenant, revision) =
-                match state::load_business_identity(config.identity_dir()) {
-                    Some(local) if local.revision > incoming => (local.tenant_id, local.revision),
-                    _ => (tenant_id.to_string(), incoming),
-                };
+            // 实例号随初始配置带出：同 revision 时保留本地值（旧中心不带 → 不动）。
+            let local = state::load_business_identity(config.identity_dir());
+            let (persisted_tenant, revision, wp_ins_id) = match local {
+                Some(local) if local.revision > incoming => {
+                    (local.tenant_id, local.revision, local.wp_ins_id)
+                }
+                Some(local) => (
+                    tenant_id.to_string(),
+                    incoming,
+                    returned.config.wp_ins_id.or(local.wp_ins_id),
+                ),
+                None => (tenant_id.to_string(), incoming, returned.config.wp_ins_id),
+            };
             let identity = state::BusinessIdentity {
                 tenant_id: persisted_tenant,
                 revision,
+                wp_ins_id,
                 wparse_applied: false,
             };
             if let Err(err) = state::save_business_identity(config.identity_dir(), &identity) {

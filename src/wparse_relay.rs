@@ -95,7 +95,7 @@ pub async fn run(
     let mut backoff = Duration::ZERO;
     let mut credential_missing_logged = false;
     // 同一期望值失败后不每轮重试（生效命令可能要重启整栈，见 [`COMPENSATION_RETRY`]）。
-    let mut last_compensation: Option<(Instant, String, i64)> = None;
+    let mut last_compensation: Option<(Instant, String, i64, Option<i64>)> = None;
     log::info!(
         "event=WparseRelayStarted upstream={} poll_ms={}",
         upstream,
@@ -795,6 +795,9 @@ struct BindTenantPayload {
     tenant_id: String,
     #[serde(default = "default_bind_revision")]
     revision: i64,
+    /// wparse 事件号实例段（`WP_INS_ID`）。旧中心不带 → `None`：不动现场已有的实例号。
+    #[serde(default)]
+    wp_ins_id: Option<i64>,
 }
 
 fn default_bind_revision() -> i64 {
@@ -852,6 +855,28 @@ async fn run_bind_tenant(
             error: Some(error),
         };
     }
+    // 实例段越界：旧 revision 的非法值也要明确拒绝，不能被 stale 分支「成功」掉。
+    if let Some(value) = payload.wp_ins_id
+        && !wist_control::is_valid_wp_ins_id(value)
+    {
+        let error = format!(
+            "wp_ins_id 越界（{}..={}）：{value}",
+            wist_control::WP_INS_ID_MIN,
+            wist_control::WP_INS_ID_MAX
+        );
+        record_event(task, "bind.rejected", &error);
+        return UpstreamResult {
+            status_code: 400,
+            body: json!({
+                "tenant_id": tenant_id,
+                "revision": payload.revision,
+                "wp_ins_id": value,
+                "wparse_applied": false,
+            })
+            .to_string(),
+            error: Some(error),
+        };
+    }
     if let Some(current) = state::load_business_identity(config.identity_dir()) {
         if payload.revision < current.revision {
             let detail = format!(
@@ -862,9 +887,14 @@ async fn run_bind_tenant(
             return UpstreamResult {
                 status_code: 200,
                 body: json!({
-                    "requested": { "tenant_id": tenant_id, "revision": payload.revision },
+                    "requested": {
+                        "tenant_id": tenant_id,
+                        "revision": payload.revision,
+                        "wp_ins_id": payload.wp_ins_id,
+                    },
                     "tenant_id": current.tenant_id,
                     "revision": current.revision,
+                    "wp_ins_id": current.wp_ins_id,
                     "ignored": "stale",
                 })
                 .to_string(),
@@ -872,8 +902,14 @@ async fn run_bind_tenant(
             };
         }
         // 同版本同身份且已生效：幂等返回，不重跑生效命令（控制命令租约过期会重投）。
+        // `wp_ins_id` 只在**载荷带了**时比较：旧中心不带 → 不把“两者都是 None/Some”误判成变化。
+        let lane_matches = payload
+            .wp_ins_id
+            .map(|value| current.wp_ins_id == Some(value))
+            .unwrap_or(true);
         if payload.revision == current.revision
             && current.tenant_id == tenant_id
+            && lane_matches
             && current.wparse_applied
         {
             record_event(
@@ -886,6 +922,7 @@ async fn run_bind_tenant(
                 body: json!({
                     "tenant_id": tenant_id,
                     "revision": payload.revision,
+                    "wp_ins_id": current.wp_ins_id,
                     "wparse_applied": true,
                     "apply": "unchanged",
                 })
@@ -894,12 +931,25 @@ async fn run_bind_tenant(
             };
         }
     }
-    match apply_business_identity(config, &tenant_id, payload.revision, task).await {
+    // 旧中心 / 旧载荷不带实例号：**保留本地已有的车道**，别把身份文件里的值抹掉。
+    let effective_wp_ins_id = payload.wp_ins_id.or_else(|| {
+        state::load_business_identity(config.identity_dir()).and_then(|current| current.wp_ins_id)
+    });
+    match apply_business_identity(
+        config,
+        &tenant_id,
+        payload.revision,
+        effective_wp_ins_id,
+        task,
+    )
+    .await
+    {
         ApplyOutcome::Applied => UpstreamResult {
             status_code: 200,
             body: json!({
                 "tenant_id": tenant_id,
                 "revision": payload.revision,
+                "wp_ins_id": effective_wp_ins_id,
                 "wparse_applied": true,
             })
             .to_string(),
@@ -912,6 +962,7 @@ async fn run_bind_tenant(
             let mut body = json!({
                 "tenant_id": tenant_id,
                 "revision": payload.revision,
+                "wp_ins_id": effective_wp_ins_id,
                 "wparse_applied": false,
                 "apply": "not_configured",
             });
@@ -928,6 +979,7 @@ async fn run_bind_tenant(
             body: json!({
                 "tenant_id": tenant_id,
                 "revision": payload.revision,
+                "wp_ins_id": effective_wp_ins_id,
                 "wparse_applied": false,
             })
             .to_string(),
@@ -958,6 +1010,7 @@ async fn apply_business_identity(
     config: &Config,
     tenant_id: &str,
     revision: i64,
+    wp_ins_id: Option<i64>,
     task: Option<&TaskLog>,
 ) -> ApplyOutcome {
     let tenant_id = tenant_id.trim();
@@ -965,6 +1018,18 @@ async fn apply_business_identity(
         let error = format!(
             "tenant_id 不是 tag-safe（1..=64，仅 [A-Za-z0-9_.:/=@+,-]）：{}",
             value_preview(tenant_id)
+        );
+        record_event(task, "bind.rejected", &error);
+        return ApplyOutcome::Failed { status: 400, error };
+    }
+    // 实例段是 10 bit：越界会让 wparse 启动失败，先于任何落盘失败。
+    if let Some(value) = wp_ins_id
+        && !wist_control::is_valid_wp_ins_id(value)
+    {
+        let error = format!(
+            "wp_ins_id 越界（{}..={}）：{value}",
+            wist_control::WP_INS_ID_MIN,
+            wist_control::WP_INS_ID_MAX
         );
         record_event(task, "bind.rejected", &error);
         return ApplyOutcome::Failed { status: 400, error };
@@ -988,6 +1053,7 @@ async fn apply_business_identity(
     let mut identity = state::BusinessIdentity {
         tenant_id: tenant_id.to_string(),
         revision,
+        wp_ins_id,
         wparse_applied: false,
     };
     if let Err(err) = state::save_business_identity(config.identity_dir(), &identity) {
@@ -1005,7 +1071,9 @@ async fn apply_business_identity(
     } else {
         instance_id
     };
-    if let Err(error) = crate::wparse_env::write_business_tags(&work_dir, tenant_id, &gw_id) {
+    if let Err(error) =
+        crate::wparse_env::write_business_tags(&work_dir, tenant_id, &gw_id, wp_ins_id)
+    {
         record_event(task, "bind.env_failed", &error);
         return ApplyOutcome::Failed {
             status: 500,
@@ -1016,13 +1084,13 @@ async fn apply_business_identity(
         task,
         "bind.stored",
         &format!(
-            "tenant_id={tenant_id} wist-gw_id={gw_id} revision={revision} env={}",
+            "tenant_id={tenant_id} wist-gw_id={gw_id} wp_ins_id={wp_ins_id:?} revision={revision} env={}",
             work_dir.join(crate::wparse_env::ENV_FILE).display()
         ),
     );
     // 补偿路径没有 task 日志：这条 info 是唯一的「写到了哪个 .env」证据。
     log::info!(
-        "event=TenantBindingStored tenant_id={tenant_id} revision={revision} env={}",
+        "event=TenantBindingStored tenant_id={tenant_id} wp_ins_id={wp_ins_id:?} revision={revision} env={}",
         work_dir.join(crate::wparse_env::ENV_FILE).display()
     );
     let action = match apply_action {
@@ -1096,6 +1164,14 @@ fn needs_business_apply(
     if local.tenant_id != desired.tenant_id || local.revision < desired.revision {
         return true;
     }
+    // 同版本但实例号不同：也要重新落 `.env`（中心可能只换了车道）。
+    if desired
+        .wp_ins_id
+        .map(|value| local.wp_ins_id != Some(value))
+        .unwrap_or(false)
+    {
+        return true;
+    }
     // 同版本但上次没生效（`.env` 已写、重启没跑成）：配置了生效命令就再试。
     can_apply && !local.wparse_applied
 }
@@ -1107,7 +1183,7 @@ fn needs_business_apply(
 async fn compensate_desired_identity(
     config: &Config,
     desired: Option<DesiredBusinessIdentity>,
-    last_attempt: &mut Option<(Instant, String, i64)>,
+    last_attempt: &mut Option<(Instant, String, i64, Option<i64>)>,
 ) {
     let Some(desired) = desired else {
         return;
@@ -1121,21 +1197,38 @@ async fn compensate_desired_identity(
     if !needs_business_apply(local.as_ref(), &desired, can_apply) {
         return;
     }
-    if let Some((at, tenant_id, revision)) = last_attempt
+    if let Some((at, tenant_id, revision, wp_ins_id)) = last_attempt
         && *tenant_id == desired.tenant_id
         && *revision == desired.revision
+        && *wp_ins_id == desired.wp_ins_id
         && at.elapsed() < COMPENSATION_RETRY
     {
         return;
     }
-    *last_attempt = Some((Instant::now(), desired.tenant_id.clone(), desired.revision));
+    *last_attempt = Some((
+        Instant::now(),
+        desired.tenant_id.clone(),
+        desired.revision,
+        desired.wp_ins_id,
+    ));
     log::info!(
-        "event=TenantBindingCompensating tenant_id={} revision={} local_revision={:?}",
+        "event=TenantBindingCompensating tenant_id={} revision={} wp_ins_id={:?} local_revision={:?}",
         desired.tenant_id,
         desired.revision,
+        desired.wp_ins_id,
         local.as_ref().map(|identity| identity.revision)
     );
-    match apply_business_identity(config, &desired.tenant_id, desired.revision, None).await {
+    match apply_business_identity(
+        config,
+        &desired.tenant_id,
+        desired.revision,
+        desired
+            .wp_ins_id
+            .or_else(|| local.as_ref().and_then(|identity| identity.wp_ins_id)),
+        None,
+    )
+    .await
+    {
         ApplyOutcome::Applied => log::info!(
             "event=TenantBindingCompensated tenant_id={} revision={}",
             desired.tenant_id,
@@ -1193,6 +1286,13 @@ pub async fn reconcile_business_identity(config: &Config) {
     };
     let env_matches = std::fs::read_to_string(work_dir.join(crate::wparse_env::ENV_FILE))
         .map(|text| {
+            let lane_matches = identity
+                .wp_ins_id
+                .map(|value| {
+                    crate::wparse_env::env_value(&text, crate::wparse_env::INS_ID_KEY)
+                        == Some(value.to_string())
+                })
+                .unwrap_or(true);
             crate::wparse_env::env_has_value(
                 &text,
                 crate::wparse_env::TENANT_KEY,
@@ -1207,6 +1307,7 @@ pub async fn reconcile_business_identity(config: &Config) {
                     crate::wparse_env::GW_ID_TAG_KEY,
                     &gw_id,
                 ))
+                && lane_matches
         })
         .unwrap_or(false);
     if identity.wparse_applied && env_matches {
@@ -1225,9 +1326,12 @@ pub async fn reconcile_business_identity(config: &Config) {
             log::warn!("event=TenantBindingFlagPersistFailed error={err}");
         }
     }
-    if let Err(error) =
-        crate::wparse_env::write_business_tags(&work_dir, &identity.tenant_id, &gw_id)
-    {
+    if let Err(error) = crate::wparse_env::write_business_tags(
+        &work_dir,
+        &identity.tenant_id,
+        &gw_id,
+        identity.wp_ins_id,
+    ) {
         log::warn!("event=TenantBindingReconcileEnvFailed error={error}");
         return;
     }
@@ -3100,6 +3204,21 @@ mod tests {
         crate::state::BusinessIdentity {
             tenant_id: tenant_id.to_string(),
             revision,
+            wp_ins_id: None,
+            wparse_applied,
+        }
+    }
+
+    fn business_identity_with_lane(
+        tenant_id: &str,
+        revision: i64,
+        wp_ins_id: Option<i64>,
+        wparse_applied: bool,
+    ) -> crate::state::BusinessIdentity {
+        crate::state::BusinessIdentity {
+            tenant_id: tenant_id.to_string(),
+            revision,
+            wp_ins_id,
             wparse_applied,
         }
     }
@@ -3109,6 +3228,7 @@ mod tests {
         let desired = DesiredBusinessIdentity {
             tenant_id: "tenant-acme".into(),
             revision: 2,
+            wp_ins_id: None,
         };
         // 从未绑定过 → 要应用。
         assert!(needs_business_apply(None, &desired, false));
@@ -3153,6 +3273,49 @@ mod tests {
             &desired,
             true
         ));
+
+        // 同版本只换实例号：也要重新落 `.env`。
+        let lane_desired = DesiredBusinessIdentity {
+            tenant_id: "tenant-acme".into(),
+            revision: 2,
+            wp_ins_id: Some(300),
+        };
+        assert!(needs_business_apply(
+            Some(&business_identity_with_lane("tenant-acme", 2, None, true)),
+            &lane_desired,
+            true
+        ));
+        assert!(needs_business_apply(
+            Some(&business_identity_with_lane(
+                "tenant-acme",
+                2,
+                Some(299),
+                true
+            )),
+            &lane_desired,
+            true
+        ));
+        assert!(!needs_business_apply(
+            Some(&business_identity_with_lane(
+                "tenant-acme",
+                2,
+                Some(300),
+                true
+            )),
+            &lane_desired,
+            true
+        ));
+        // 旧中心不带实例号 → 不因车道触发重写。
+        assert!(!needs_business_apply(
+            Some(&business_identity_with_lane(
+                "tenant-acme",
+                2,
+                Some(300),
+                true
+            )),
+            &desired,
+            true
+        ));
     }
 
     /// 离线补偿：状态回执带中心期望值 → relay 写 `.env` + 落身份 + 跑生效命令。
@@ -3187,6 +3350,7 @@ mod tests {
             Some(DesiredBusinessIdentity {
                 tenant_id: "tenant-acme".into(),
                 revision: 4,
+                wp_ins_id: Some(301),
             }),
             &mut last_attempt,
         )
@@ -3194,10 +3358,12 @@ mod tests {
 
         let env = std::fs::read_to_string(work.join(".env")).unwrap();
         assert!(env.contains("WIST_TENANT_ID=tenant-acme"), "{env}");
+        assert!(env.contains("WP_INS_ID=301"), "{env}");
         let identity =
             crate::state::load_business_identity(config.identity_dir()).expect("identity");
         assert_eq!(identity.tenant_id, "tenant-acme");
         assert_eq!(identity.revision, 4);
+        assert_eq!(identity.wp_ins_id, Some(301));
         assert!(identity.wparse_applied);
         assert!(last_attempt.is_some());
         let _ = std::fs::remove_dir_all(state);
@@ -3238,6 +3404,21 @@ mod tests {
         }
     }
 
+    fn bind_command_with_lane(tenant_id: &str, revision: i64, wp_ins_id: i64) -> WparseCommand {
+        WparseCommand {
+            command_id: "cmd-bind".into(),
+            kind: "bind-tenant".into(),
+            method: String::new(),
+            path: String::new(),
+            body: Some(json!({
+                "tenant_id": tenant_id,
+                "revision": revision,
+                "wp_ins_id": wp_ins_id,
+            })),
+            lease_expires_at: "2030-01-01T00:00:00Z".into(),
+        }
+    }
+
     /// 同 revision / 同 tenant 且已生效：幂等返回，**不重跑生效命令**（命令租约过期会重投）。
     #[cfg(unix)]
     #[tokio::test]
@@ -3264,6 +3445,89 @@ mod tests {
         let result = run_bind_tenant(&config, &bind_command("tenant-acme", 2), None).await;
         assert_eq!(result.status_code, 200, "{:?}", result.error);
         assert!(marker.exists(), "新 revision 应该重生效");
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    /// 绑定带 `wp_ins_id` → 写进 `.env` 的 `WP_INS_ID` 并落身份；同版本换车道也要重生效。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_tenant_writes_the_event_instance_lane() {
+        let state = temp_state("bind-lane");
+        let work = state.join("data-plane-run/dev");
+        let config = bind_config(&state, &work, "true");
+
+        let result = run_bind_tenant(
+            &config,
+            &bind_command_with_lane("tenant-acme", 1, 107),
+            None,
+        )
+        .await;
+        assert_eq!(result.status_code, 200, "{:?}", result.error);
+        let body: serde_json::Value = serde_json::from_str(&result.body).expect("body");
+        assert_eq!(body["wp_ins_id"], 107, "{body}");
+        let env = std::fs::read_to_string(work.join(".env")).expect("env");
+        assert!(env.contains("WP_INS_ID=107"), "{env}");
+        let identity =
+            crate::state::load_business_identity(config.identity_dir()).expect("identity");
+        assert_eq!(identity.wp_ins_id, Some(107));
+
+        // 同 revision / 同 tenant、只换车道：不能当 `unchanged` 返回（否则数据面还是旧车道）。
+        let result = run_bind_tenant(
+            &config,
+            &bind_command_with_lane("tenant-acme", 1, 108),
+            None,
+        )
+        .await;
+        assert_eq!(result.status_code, 200, "{:?}", result.error);
+        let body: serde_json::Value = serde_json::from_str(&result.body).expect("body");
+        assert_ne!(body["apply"], "unchanged", "{body}");
+        let env = std::fs::read_to_string(work.join(".env")).expect("env");
+        assert!(env.contains("WP_INS_ID=108"), "{env}");
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    /// 旧中心（载荷没有 `wp_ins_id`）不能掊掉本地已有的车道。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_tenant_keeps_existing_lane_when_payload_omits_it() {
+        let state = temp_state("bind-keep-lane");
+        let work = state.join("data-plane-run/dev");
+        let config = bind_config(&state, &work, "true");
+        crate::state::save_business_identity(
+            config.identity_dir(),
+            &business_identity_with_lane("tenant-acme", 1, Some(207), true),
+        )
+        .expect("seed identity");
+
+        // revision 更新会重应用；但载荷无车道 → 保留 207。
+        let result = run_bind_tenant(&config, &bind_command("tenant-acme", 2), None).await;
+        assert_eq!(result.status_code, 200, "{:?}", result.error);
+        let identity =
+            crate::state::load_business_identity(config.identity_dir()).expect("identity");
+        assert_eq!(identity.wp_ins_id, Some(207));
+        let env = std::fs::read_to_string(work.join(".env")).expect("env");
+        assert!(env.contains("WP_INS_ID=207"), "{env}");
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    /// 实例段越界：400，且不得落盘。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_tenant_rejects_an_out_of_range_lane() {
+        let state = temp_state("bind-bad-lane");
+        let work = state.join("data-plane-run/dev");
+        let config = bind_config(&state, &work, "true");
+        for invalid in [99, 1124] {
+            let result = run_bind_tenant(
+                &config,
+                &bind_command_with_lane("tenant-acme", 1, invalid),
+                None,
+            )
+            .await;
+            assert_eq!(result.status_code, 400, "{invalid}: {:?}", result.error);
+        }
+        let env = std::fs::read_to_string(work.join(".env")).unwrap_or_default();
+        assert!(!env.contains("WP_INS_ID"), "非法值不得写入 .env：{env}");
         let _ = std::fs::remove_dir_all(state);
     }
 
@@ -3308,6 +3572,50 @@ mod tests {
         assert!(env.contains("WIST_TENANT_ID=tenant-acme"), "{env}");
         let identity =
             crate::state::load_business_identity(config.identity_dir()).expect("identity");
+        assert!(identity.wparse_applied, "重写后应重新标成已生效");
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    /// 人工改了 `.env` 的 `WP_INS_ID`：启动自检必须判成漂移并改回身份文件里的车道。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_rewrites_the_env_when_the_lane_drifts() {
+        let state = temp_state("reconcile-lane");
+        let work = state.join("data-plane-run/dev");
+        let config = bind_config(&state, &work, "true");
+        crate::state::save_business_identity(
+            config.identity_dir(),
+            &business_identity_with_lane("tenant-acme", 2, Some(107), true),
+        )
+        .expect("seed identity");
+        let instance_id =
+            crate::state::load_or_create_instance_id(&config.state_dir, &config.gateway_id)
+                .unwrap_or_default();
+        let gw_id = if instance_id.is_empty() {
+            config.gateway_id.trim().to_string()
+        } else {
+            instance_id
+        };
+        // 其它值都对，只有 `WP_INS_ID` 被人改成 108。
+        std::fs::write(
+            work.join(".env"),
+            format!(
+                "WIST_TENANT_ID=tenant-acme\nWP_GLOBAL_TAGS=tenant_id=tenant-acme,wist-gw_id={gw_id}\nWP_INS_ID=108\n"
+            ),
+        )
+        .unwrap();
+
+        reconcile_business_identity(&config).await;
+
+        let env = std::fs::read_to_string(work.join(".env")).unwrap();
+        assert!(
+            crate::wparse_env::env_value(&env, crate::wparse_env::INS_ID_KEY).as_deref()
+                == Some("107"),
+            "车道应改回身份文件里的 107：{env}"
+        );
+        let identity =
+            crate::state::load_business_identity(config.identity_dir()).expect("identity");
+        assert_eq!(identity.wp_ins_id, Some(107));
         assert!(identity.wparse_applied, "重写后应重新标成已生效");
         let _ = std::fs::remove_dir_all(state);
     }
